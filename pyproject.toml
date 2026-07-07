@@ -1,0 +1,29 @@
+[project]
+name = "pyne-worker"
+version = "0.1.0"
+description = "Experimental Python Cloudflare Worker — Pine Script evaluator via pynescript"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pynescript",
+    "workers-py",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv.sources]
+pynescript = { path = "../../../pynescript", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

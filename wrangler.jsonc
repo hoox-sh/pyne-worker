@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pyne-worker",
+  "account_id": "debc6545e63bea36be059cbc82d80ec8",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-06-08",
+  "compatibility_flags": ["python_workers"],
+  "placement": { "mode": "smart" },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    }
+  },
+  "vars": {
+    "TRADE_WORKER_NAME": "trade-worker"
+  },
+  // INTERNAL_KEY_BINDING must be created via `wrangler secret put INTERNAL_KEY_BINDING`
+  "services": [
+    {
+      "binding": "TRADE_SERVICE",
+      "service": "trade-worker"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "OHLCV_DATA",
+      "bucket_name": "pyne-worker-ohlcv",
+      "preview_bucket_name": "pyne-worker-ohlcv-dev"
+    }
+  ]
+}
