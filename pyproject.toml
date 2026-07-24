@@ -26,4 +26,7 @@ packages = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = [
+    "src",
+    "/mnt/data/home/jango/Git/pynescript",
+]

@@ -3,10 +3,31 @@ from __future__ import annotations
 import hashlib
 import uuid
 
+from typing import Any
+
 from pynescript.ast.helper import parse
 
 from pynescript_backend.evaluator import CustomEvaluator
 from pynescript_backend.series import PineSeries
+
+
+_REQUIRED_BAR_FIELDS = {"open", "high", "low", "close", "time"}
+
+
+def _validate_bars(ohlcv_data: list[dict]) -> str | None:
+    """Validate OHLCV bar data.
+
+    Returns ``None`` if valid, or an error message string if invalid.
+    """
+    if not isinstance(ohlcv_data, list):
+        return "OHLCV data must be a list"
+    for i, bar in enumerate(ohlcv_data):
+        if not isinstance(bar, dict):
+            return f"Bar at index {i} is not a dict"
+        missing = _REQUIRED_BAR_FIELDS - set(bar)
+        if missing:
+            return f"Bar at index {i} missing fields: {', '.join(sorted(missing))}"
+    return None
 
 
 class Syminfo:
@@ -139,7 +160,7 @@ class Runtime:
         self._bid = bid
         self._ask = ask
 
-    def run(self, source_code: str, ohlcv_data: list[dict]):
+    def run(self, source_code: str, ohlcv_data: list[dict]) -> dict[str, Any]:
         """
         Execute the script over the provided OHLCV data.
 
@@ -148,11 +169,19 @@ class Runtime:
             ohlcv_data: List of dicts with 'open', 'high', 'low', 'close', 'time'.
 
         Returns:
-            dict with 'series': list of plotted values for each bar.
+            dict with ``plots``, ``events``, ``count``, ``script_id``, ``run_id``,
+            or ``error`` on failure.
         """
+        # Validate bars first
+        bar_err = _validate_bars(ohlcv_data)
+        if bar_err:
+            return {"error": bar_err}
+
         # Parse once
         try:
             tree = parse(source_code, mode="exec")
+        except SyntaxError as e:
+            return {"error": f"Syntax Error: {e!s}"}
         except Exception as e:
             return {"error": f"Parse Error: {e!s}"}
 
@@ -179,7 +208,7 @@ class Runtime:
         }
 
         evaluator = CustomEvaluator(context=context)
-        evaluator.reset_var_declarations()
+        evaluator._var_declarations.clear()
 
         results = []
         all_events: list[dict] = []
@@ -206,18 +235,25 @@ class Runtime:
 
             # Reset plot capture and event buffer for this bar
             evaluator.reset_plots()
-            evaluator.reset_events()
+            if hasattr(evaluator, "reset_events"):
+                evaluator.reset_events()
+            elif hasattr(evaluator, "_strategy_state"):
+                evaluator._strategy_state._events = []
 
             # Execute script
             try:
                 evaluator.visit(tree)
-            except Exception as e:
-                # In a real engine we might handle runtime errors more gracefully
-                # e.g. propagate 'na' or halt
-                return {"error": f"Runtime Error at bar {bar.get('time')}: {e!s}"}
+            except (SyntaxError, TypeError, ValueError) as e:
+                return {
+                    "error": f"Runtime Error at bar {bar_index} (time={bar.get('time', '?')}): {e!s}",
+                    "bar": bar_index,
+                }
 
             # Collect events from this bar (convert to dicts for serialization)
-            bar_events = evaluator._strategy_state.drain_events()
+            if hasattr(evaluator, "_strategy_state"):
+                bar_events = evaluator._strategy_state.drain_events()
+            else:
+                bar_events = []
             for ev in bar_events:
                 ev_dict = ev.to_dict()
                 ev_dict["script_id"] = script_id
