@@ -314,4 +314,5 @@ class CustomEvaluator(NodeLiteralEvaluator):
         return None
 
     def reset_plots(self):
-        self.plot_outputs = []
+        # Reuse list to cut per-bar allocations (values are copied into results)
+        self.plot_outputs.clear()
