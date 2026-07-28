@@ -1,3 +1,6 @@
+# Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Smoke tests for pyne-worker bootstrap.
 
 Verifies routing and response shapes. Full evaluator parity tests live in

@@ -1,0 +1,23 @@
+pyne-worker — NOTICE
+====================
+
+Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+https://github.com/jango-blockchained/pyne-worker
+
+License
+-------
+This worker is licensed under the GNU Affero General Public License
+**version 3 or any later version** (SPDX: AGPL-3.0-or-later).
+
+Full text: LICENSE
+
+It depends on the `pynescript` package (same AGPL-3.0-or-later family).
+
+Vendored trees under `python_modules/` may retain their own SPDX headers
+(e.g. historical LGPL identifiers). Prefer the editable `pynescript`
+dependency for current code.
+
+Third-party marks
+-----------------
+Pine Script™ and TradingView® are trademarks of TradingView, Inc.
+Cloudflare® is a registered trademark of Cloudflare, Inc.

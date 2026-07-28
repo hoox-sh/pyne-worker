@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Run pynescript corpus set01–set04 through pyne-worker Runtime.
 
 Each file is sanitized (same helper as pynescript corpus), then executed with
@@ -9,11 +11,13 @@ Usage (from pyne-worker root)::
 
     python scripts/corpus_run_sets.py
     python scripts/corpus_run_sets.py --sets set01,set02 --timeout 8 --mode parse
+    python scripts/corpus_run_sets.py --sets set01,set02,set03 --mode compile --timeout 20
     python scripts/corpus_run_sets.py --resume --workers 4
 
 Modes:
-  parse  — parse+unparse only (via pynescript in this env)
-  run    — full Runtime evaluation over synthetic bars (default)
+  parse    — parse+unparse only (via pynescript in this env)
+  run      — full Runtime evaluation over synthetic bars (interpret, default)
+  compile  — Runtime with mode=compile (Numba/object bar loop)
 
 Writes under ``.cache/``:
   pyne_corpus_set01_set04.csv
@@ -95,7 +99,10 @@ def _run_one(args: tuple[str, str, int]) -> tuple[str, str, str, int]:
 
         if n_bars not in _BARS_CACHE:
             _BARS_CACHE[n_bars] = _make_bars(n_bars)
-        result = Runtime(symbol="BTCUSDT").run(src, _BARS_CACHE[n_bars])
+        run_mode = "compile" if mode == "compile" else "interpret"
+        result = Runtime(symbol="BTCUSDT").run(
+            src, _BARS_CACHE[n_bars], mode=run_mode
+        )
         ms = int((time.perf_counter() - t0) * 1000)
         err = result.get("error")
         if err:
@@ -184,7 +191,12 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--bars", type=int, default=50)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--mode", choices=("run", "parse"), default="run")
+    ap.add_argument(
+        "--mode",
+        choices=("run", "parse", "compile"),
+        default="run",
+        help="parse | run (interpret) | compile (Numba/object path)",
+    )
     ap.add_argument("--out", type=Path, default=CACHE / "pyne_corpus_set01_set04.csv")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--progress-every", type=int, default=25)

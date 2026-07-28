@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Benchmark pyne-worker Runtime throughput.
 
 Measures runs-per-minute by executing a complex Pine Script strategy

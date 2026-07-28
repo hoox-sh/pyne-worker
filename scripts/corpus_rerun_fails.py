@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Re-run FAIL rows from a pyne-worker corpus CSV with hard per-file kill.
 
 Avoids infinite Runtime loops hanging the batch (soft timeouts cannot stop them).

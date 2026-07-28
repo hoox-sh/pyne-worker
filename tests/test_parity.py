@@ -1,3 +1,6 @@
+# Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Parity corpus tests — run each ``.pine`` through ``Runtime.run`` and
 compare the emitted events against the expected JSON fixture.
 

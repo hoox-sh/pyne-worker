@@ -1,7 +1,8 @@
 [project]
 name = "pyne-worker"
-version = "0.1.0"
-description = "Experimental Python Cloudflare Worker — Pine Script evaluator via pynescript"
+version = "0.4.0"
+description = "Production-grade Python Cloudflare Worker — Pine Script evaluator via pynescript"
+license = { text = "AGPL-3.0-or-later" }
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -30,3 +31,4 @@ pythonpath = [
     "src",
     "/mnt/data/home/jango/Git/pynescript",
 ]
+asyncio_mode = "auto"

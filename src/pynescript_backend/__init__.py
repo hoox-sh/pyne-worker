@@ -1,3 +1,6 @@
+# Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Pynescript runtime glue vendored from pynescript/backend.
 
 The installable ``pynescript`` wheel does not include ``backend/``; this

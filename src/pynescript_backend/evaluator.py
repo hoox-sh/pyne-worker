@@ -1,3 +1,6 @@
+# Copyright (c) 2026 HOOX · PYNE · jango-blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # pyne-worker — Python Cloudflare Worker for Pine Script evaluation
 # Copyright (C) 2024-2026  jango-blockchained
 #
