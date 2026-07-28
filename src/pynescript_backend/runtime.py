@@ -643,6 +643,7 @@ class Runtime:
                 strategy_events.clear()
             evaluator._cross_call_i = 0  # type: ignore[attr-defined]
             evaluator._ta_call_i = 0  # type: ignore[attr-defined]
+            evaluator._plot_call_i = 0  # type: ignore[attr-defined]
 
             try:
                 visit(tree)
