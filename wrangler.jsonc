@@ -3,8 +3,8 @@
   "name": "pyne-worker",
   "account_id": "debc6545e63bea36be059cbc82d80ec8",
   "main": "src/entry.py",
-  "compatibility_date": "2026-06-08",
-  "compatibility_flags": ["python_workers"],
+  "compatibility_date": "2026-07-24",
+  "compatibility_flags": ["python_workers", "disable_python_external_sdk"],
   "placement": { "mode": "smart" },
   "observability": {
     "enabled": true,
@@ -19,7 +19,13 @@
   "vars": {
     "TRADE_WORKER_NAME": "trade-worker"
   },
-  // INTERNAL_KEY_BINDING must be created via `wrangler secret put INTERNAL_KEY_BINDING`
+  // Bar-close scheduler: every minute (UTC). Only re-runs when R2 has a newer bar.
+  // Keep 1m data fresh via scripts/fetch_and_ingest.py (Binance blocks CF IPs).
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  // Production secrets (set via `wrangler secret put`):
+  //   API_KEY — shared secret for HTTP auth (X-API-Key header)
   "services": [
     {
       "binding": "TRADE_SERVICE",

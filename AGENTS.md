@@ -47,6 +47,9 @@ uv run wrangler deploy      # deploy
 
 | File | Purpose |
 |---|---|
-| `src/entry.py` | Worker entry point |
-| `wrangler.jsonc` | Worker config |
+| `src/entry.py` | Worker entry (`fetch` + `scheduled` cron) |
+| `src/handler.py` | HTTP routes: `/run`, `/scripts`, `/cron/*`, `/ingest` |
+| `src/scheduler.py` | Bar-close job runner |
+| `src/scripts_registry.py` | Deployed scripts + cron config in R2 |
+| `wrangler.jsonc` | Worker config + cron `* * * * *` |
 | `pyproject.toml` | Package config (editable dep on `pynescript`) |

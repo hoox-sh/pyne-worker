@@ -1,11 +1,10 @@
 # Copyright (c) 2026 HOOX · PYNE · jango-blockchained
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""pyne-worker — experimental Python Cloudflare Worker for Pine Script evaluation.
+"""pyne-worker — Python Cloudflare Worker for Pine Script evaluation.
 
-Runs TradingView Pine Script strategy scripts via the pynescript reference
-evaluator and emits structured trade events. Mirrors the pine-worker API
-surface (``/health``, ``POST /run``) while staying in 100% Python.
+Runs TradingView Pine Script via the pynescript evaluator / compile path and
+emits structured trade events.
 
 Production features:
 - API key authentication (``X-API-Key`` header / ``API_KEY`` secret)
@@ -15,6 +14,8 @@ Production features:
 - Dependency health checks (R2, trade-worker)
 - Execution timeout (30 s)
 - R2 data ingestion (``POST /ingest``)
+- Deployed script registry (``POST /scripts``)
+- Cron bar-close scheduler (``scheduled`` + ``POST /cron/run``)
 """
 
 # pyne-worker — Python Cloudflare Worker for Pine Script evaluation
@@ -153,3 +154,61 @@ class Default(WorkerEntrypoint):
             status=status,
             headers=headers,
         )
+
+    async def scheduled(self, controller, env, ctx):
+        """Cron Trigger entry — bar-close run for deployed scripts.
+
+        Configure in wrangler.jsonc::
+
+            "triggers": { "crons": ["* * * * *"] }
+
+        Each minute:
+          1. Pull latest closed klines (Bybit primary → R2)
+          2. Re-run each enabled deployed script only if bar time advanced
+        """
+        start = time.time()
+        request_id = LogHelper.make_request_id()
+        cron_expr = getattr(controller, "cron", None) or "* * * * *"
+
+        try:
+            from scheduler import run_scheduled_jobs
+
+            summary = await run_scheduled_jobs(
+                getattr(self.env, "OHLCV_DATA", None),
+                force=False,
+                refresh_market=True,
+            )
+        except Exception as e:
+            summary = {"error": str(e), "jobs": [], "events": [], "feed": []}
+
+        # Forward strategy events to trade-worker
+        events = summary.get("events") or []
+        if events and hasattr(self.env, "TRADE_SERVICE"):
+            # Group by symbol when present
+            by_symbol: dict[str, list] = {}
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                sym = str(ev.get("symbol") or "BTCUSDT")
+                by_symbol.setdefault(sym, []).append(ev)
+            forward_meta: dict[str, object] = {}
+            for sym, evs in by_symbol.items():
+                try:
+                    fwd = await forward_events(evs, self.env.TRADE_SERVICE, symbol=sym)
+                    forward_meta[sym] = fwd
+                except Exception as e:
+                    forward_meta[sym] = {"error": str(e)}
+            summary["forward"] = forward_meta
+
+        duration_ms = (time.time() - start) * 1000
+        log = LogHelper.as_dict(
+            request_id=request_id,
+            method="SCHEDULED",
+            path=f"cron:{cron_expr}",
+            status=200 if "error" not in summary else 500,
+            duration_ms=duration_ms,
+            bars=summary.get("jobs_run"),
+            events=len(events) if isinstance(events, list) else 0,
+        )
+        print(json.dumps(log))
+        print(json.dumps({"cron_summary": summary, "request_id": request_id}))

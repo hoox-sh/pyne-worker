@@ -642,12 +642,16 @@ class Runtime:
 
     @staticmethod
     def _compile_eligible(source_code: str) -> tuple[bool, str]:
+        """Return whether compile mode may succeed.
+
+        Numba is only required for pure-numeric (non-object) scripts. Object-mode
+        compile works without Numba, so we do not gate eligibility on it here —
+        ``compile_script`` raises a clear error when Numba is required but missing.
+        """
         try:
-            from pynescript.compiler.engine import has_numba
+            import pynescript.compiler.engine  # noqa: F401
         except ImportError:
             return False, "compiler package unavailable"
-        if not has_numba():
-            return False, "numba not installed"
         src = source_code or ""
         if re.search(r"(?m)^\s*import\s+\S+", src):
             return False, "import statements not supported in compile path"
@@ -676,14 +680,14 @@ class Runtime:
         return result
 
     def _run_compiled(self, source_code: str, ohlcv_data: list[dict]) -> dict[str, Any]:
-        """Numba/object compile path via pynescript.compiler."""
+        """Numba/object compile path via pynescript.compiler.
+
+        Pure-numeric scripts need Numba; object-mode (UDT/map/drawing) does not.
+        """
         try:
             from pynescript.compiler.engine import compile_script
-            from pynescript.compiler.engine import has_numba
         except ImportError as e:
             return {"error": f"Compile mode unavailable: {e!s}"}
-        if not has_numba():
-            return {"error": "Compile mode requires numba (pip install numba)"}
         if not ohlcv_data:
             return {"plots": [], "events": [], "count": 0, "mode": "compile", "series": {}}
         try:

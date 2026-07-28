@@ -1,0 +1,47 @@
+name: Data Ingestion — daily OHLCV fetch
+
+on:
+  schedule:
+    # Every day at 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol(s) to fetch (comma-separated)"
+        required: false
+        default: "BTCUSDT,ETHUSDT,SOLUSDT"
+      timeframe:
+        description: "Interval"
+        required: false
+        default: "1d"
+
+jobs:
+  fetch-and-ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch OHLCV data
+        run: |
+          SYMBOL="${{ github.event.inputs.symbol || 'BTCUSDT,ETHUSDT,SOLUSDT' }}"
+          TIMEFRAME="${{ github.event.inputs.timeframe || '1d' }}"
+          python scripts/fetch_and_ingest.py \
+            --symbol "$SYMBOL" \
+            --timeframe "$TIMEFRAME" \
+            --output-dir data
+
+      - name: Upload to R2 (via wrangler)
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          npx wrangler r2 object put pyne-worker-ohlcv/data/BTCUSDT/1d/$(date +%Y).jsonl.gz \
+            --file data/BTCUSDT/1d/$(date +%Y).jsonl.gz \
+            --local 2>/dev/null || \
+          echo "wrangler not available — skipping R2 upload"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
