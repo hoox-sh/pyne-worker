@@ -20,15 +20,33 @@ import hashlib
 import time
 import uuid
 
-from datetime import datetime
-from datetime import timezone
 from typing import Any
 
 from pynescript.ast.helper import parse
+from pynescript.util.time_parts import apply_utc_parts_to_context
 
 from pynescript_backend.evaluator import CustomEvaluator
 from pynescript_backend.evaluator import _NaValue
 from pynescript_backend.series import PineSeries
+
+# Parse tree cache (source sha256 → AST). Bounded.
+_PARSE_CACHE: dict[str, Any] = {}
+_PARSE_CACHE_MAX = 64
+
+
+def _parse_script(source_code: str) -> Any:
+    key = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
+    tree = _PARSE_CACHE.get(key)
+    if tree is not None:
+        return tree
+    tree = parse(source_code, mode="exec")
+    if len(_PARSE_CACHE) >= _PARSE_CACHE_MAX:
+        try:
+            _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
+        except StopIteration:
+            pass
+    _PARSE_CACHE[key] = tree
+    return tree
 
 def _hl2(bar: dict) -> float:
     return (bar.get("high", 0.0) + bar.get("low", 0.0)) / 2.0
@@ -331,9 +349,9 @@ class Runtime:
         if bar_err:
             return {"error": bar_err}
 
-        # Parse once
+        # Parse once (cached by source hash for multi-run / warm hosts)
         try:
-            tree = parse(source_code, mode="exec")
+            tree = _parse_script(source_code)
         except SyntaxError as e:
             return {"error": f"Syntax Error: {e!s}"}
         except Exception as e:
@@ -431,9 +449,10 @@ class Runtime:
             deadline = None
 
         n_bars = len(ohlcv_data)
+        visit = evaluator.visit  # localize hot-path method
         for bar_index, bar in enumerate(ohlcv_data):
-            # Check timeout before each bar
-            if deadline is not None and time.monotonic() > deadline:
+            # Wall-clock check every 32 bars (still first bar + last via natural end)
+            if deadline is not None and (bar_index & 31) == 0 and time.monotonic() > deadline:
                 timed_out = True
                 break
             # Update series state (derived prices once per bar)
@@ -442,10 +461,19 @@ class Runtime:
             l = bar.get("low")
             c = bar.get("close")
             v = bar.get("volume")
-            hl2_val = _hl2(bar)
-            hlc3_val = _hlc3(bar)
-            ohlc4_val = _ohlc4(bar)
-            hlcc4_val = _hlcc4(bar)
+            # Prefer already-extracted o/h/l/c for derived (avoid re-dict)
+            try:
+                hf, lf, cf = float(h), float(l), float(c)
+                of = float(o)
+                hl2_val = (hf + lf) / 2.0
+                hlc3_val = (hf + lf + cf) / 3.0
+                ohlc4_val = (of + hf + lf + cf) / 4.0
+                hlcc4_val = (hf + lf + cf + cf) / 4.0
+            except (TypeError, ValueError):
+                hl2_val = _hl2(bar)
+                hlc3_val = _hlc3(bar)
+                ohlc4_val = _ohlc4(bar)
+                hlcc4_val = _hlcc4(bar)
             open_series.update(o)
             high_series.update(h)
             low_series.update(l)
@@ -491,18 +519,7 @@ class Runtime:
             _series_lists["time"].append(bar_time)
             _series_lists["time_close"].append(time_close)
 
-            try:
-                dt = datetime.fromtimestamp(int(bar_time) / 1000, tz=timezone.utc)
-                context["year"] = dt.year
-                context["month"] = dt.month
-                context["dayofmonth"] = dt.day
-                context["hour"] = dt.hour
-                context["minute"] = dt.minute
-                context["second"] = dt.second
-                # Pine: 1=Sunday … 7=Saturday
-                context["dayofweek"] = ((dt.weekday() + 1) % 7) + 1
-            except (ValueError, OSError, OverflowError):
-                pass
+            apply_utc_parts_to_context(context, bar_time)
 
             barstate.isfirst = bar_index == 0
             barstate.islast = bar_index == n_bars - 1
@@ -529,7 +546,7 @@ class Runtime:
 
             # Execute script
             try:
-                evaluator.visit(tree)
+                visit(tree)
             except (SyntaxError, TypeError, ValueError, ZeroDivisionError, AttributeError, IndexError, RuntimeError, OverflowError) as e:
                 return {
                     "error": f"Runtime Error at bar {bar_index} (time={bar.get('time', '?')}): {e!s}",
