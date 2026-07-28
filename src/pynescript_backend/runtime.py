@@ -334,6 +334,7 @@ class Runtime:
         source_code: str,
         ohlcv_data: list[dict],
         timeout_seconds: float | None = None,
+        mode: str = "interpret",
     ) -> dict[str, Any]:
         """Execute the script over the provided OHLCV data.
 
@@ -343,6 +344,8 @@ class Runtime:
             timeout_seconds: Maximum wall-clock time for execution. When
                 exceeded, execution stops early and returns a partial result
                 with a ``timed_out`` flag. ``None`` means no timeout.
+            mode: ``interpret`` (default), ``compile`` (Numba path), or
+                ``auto`` (try compile, fall back to interpret).
 
         Returns:
             dict with ``plots``, ``events``, ``count``, ``script_id``,
@@ -352,6 +355,14 @@ class Runtime:
         bar_err = _validate_bars(ohlcv_data)
         if bar_err:
             return {"error": bar_err}
+
+        mode_norm = (mode or "interpret").strip().lower()
+        if mode_norm == "compile":
+            return self._run_compiled(source_code, ohlcv_data)
+        if mode_norm == "auto":
+            return self._run_auto(source_code, ohlcv_data, timeout_seconds=timeout_seconds)
+        if mode_norm not in ("interpret",):
+            return {"error": f"Unknown mode: {mode!r} (use interpret|compile|auto)"}
 
         # Parse once (cached by source hash for multi-run / warm hosts)
         try:
@@ -619,8 +630,97 @@ class Runtime:
             "count": len(results),
             "script_id": script_id,
             "run_id": self._run_id,
+            "mode": "interpret",
         }
         if timed_out:
             result["timed_out"] = True
             result["error"] = "Script execution timed out"
         return result
+
+    @staticmethod
+    def _compile_eligible(source_code: str) -> tuple[bool, str]:
+        try:
+            from pynescript.compiler.engine import has_numba
+        except ImportError:
+            return False, "compiler package unavailable"
+        if not has_numba():
+            return False, "numba not installed"
+        src = source_code or ""
+        if re.search(r"(?m)^\s*import\s+\S+", src):
+            return False, "import statements not supported in compile path"
+        if "request." in src:
+            return False, "request.* not supported in compile path"
+        return True, ""
+
+    def _run_auto(
+        self,
+        source_code: str,
+        ohlcv_data: list[dict],
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        eligible, reason = self._compile_eligible(source_code)
+        compile_err: str | None = reason or None
+        if eligible:
+            compiled_result = self._run_compiled(source_code, ohlcv_data)
+            if "error" not in compiled_result:
+                compiled_result["auto_backend"] = "compile"
+                return compiled_result
+            compile_err = str(compiled_result.get("error") or "compile failed")
+        result = self.run(source_code, ohlcv_data, timeout_seconds=timeout_seconds, mode="interpret")
+        result["auto_backend"] = "interpret"
+        if compile_err:
+            result["compile_fallback_reason"] = compile_err
+        return result
+
+    def _run_compiled(self, source_code: str, ohlcv_data: list[dict]) -> dict[str, Any]:
+        """Numba/object compile path via pynescript.compiler."""
+        try:
+            from pynescript.compiler.engine import compile_script
+            from pynescript.compiler.engine import has_numba
+        except ImportError as e:
+            return {"error": f"Compile mode unavailable: {e!s}"}
+        if not has_numba():
+            return {"error": "Compile mode requires numba (pip install numba)"}
+        if not ohlcv_data:
+            return {"plots": [], "events": [], "count": 0, "mode": "compile", "series": {}}
+        try:
+            compiled = compile_script(source_code)
+        except Exception as e:
+            return {"error": f"Compile Error: {e!s}"}
+        opens = [float(b.get("open", 0.0)) for b in ohlcv_data]
+        highs = [float(b.get("high", 0.0)) for b in ohlcv_data]
+        lows = [float(b.get("low", 0.0)) for b in ohlcv_data]
+        closes = [float(b.get("close", 0.0)) for b in ohlcv_data]
+        volumes = [float(b.get("volume", 1.0)) for b in ohlcv_data]
+        try:
+            series_map = compiled.run(opens, highs, lows, closes, volumes)
+        except Exception as e:
+            return {"error": f"Compiled Runtime Error: {e!s}"}
+        if not isinstance(series_map, dict):
+            series_map = {}
+        drawings = series_map.pop("__drawings", [])
+        events = series_map.pop("__events", [])
+        for meta_key in ("__position_size", "__netprofit", "__equity"):
+            series_map.pop(meta_key, None)
+        final_series: list[Any] = []
+        numeric = {k: v for k, v in series_map.items() if hasattr(v, "tolist")}
+        if numeric:
+            first = next(iter(numeric.values()))
+            final_series = [None if (isinstance(x, float) and x != x) else float(x) for x in first]
+        script_id = hashlib.sha256(source_code.encode("utf-8")).hexdigest()[:16]
+        if isinstance(events, list):
+            for ev in events:
+                if isinstance(ev, dict):
+                    ev.setdefault("script_id", script_id)
+                    ev.setdefault("run_id", self._run_id)
+        return {
+            "plots": final_series,
+            "series": {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in series_map.items()},
+            "drawings": drawings if isinstance(drawings, list) else [],
+            "events": events if isinstance(events, list) else [],
+            "count": len(ohlcv_data),
+            "script_id": script_id,
+            "run_id": self._run_id,
+            "mode": "compile",
+            "object_mode": compiled.object_mode,
+        }
