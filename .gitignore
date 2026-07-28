@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.nbi
+*.nbc
 .pytest_cache/
 .wrangler/
 *.log
@@ -8,3 +10,8 @@ __pycache__/
 coverage/
 data/
 uv.lock
+.cache/
+# Vendored tree is local deploy payload (run scripts/sync_vendor.sh before deploy).
+# Do not ignore python_modules/ if you choose to commit it; only strip bytecode:
+python_modules/**/__pycache__/
+python_modules/**/*.pyc

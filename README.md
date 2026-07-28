@@ -35,6 +35,9 @@ pip install -e ".[dev]"
 # Run tests
 pytest -v
 
+# Sync pynescript into python_modules/ (CF vendored tree — required before deploy)
+./scripts/sync_vendor.sh
+
 # Deploy
 npx wrangler deploy
 # Then set your API key

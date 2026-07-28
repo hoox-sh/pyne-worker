@@ -39,9 +39,13 @@ pynescript ←── pyne-worker (depends on this)
 ```bash
 pip install -e ".[dev]"    # install + dev deps
 pytest tests/ -v            # run tests
-uv run wrangler dev         # local dev
-uv run wrangler deploy      # deploy
+./scripts/sync_vendor.sh   # copy live pynescript → python_modules/ (required before deploy)
+npx wrangler deploy        # deploy (uses python_modules/ as Vendored Modules)
 ```
+
+**Deploy gotcha:** Cloudflare packages `python_modules/pynescript`, not the editable
+install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always run
+`./scripts/sync_vendor.sh` or deploy will fail with `ModuleNotFoundError`.
 
 ## Key Files
 
