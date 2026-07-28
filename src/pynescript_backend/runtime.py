@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import uuid
 
@@ -32,6 +33,9 @@ from pynescript_backend.series import PineSeries
 # Parse tree cache (source sha256 → AST). Bounded.
 _PARSE_CACHE: dict[str, Any] = {}
 _PARSE_CACHE_MAX = 64
+_CAL_NAME_RE = re.compile(
+    r"\b(year|month|dayofmonth|hour|minute|second|dayofweek)\b",
+)
 
 
 def _parse_script(source_code: str) -> Any:
@@ -449,19 +453,27 @@ class Runtime:
             deadline = None
 
         n_bars = len(ohlcv_data)
+        # Pre-extract columns once
+        col_open = [b.get("open") for b in ohlcv_data]
+        col_high = [b.get("high") for b in ohlcv_data]
+        col_low = [b.get("low") for b in ohlcv_data]
+        col_close = [b.get("close") for b in ohlcv_data]
+        col_vol = [b.get("volume") for b in ohlcv_data]
+        col_time = [b.get("time", 0) or 0 for b in ohlcv_data]
+        need_calendar = bool(_CAL_NAME_RE.search(source_code))
+
         visit = evaluator.visit  # localize hot-path method
-        for bar_index, bar in enumerate(ohlcv_data):
+        for bar_index in range(n_bars):
             # Wall-clock check every 32 bars (still first bar + last via natural end)
             if deadline is not None and (bar_index & 31) == 0 and time.monotonic() > deadline:
                 timed_out = True
                 break
             # Update series state (derived prices once per bar)
-            o = bar.get("open")
-            h = bar.get("high")
-            l = bar.get("low")
-            c = bar.get("close")
-            v = bar.get("volume")
-            # Prefer already-extracted o/h/l/c for derived (avoid re-dict)
+            o = col_open[bar_index]
+            h = col_high[bar_index]
+            l = col_low[bar_index]
+            c = col_close[bar_index]
+            v = col_vol[bar_index]
             try:
                 hf, lf, cf = float(h), float(l), float(c)
                 of = float(o)
@@ -470,6 +482,7 @@ class Runtime:
                 ohlc4_val = (of + hf + lf + cf) / 4.0
                 hlcc4_val = (hf + lf + cf + cf) / 4.0
             except (TypeError, ValueError):
+                bar = ohlcv_data[bar_index]
                 hl2_val = _hl2(bar)
                 hlc3_val = _hlc3(bar)
                 ohlc4_val = _ohlc4(bar)
@@ -484,7 +497,18 @@ class Runtime:
             ohlc4_series.update(ohlc4_val)
             hlcc4_series.update(hlcc4_val)
             prev_c = close_series[1] if bar_index > 0 else None
-            tr_val = _tr(bar, float(prev_c) if prev_c is not None else None)
+            # True range without re-fetching bar dict when floats known
+            try:
+                if prev_c is None:
+                    tr_val = float(h) - float(l) if h is not None and l is not None else None
+                else:
+                    tr_val = max(
+                        float(h) - float(l),
+                        abs(float(h) - float(prev_c)),
+                        abs(float(l) - float(prev_c)),
+                    )
+            except (TypeError, ValueError):
+                tr_val = _tr(ohlcv_data[bar_index], float(prev_c) if prev_c is not None else None)
             tr_series.update(tr_val)
 
             # Accumulate series lists for builtin technical indicators
@@ -500,15 +524,14 @@ class Runtime:
             _series_lists["tr"].append(tr_val)
 
             # Update per-bar counters and time series (history for time[n])
-            bar_time = bar.get("time", 0) or 0
+            bar_time = col_time[bar_index]
             # Assume daily bars for time_close when next open unknown
             if bar_index + 1 < n_bars:
-                next_time = ohlcv_data[bar_index + 1].get("time", bar_time) or bar_time
-                time_close = next_time
+                time_close = col_time[bar_index + 1] or bar_time
             else:
                 # Fallback close = open + inferred bar spacing (or 1 day)
                 if bar_index > 0:
-                    prev_t = ohlcv_data[bar_index - 1].get("time", bar_time) or bar_time
+                    prev_t = col_time[bar_index - 1] or bar_time
                     spacing = max(1, int(bar_time) - int(prev_t))
                 else:
                     spacing = 86_400_000
@@ -519,7 +542,8 @@ class Runtime:
             _series_lists["time"].append(bar_time)
             _series_lists["time_close"].append(time_close)
 
-            apply_utc_parts_to_context(context, bar_time)
+            if need_calendar:
+                apply_utc_parts_to_context(context, bar_time)
 
             barstate.isfirst = bar_index == 0
             barstate.islast = bar_index == n_bars - 1
@@ -530,6 +554,7 @@ class Runtime:
             barstate.isrealtime = False
 
             # Update bid/ask if available (February 2025)
+            bar = ohlcv_data[bar_index]
             if "bid" in bar:
                 self._bid = bar["bid"]
             if "ask" in bar:
@@ -549,7 +574,7 @@ class Runtime:
                 visit(tree)
             except (SyntaxError, TypeError, ValueError, ZeroDivisionError, AttributeError, IndexError, RuntimeError, OverflowError) as e:
                 return {
-                    "error": f"Runtime Error at bar {bar_index} (time={bar.get('time', '?')}): {e!s}",
+                    "error": f"Runtime Error at bar {bar_index} (time={bar_time}): {e!s}",
                     "bar": bar_index,
                 }
 

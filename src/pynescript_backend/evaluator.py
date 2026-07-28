@@ -252,21 +252,15 @@ class CustomEvaluator(NodeLiteralEvaluator):
         if dispatch is None:
             dispatch = self._build_builtin_map()
             self._builtin_dispatch = dispatch
-        is_ta_alias = (
+        # Tuple form of startswith is cheaper than multiple checks per call.
+        if name.startswith(("ta.", "array.", "matrix.", "map.")):
+            cleaned_args = args
+        elif (
             not name.startswith("ta.")
             and f"ta.{name}" in dispatch
             and dispatch.get(name) is dispatch.get(f"ta.{name}")
-        )
-        if (
-            name.startswith("ta.")
-            or is_ta_alias
-            or name.startswith("array.")
-            or name.startswith("matrix.")
-            or name.startswith("map.")
         ):
             cleaned_args = args
-            # Keep ta.* kwargs so base._call_builtin can merge source=/length=/…
-            # into positional args. Unknown plot-style kwargs are dropped there.
         elif name.startswith("request."):
             cleaned_args = [
                 a if i >= 2 else _to_scalar(a)
