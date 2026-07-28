@@ -525,7 +525,8 @@ class Runtime:
                 tr_val = _tr(ohlcv_data[bar_index], float(prev_c) if prev_c is not None else None)
             tr_series.update(tr_val)
 
-            # Accumulate series lists for builtin technical indicators
+            # Accumulate series lists for builtin technical indicators.
+            # Cap to evaluator _SERIES_MAX (+slack) so long runs stay O(1) memory.
             _series_lists["open"].append(o)
             _series_lists["high"].append(h)
             _series_lists["low"].append(l)
@@ -536,6 +537,11 @@ class Runtime:
             _series_lists["ohlc4"].append(ohlc4_val)
             _series_lists["hlcc4"].append(hlcc4_val)
             _series_lists["tr"].append(tr_val)
+            _series_cap = getattr(evaluator, "_SERIES_MAX", 256)
+            if len(_series_lists["close"]) > _series_cap + 64:
+                keep = _series_cap
+                for _sk in _series_lists:
+                    _series_lists[_sk] = _series_lists[_sk][-keep:]
 
             # Update per-bar counters and time series (history for time[n])
             bar_time = col_time[bar_index]
