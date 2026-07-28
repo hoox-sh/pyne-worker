@@ -453,11 +453,15 @@ class Runtime:
         evaluator._var_declarations.clear()
         evaluator.current_series = _series_lists
 
-        results = []
+        # Per-bar first-plot values (worker response keeps simple plots list)
+        plot0_values: list[Any] = []
+        plot0_append = plot0_values.append
         all_events: list[dict] = []
+        all_events_append = all_events.append
 
         # Generate stable script_id from source hash
         script_id = hashlib.sha256(source_code.encode("utf-8")).hexdigest()[:16]
+        run_id = self._run_id
 
         # Wall-clock deadline for circuit breaker
         timed_out = False
@@ -467,6 +471,7 @@ class Runtime:
             deadline = None
 
         n_bars = len(ohlcv_data)
+        last_bar_i = n_bars - 1
         # Pre-extract columns once
         col_open = [b.get("open") for b in ohlcv_data]
         col_high = [b.get("high") for b in ohlcv_data]
@@ -475,81 +480,130 @@ class Runtime:
         col_vol = [b.get("volume") for b in ohlcv_data]
         col_time = [b.get("time", 0) or 0 for b in ohlcv_data]
         need_calendar = bool(_CAL_NAME_RE.search(source_code))
+        has_bid_ask = any(("bid" in b) or ("ask" in b) for b in ohlcv_data)
 
-        visit = evaluator.visit  # localize hot-path method
+        # Pre-bind series list locals + in-place cap (mirrors backend/runtime.py)
+        sl_open = _series_lists["open"]
+        sl_high = _series_lists["high"]
+        sl_low = _series_lists["low"]
+        sl_close = _series_lists["close"]
+        sl_vol = _series_lists["volume"]
+        sl_hl2 = _series_lists["hl2"]
+        sl_hlc3 = _series_lists["hlc3"]
+        sl_ohlc4 = _series_lists["ohlc4"]
+        sl_hlcc4 = _series_lists["hlcc4"]
+        sl_tr = _series_lists["tr"]
+        sl_time = _series_lists["time"]
+        sl_time_close = _series_lists["time_close"]
+        _series_list_refs = (
+            sl_open,
+            sl_high,
+            sl_low,
+            sl_close,
+            sl_vol,
+            sl_hl2,
+            sl_hlc3,
+            sl_ohlc4,
+            sl_hlcc4,
+            sl_tr,
+            sl_time,
+            sl_time_close,
+        )
+        series_cap = int(getattr(evaluator, "_SERIES_MAX", 256) or 256)
+        series_cap_limit = series_cap + 64
+
+        open_update = open_series.update
+        high_update = high_series.update
+        low_update = low_series.update
+        close_update = close_series.update
+        volume_update = volume_series.update
+        hl2_update = hl2_series.update
+        hlc3_update = hlc3_series.update
+        ohlc4_update = ohlc4_series.update
+        hlcc4_update = hlcc4_series.update
+        tr_update = tr_series.update
+        time_update = time_series.update
+        time_close_update = time_close_series.update
+
+        # Static historical barstate flags (do not change mid-run)
+        barstate.isnew = True
+        barstate.ishistory = True
+        barstate.isconfirmed = True
+        barstate.isrealtime = False
+
+        visit = evaluator.visit
+        reset_plots = evaluator.reset_plots
+        plot_outputs = evaluator.plot_outputs
+        strategy_state = getattr(evaluator, "_strategy_state", None)
+        strategy_events = getattr(strategy_state, "_events", None) if strategy_state else None
+        set_defs_locked = True
+        prev_close_f: float | None = None
+
         for bar_index in range(n_bars):
             # Wall-clock check every 32 bars (still first bar + last via natural end)
             if deadline is not None and (bar_index & 31) == 0 and time.monotonic() > deadline:
                 timed_out = True
                 break
-            # Update series state (derived prices once per bar)
             o = col_open[bar_index]
             h = col_high[bar_index]
             l = col_low[bar_index]
             c = col_close[bar_index]
             v = col_vol[bar_index]
             try:
-                hf, lf, cf = float(h), float(l), float(c)
                 of = float(o)
-                hl2_val = (hf + lf) / 2.0
+                hf = float(h)
+                lf = float(l)
+                cf = float(c)
+                hl2_val = (hf + lf) * 0.5
                 hlc3_val = (hf + lf + cf) / 3.0
-                ohlc4_val = (of + hf + lf + cf) / 4.0
-                hlcc4_val = (hf + lf + cf + cf) / 4.0
+                ohlc4_val = (of + hf + lf + cf) * 0.25
+                hlcc4_val = (hf + lf + cf + cf) * 0.25
+                if prev_close_f is None:
+                    tr_val: float | None = hf - lf
+                else:
+                    tr_val = max(hf - lf, abs(hf - prev_close_f), abs(lf - prev_close_f))
+                prev_close_f = cf
             except (TypeError, ValueError):
                 bar = ohlcv_data[bar_index]
                 hl2_val = _hl2(bar)
                 hlc3_val = _hlc3(bar)
                 ohlc4_val = _ohlc4(bar)
                 hlcc4_val = _hlcc4(bar)
-            open_series.update(o)
-            high_series.update(h)
-            low_series.update(l)
-            close_series.update(c)
-            volume_series.update(v)
-            hl2_series.update(hl2_val)
-            hlc3_series.update(hlc3_val)
-            ohlc4_series.update(ohlc4_val)
-            hlcc4_series.update(hlcc4_val)
-            prev_c = close_series[1] if bar_index > 0 else None
-            # True range without re-fetching bar dict when floats known
-            try:
-                if prev_c is None:
-                    tr_val = float(h) - float(l) if h is not None and l is not None else None
-                else:
-                    tr_val = max(
-                        float(h) - float(l),
-                        abs(float(h) - float(prev_c)),
-                        abs(float(l) - float(prev_c)),
-                    )
-            except (TypeError, ValueError):
-                tr_val = _tr(ohlcv_data[bar_index], float(prev_c) if prev_c is not None else None)
-            tr_series.update(tr_val)
+                try:
+                    prev_c = prev_close_f
+                    tr_val = _tr(bar, prev_c)
+                    prev_close_f = float(c)
+                except (TypeError, ValueError):
+                    tr_val = None
+                    prev_close_f = None
 
-            # Accumulate series lists for builtin technical indicators.
-            # Cap to evaluator _SERIES_MAX (+slack) so long runs stay O(1) memory.
-            _series_lists["open"].append(o)
-            _series_lists["high"].append(h)
-            _series_lists["low"].append(l)
-            _series_lists["close"].append(c)
-            _series_lists["volume"].append(v)
-            _series_lists["hl2"].append(hl2_val)
-            _series_lists["hlc3"].append(hlc3_val)
-            _series_lists["ohlc4"].append(ohlc4_val)
-            _series_lists["hlcc4"].append(hlcc4_val)
-            _series_lists["tr"].append(tr_val)
-            _series_cap = getattr(evaluator, "_SERIES_MAX", 256)
-            if len(_series_lists["close"]) > _series_cap + 64:
-                keep = _series_cap
-                for _sk in _series_lists:
-                    _series_lists[_sk] = _series_lists[_sk][-keep:]
+            open_update(o)
+            high_update(h)
+            low_update(l)
+            close_update(c)
+            volume_update(v)
+            hl2_update(hl2_val)
+            hlc3_update(hlc3_val)
+            ohlc4_update(ohlc4_val)
+            hlcc4_update(hlcc4_val)
+            tr_update(tr_val)
 
-            # Update per-bar counters and time series (history for time[n])
+            # Append-only + in-place series cap (pre-bound list refs stay valid)
+            sl_open.append(o)
+            sl_high.append(h)
+            sl_low.append(l)
+            sl_close.append(c)
+            sl_vol.append(v)
+            sl_hl2.append(hl2_val)
+            sl_hlc3.append(hlc3_val)
+            sl_ohlc4.append(ohlc4_val)
+            sl_hlcc4.append(hlcc4_val)
+            sl_tr.append(tr_val)
+
             bar_time = col_time[bar_index]
-            # Assume daily bars for time_close when next open unknown
-            if bar_index + 1 < n_bars:
+            if bar_index < last_bar_i:
                 time_close = col_time[bar_index + 1] or bar_time
             else:
-                # Fallback close = open + inferred bar spacing (or 1 day)
                 if bar_index > 0:
                     prev_t = col_time[bar_index - 1] or bar_time
                     spacing = max(1, int(bar_time) - int(prev_t))
@@ -557,39 +611,39 @@ class Runtime:
                     spacing = 86_400_000
                 time_close = int(bar_time) + spacing
             context["bar_index"] = bar_index
-            time_series.update(bar_time)
-            time_close_series.update(time_close)
-            _series_lists["time"].append(bar_time)
-            _series_lists["time_close"].append(time_close)
+            time_update(bar_time)
+            time_close_update(time_close)
+            sl_time.append(bar_time)
+            sl_time_close.append(time_close)
+
+            # Cap after all series for this bar are appended (aligned lists)
+            n_hist = len(sl_close)
+            if n_hist > series_cap_limit:
+                drop = n_hist - series_cap
+                for _lst in _series_list_refs:
+                    del _lst[:drop]
 
             if need_calendar:
                 apply_utc_parts_to_context(context, bar_time)
 
+            is_last = bar_index == last_bar_i
             barstate.isfirst = bar_index == 0
-            barstate.islast = bar_index == n_bars - 1
-            barstate.isnew = True
-            barstate.ishistory = True
-            barstate.isconfirmed = True
-            barstate.islastconfirmedhistory = barstate.islast
-            barstate.isrealtime = False
+            barstate.islast = is_last
+            barstate.islastconfirmedhistory = is_last
 
-            # Update bid/ask if available (February 2025)
-            bar = ohlcv_data[bar_index]
-            if "bid" in bar:
-                self._bid = bar["bid"]
-            if "ask" in bar:
-                self._ask = bar["ask"]
-            # Reset plot capture and event buffer for this bar
-            evaluator.reset_plots()
-            if hasattr(evaluator, "reset_events"):
-                evaluator.reset_events()
-            elif hasattr(evaluator, "_strategy_state"):
-                evaluator._strategy_state._events = []
-            # Bar-mode call-site indices (crossover + incremental ta.*)
+            if has_bid_ask:
+                bar = ohlcv_data[bar_index]
+                if "bid" in bar:
+                    self._bid = bar["bid"]
+                if "ask" in bar:
+                    self._ask = bar["ask"]
+
+            reset_plots()
+            if strategy_events:
+                strategy_events.clear()
             evaluator._cross_call_i = 0  # type: ignore[attr-defined]
             evaluator._ta_call_i = 0  # type: ignore[attr-defined]
 
-            # Execute script
             try:
                 visit(tree)
             except (SyntaxError, TypeError, ValueError, ZeroDivisionError, AttributeError, IndexError, RuntimeError, OverflowError) as e:
@@ -598,47 +652,30 @@ class Runtime:
                     "bar": bar_index,
                 }
 
-            # After the first bar, lock function/type/import registration.
-            # Re-visiting Console-scale method tables every bar used to append
-            # multi-dispatch overloads (O(bars²)) and hang Runtime runs.
-            # Mirrors pynescript/backend/runtime.py (package evaluator already
-            # guards visit_FunctionDef / TypeDef / Import on this flag).
-            evaluator._pine_defs_locked = True  # type: ignore[attr-defined]
+            if set_defs_locked:
+                evaluator._pine_defs_locked = True  # type: ignore[attr-defined]
+                set_defs_locked = False
 
-            # Collect events from this bar (convert to dicts for serialization)
-            if hasattr(evaluator, "_strategy_state"):
-                bar_events = evaluator._strategy_state.drain_events()
+            if strategy_state is not None and strategy_events:
+                for ev in strategy_state.drain_events():
+                    ev_dict = ev.to_dict()
+                    ev_dict["script_id"] = script_id
+                    ev_dict["run_id"] = run_id
+                    all_events_append(ev_dict)
+
+            # First plot value only (worker API)
+            if plot_outputs:
+                p0 = plot_outputs[0]
+                plot0_append(p0.get("value") if isinstance(p0, dict) else p0)
             else:
-                bar_events = []
-            for ev in bar_events:
-                ev_dict = ev.to_dict()
-                ev_dict["script_id"] = script_id
-                ev_dict["run_id"] = self._run_id
-                all_events.append(ev_dict)
-
-            # Collect outputs from this bar
-            # For simplicity, we assume one plot() call for now and return that value.
-            # If there are multiple plots, we'd need a more structured response.
-            bar_result = {}
-            for i, plot in enumerate(evaluator.plot_outputs):
-                bar_result[f"plot_{i}"] = plot["value"]
-
-            results.append(bar_result)
-
-        # Post-process results into structure expected by frontend
-        # Front end expects: array of values for the overlay series.
-        # Let's simplify and just return the first plot series found.
-
-        final_series = []
-        if results and "plot_0" in results[0]:
-            final_series = [r.get("plot_0") for r in results]
+                plot0_append(None)
 
         result: dict[str, Any] = {
-            "plots": final_series,
+            "plots": plot0_values,
             "events": all_events,
-            "count": len(results),
+            "count": len(plot0_values),
             "script_id": script_id,
-            "run_id": self._run_id,
+            "run_id": run_id,
             "mode": "interpret",
         }
         if timed_out:
