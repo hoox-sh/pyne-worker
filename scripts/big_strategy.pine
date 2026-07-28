@@ -1,0 +1,30 @@
+//@version=6
+strategy("BigStrategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ── Price-action conditions ─────────────────────────────────────────────────
+longCondition = close > open and close > close[1] and high > high[1]
+shortCondition = close < open and close < close[1] and low < low[1]
+
+// ── Entries ─────────────────────────────────────────────────────────────────
+if longCondition and bar_index > 10
+    strategy.entry("Long", strategy.long, qty=100, comment="bullish bar")
+    strategy.exit("Long Exit", "Long", stop=low * 0.97, limit=close * 1.08, trail_price=close * 0.03)
+
+if shortCondition and bar_index > 10
+    strategy.entry("Short", strategy.short, qty=100, comment="bearish bar")
+    strategy.exit("Short Exit", "Short", stop=high * 1.03, limit=close * 0.92, trail_price=close * 0.03)
+
+// ── Close on reversal ───────────────────────────────────────────────────────
+if shortCondition and strategy.position_size > 0
+    strategy.close("Long", comment="reversed to short")
+
+if longCondition and strategy.position_size < 0
+    strategy.close("Short", comment="reversed to long")
+
+// ── Periodic close ──────────────────────────────────────────────────────────
+if bar_index % 20 == 0 and strategy.position_size != 0
+    strategy.close_all(comment="periodic exit")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(close, "Close", color=color.white, linewidth=1)
+plot(open, "Open", color=color.gray, linewidth=1)

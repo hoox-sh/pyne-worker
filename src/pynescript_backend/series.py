@@ -1,3 +1,19 @@
+# pyne-worker — Python Cloudflare Worker for Pine Script evaluation
+# Copyright (C) 2024-2026  jango-blockchained
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 from __future__ import annotations
 
 import operator
@@ -17,16 +33,30 @@ class PineSeries:
     __hash__ = None  # type: ignore
 
     def __init__(self, initial_value: Any = None, history_length: int = 1000):
-        self.history = deque([initial_value], maxlen=history_length)
+        # Start empty so the first update() is bar 0 — do not seed a fake na bar.
+        self.history: deque[Any] = deque(maxlen=history_length)
         self.current = initial_value
+        if initial_value is not None:
+            self.history.appendleft(initial_value)
 
     def update(self, new_value: Any):
         """Push a new value for the current bar."""
         self.current = new_value
         self.history.appendleft(new_value)
 
-    def __getitem__(self, index: int):
-        """Access historical values. series[0] is current, series[1] is previous."""
+    def __getitem__(self, index: int | float):
+        """Access historical values. series[0] is current, series[1] is previous.
+
+        Float offsets (e.g. ``close[depth / 2]``) are truncated toward zero,
+        matching Pine's int coercion for series subscripts.
+        """
+        if isinstance(index, float):
+            if index != index:  # NaN
+                return None
+            index = int(index)
+        if not isinstance(index, int):
+            msg = f"Pine series index must be int, got {type(index).__name__}"
+            raise TypeError(msg)
         if index < 0:
             msg = "Pine Script does not support negative indexing"
             raise ValueError(msg)
@@ -35,12 +65,17 @@ class PineSeries:
         return self.history[index]
 
     def _binary_op(self, other: Any, op: Callable) -> Any:
-        other_val = other.current if isinstance(other, PineSeries) else other
+        other_val = (
+            other.current if isinstance(other, PineSeries) else (other.current if hasattr(other, "current") else other)
+        )
 
         if self.current is None or other_val is None:
             return None
 
-        return op(self.current, other_val)
+        try:
+            return op(self.current, other_val)
+        except TypeError:
+            return None
 
     # Arithmetic Operations
     def __add__(self, other):
@@ -105,3 +140,18 @@ class PineSeries:
 
     def __repr__(self):
         return f"PineSeries({self.current})"
+
+    def __float__(self):
+        """Allow Python ``float(series)`` — used by some numeric coercions."""
+        if self.current is None:
+            return float("nan")
+        return float(self.current)
+
+    def __int__(self):
+        if self.current is None:
+            return 0
+        return int(self.current)
+
+    def __index__(self):
+        """Permit use as array/series index when current is whole number."""
+        return int(self)
