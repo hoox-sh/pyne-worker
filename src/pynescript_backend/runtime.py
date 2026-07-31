@@ -39,6 +39,11 @@ _PARSE_CACHE_MAX = 64
 _CAL_NAME_RE = re.compile(
     r"\b(year|month|dayofmonth|hour|minute|second|dayofweek)\b",
 )
+# Derived built-in series — skip update/append when script never names them.
+_HL2_RE = re.compile(r"\bhl2\b")
+_HLC3_RE = re.compile(r"\bhlc3\b")
+_OHLC4_RE = re.compile(r"\bohlc4\b")
+_HLCC4_RE = re.compile(r"\bhlcc4\b")
 
 
 def _parse_script(source_code: str) -> Any:
@@ -480,6 +485,10 @@ class Runtime:
         col_vol = [b.get("volume") for b in ohlcv_data]
         col_time = [b.get("time", 0) or 0 for b in ohlcv_data]
         need_calendar = bool(_CAL_NAME_RE.search(source_code))
+        need_hl2 = bool(_HL2_RE.search(source_code))
+        need_hlc3 = bool(_HLC3_RE.search(source_code))
+        need_ohlc4 = bool(_OHLC4_RE.search(source_code))
+        need_hlcc4 = bool(_HLCC4_RE.search(source_code))
         has_bid_ask = any(("bid" in b) or ("ask" in b) for b in ohlcv_data)
 
         # Pre-bind series list locals + in-place cap (mirrors backend/runtime.py)
@@ -495,20 +504,25 @@ class Runtime:
         sl_tr = _series_lists["tr"]
         sl_time = _series_lists["time"]
         sl_time_close = _series_lists["time_close"]
-        _series_list_refs = (
+        _series_list_refs_list = [
             sl_open,
             sl_high,
             sl_low,
             sl_close,
             sl_vol,
-            sl_hl2,
-            sl_hlc3,
-            sl_ohlc4,
-            sl_hlcc4,
             sl_tr,
             sl_time,
             sl_time_close,
-        )
+        ]
+        if need_hl2:
+            _series_list_refs_list.append(sl_hl2)
+        if need_hlc3:
+            _series_list_refs_list.append(sl_hlc3)
+        if need_ohlc4:
+            _series_list_refs_list.append(sl_ohlc4)
+        if need_hlcc4:
+            _series_list_refs_list.append(sl_hlcc4)
+        _series_list_refs = tuple(_series_list_refs_list)
         series_cap = int(getattr(evaluator, "_SERIES_MAX", 256) or 256)
         series_cap_limit = series_cap + 64
 
@@ -549,6 +563,8 @@ class Runtime:
             l = col_low[bar_index]
             c = col_close[bar_index]
             v = col_vol[bar_index]
+            # Always compute derived OHLC so input.source overrides can select them
+            # even when the script body never mentions hl2/hlc3/ohlc4.
             try:
                 of = float(o)
                 hf = float(h)
@@ -557,7 +573,7 @@ class Runtime:
                 hl2_val = (hf + lf) * 0.5
                 hlc3_val = (hf + lf + cf) / 3.0
                 ohlc4_val = (of + hf + lf + cf) * 0.25
-                hlcc4_val = (hf + lf + cf + cf) * 0.25
+                hlcc4_val = (hf + lf + cf + cf) * 0.25 if need_hlcc4 else None
                 if prev_close_f is None:
                     tr_val: float | None = hf - lf
                 else:
@@ -568,7 +584,7 @@ class Runtime:
                 hl2_val = _hl2(bar)
                 hlc3_val = _hlc3(bar)
                 ohlc4_val = _ohlc4(bar)
-                hlcc4_val = _hlcc4(bar)
+                hlcc4_val = _hlcc4(bar) if need_hlcc4 else None
                 try:
                     prev_c = prev_close_f
                     tr_val = _tr(bar, prev_c)
@@ -585,7 +601,15 @@ class Runtime:
             hl2_update(hl2_val)
             hlc3_update(hlc3_val)
             ohlc4_update(ohlc4_val)
-            hlcc4_update(hlcc4_val)
+            if need_hl2:
+                sl_hl2.append(hl2_val)
+            if need_hlc3:
+                sl_hlc3.append(hlc3_val)
+            if need_ohlc4:
+                sl_ohlc4.append(ohlc4_val)
+            if need_hlcc4:
+                hlcc4_update(hlcc4_val)
+                sl_hlcc4.append(hlcc4_val)
             tr_update(tr_val)
 
             # Append-only + in-place series cap (pre-bound list refs stay valid)
@@ -594,10 +618,6 @@ class Runtime:
             sl_low.append(l)
             sl_close.append(c)
             sl_vol.append(v)
-            sl_hl2.append(hl2_val)
-            sl_hlc3.append(hlc3_val)
-            sl_ohlc4.append(ohlc4_val)
-            sl_hlcc4.append(hlcc4_val)
             sl_tr.append(tr_val)
 
             bar_time = col_time[bar_index]
@@ -664,7 +684,8 @@ class Runtime:
                     ev_dict["run_id"] = run_id
                     all_events_append(ev_dict)
 
-            # First plot value only (worker API)
+            # First plot value only (worker API). plot_outputs holds scalars
+            # (or legacy dicts for mixed evaluator versions).
             if plot_outputs:
                 p0 = plot_outputs[0]
                 plot0_append(p0.get("value") if isinstance(p0, dict) else p0)

@@ -307,7 +307,9 @@ class CustomEvaluator(NodeLiteralEvaluator):
     def _builtin_plot(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
         if not args:
             return None
-        self.plot_outputs.append({"type": "plot", "value": _to_scalar(args[0])})
+        # Value-only capture (worker Runtime only needs first plot scalar).
+        # Avoid per-bar dict allocation; keep dict shape only if mid-bar readers expect it.
+        self.plot_outputs.append(_to_scalar(args[0]))
         return None
 
     def reset_plots(self):
