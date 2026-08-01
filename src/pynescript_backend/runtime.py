@@ -36,6 +36,27 @@ from pynescript_backend.series import PineSeries
 # Parse tree cache (source sha256 → AST). Bounded.
 _PARSE_CACHE: dict[str, Any] = {}
 _PARSE_CACHE_MAX = 64
+
+# Host-side compile cache (raw source sha256 → CompiledScript). Aligns with SoT
+# backend/runtime.py (R5–R6 Agent 05/12).
+_HOST_COMPILE_CACHE: dict[str, Any] = {}
+_HOST_COMPILE_CACHE_MAX = 64
+
+# Auto-mode negative cache: source sha256 → compile failure reason.
+_HOST_COMPILE_FAIL_CACHE: dict[str, str] = {}
+_HOST_COMPILE_FAIL_CACHE_MAX = 128
+
+# Compiler package availability for mode=auto prefilter (None = not probed yet).
+_HAS_COMPILER: bool | None = None
+
+# Structured Runtime error kinds (surfaced as ``error_kind``; keep string ``error``).
+ERROR_KIND_PARSE = "parse"
+ERROR_KIND_COMPILE = "compile"
+ERROR_KIND_RUNTIME = "runtime"
+ERROR_KIND_DATA = "data"
+ERROR_KIND_ORDER = "order"
+ERROR_KIND_MODE = "mode"
+
 _CAL_NAME_RE = re.compile(
     r"\b(year|month|dayofmonth|hour|minute|second|dayofweek)\b",
 )
@@ -44,6 +65,37 @@ _HL2_RE = re.compile(r"\bhl2\b")
 _HLC3_RE = re.compile(r"\bhlc3\b")
 _OHLC4_RE = re.compile(r"\bohlc4\b")
 _HLCC4_RE = re.compile(r"\bhlcc4\b")
+
+
+def _error_payload(
+    message: str,
+    *,
+    kind: str,
+    exc: BaseException | None = None,
+    bar_index: int | None = None,
+    bar_time: Any = None,
+) -> dict[str, Any]:
+    """Build a classified Runtime error dict (fail-closed host contract)."""
+    body: dict[str, Any] = {
+        "error": message,
+        "error_kind": kind,
+    }
+    if exc is not None:
+        body["error_type"] = type(exc).__name__
+    if bar_index is not None:
+        body["error_bar"] = int(bar_index)
+    if bar_time is not None:
+        body["error_bar_time"] = bar_time
+    return body
+
+
+def _format_exc_message(prefix: str, exc: BaseException) -> str:
+    """``Prefix: TypeName: detail``."""
+    et = type(exc).__name__
+    detail = str(exc).strip() or et
+    if detail == et:
+        return f"{prefix}: {et}"
+    return f"{prefix}: {et}: {detail}"
 
 
 def _parse_script(source_code: str) -> Any:
@@ -343,6 +395,7 @@ class Runtime:
         ohlcv_data: list[dict],
         timeout_seconds: float | None = None,
         mode: str = "interpret",
+        inputs: dict | None = None,
     ) -> dict[str, Any]:
         """Execute the script over the provided OHLCV data.
 
@@ -354,31 +407,49 @@ class Runtime:
                 with a ``timed_out`` flag. ``None`` means no timeout.
             mode: ``interpret`` (default), ``compile`` (Numba path), or
                 ``auto`` (try compile, fall back to interpret).
+            inputs: Optional Pine ``input.*`` overrides (title → value). Non-empty
+                inputs force ``mode=auto`` onto interpret (compile cannot apply them).
 
         Returns:
             dict with ``plots``, ``events``, ``count``, ``script_id``,
-            ``run_id``, or ``error`` on failure.
+            ``run_id``, or ``error`` / ``error_kind`` on failure.
         """
         # Validate bars first
         bar_err = _validate_bars(ohlcv_data)
         if bar_err:
-            return {"error": bar_err}
+            return _error_payload(bar_err, kind=ERROR_KIND_DATA)
 
         mode_norm = (mode or "interpret").strip().lower()
         if mode_norm == "compile":
             return self._run_compiled(source_code, ohlcv_data)
         if mode_norm == "auto":
-            return self._run_auto(source_code, ohlcv_data, timeout_seconds=timeout_seconds)
+            return self._run_auto(
+                source_code,
+                ohlcv_data,
+                timeout_seconds=timeout_seconds,
+                inputs=inputs,
+            )
         if mode_norm not in ("interpret",):
-            return {"error": f"Unknown mode: {mode!r} (use interpret|compile|auto)"}
+            return _error_payload(
+                f"Unknown mode: {mode!r} (use interpret|compile|auto)",
+                kind=ERROR_KIND_MODE,
+            )
 
         # Parse once (cached by source hash for multi-run / warm hosts)
         try:
             tree = _parse_script(source_code)
         except SyntaxError as e:
-            return {"error": f"Syntax Error: {e!s}"}
+            return _error_payload(
+                f"Syntax Error: {e!s}",
+                kind=ERROR_KIND_PARSE,
+                exc=e,
+            )
         except Exception as e:
-            return {"error": f"Parse Error: {e!s}"}
+            return _error_payload(
+                f"Parse Error: {e!s}",
+                kind=ERROR_KIND_PARSE,
+                exc=e,
+            )
 
         # Initialize Series
         open_series = PineSeries()
@@ -677,10 +748,13 @@ class Runtime:
             try:
                 visit(tree)
             except (SyntaxError, TypeError, ValueError, ZeroDivisionError, AttributeError, IndexError, RuntimeError, OverflowError) as e:
-                return {
-                    "error": f"Runtime Error at bar {bar_index} (time={bar_time}): {e!s}",
-                    "bar": bar_index,
-                }
+                return _error_payload(
+                    f"Runtime Error at bar {bar_index} (time={bar_time}): {e!s}",
+                    kind=ERROR_KIND_RUNTIME,
+                    exc=e,
+                    bar_index=bar_index,
+                    bar_time=bar_time,
+                )
 
             if set_defs_locked:
                 evaluator._pine_defs_locked = True  # type: ignore[attr-defined]
@@ -738,10 +812,17 @@ class Runtime:
         compile works without Numba, so we do not gate eligibility on it here —
         ``compile_script`` raises a clear error when Numba is required but missing.
         """
-        try:
-            import pynescript.compiler.engine  # noqa: F401
-        except ImportError:
+        global _HAS_COMPILER
+        if _HAS_COMPILER is False:
             return False, "compiler package unavailable"
+        if _HAS_COMPILER is None:
+            try:
+                import pynescript.compiler.engine  # noqa: F401
+
+                _HAS_COMPILER = True
+            except ImportError:
+                _HAS_COMPILER = False
+                return False, "compiler package unavailable"
         src = source_code or ""
         if re.search(r"(?m)^\s*import\s+\S+", src):
             return False, "import statements not supported in compile path"
@@ -749,41 +830,137 @@ class Runtime:
             return False, "request.* not supported in compile path"
         return True, ""
 
+    @staticmethod
+    def _source_cache_key(source_code: str) -> str:
+        return hashlib.sha256((source_code or "").encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _is_cacheable_compile_failure(err: str) -> bool:
+        """True for deterministic source/environment failures (not bar-data runtime)."""
+        e = (err or "").strip()
+        if not e:
+            return False
+        if e.startswith("Compiled Runtime Error"):
+            return False
+        if e.startswith("Compile Error"):
+            return True
+        if e.startswith("Compile mode unavailable"):
+            return True
+        low = e.lower()
+        if "numba" in low and ("required" in low or "not installed" in low):
+            return True
+        return False
+
+    @staticmethod
+    def _remember_compile_failure(cache_key: str, reason: str) -> None:
+        if not cache_key or not reason:
+            return
+        if (
+            len(_HOST_COMPILE_FAIL_CACHE) >= _HOST_COMPILE_FAIL_CACHE_MAX
+            and cache_key not in _HOST_COMPILE_FAIL_CACHE
+        ):
+            try:
+                _HOST_COMPILE_FAIL_CACHE.pop(next(iter(_HOST_COMPILE_FAIL_CACHE)))
+            except StopIteration:
+                pass
+        _HOST_COMPILE_FAIL_CACHE[cache_key] = reason
+
     def _run_auto(
         self,
         source_code: str,
         ohlcv_data: list[dict],
         timeout_seconds: float | None = None,
+        inputs: dict | None = None,
     ) -> dict[str, Any]:
-        eligible, reason = self._compile_eligible(source_code)
+        """Try compile; fall back to interpret. Sets ``auto_backend`` + fallback reason."""
+        # Compile path does not apply input.* overrides — prefer full host semantics.
+        if inputs:
+            result = self.run(
+                source_code,
+                ohlcv_data,
+                timeout_seconds=timeout_seconds,
+                mode="interpret",
+                inputs=inputs,
+            )
+            if isinstance(result, dict):
+                result["mode"] = result.get("mode") or "interpret"
+                result["auto_backend"] = "interpret"
+                result["compile_fallback_reason"] = "input.* overrides require interpret path"
+            return result
+
+        src_key = self._source_cache_key(source_code)
+        prior_fail = _HOST_COMPILE_FAIL_CACHE.get(src_key)
+        if prior_fail is not None:
+            eligible, reason = False, prior_fail
+        else:
+            eligible, reason = self._compile_eligible(source_code)
+
         compile_err: str | None = reason or None
         if eligible:
             compiled_result = self._run_compiled(source_code, ohlcv_data)
             if "error" not in compiled_result:
+                _HOST_COMPILE_FAIL_CACHE.pop(src_key, None)
+                compiled_result["mode"] = compiled_result.get("mode") or "compile"
                 compiled_result["auto_backend"] = "compile"
                 return compiled_result
             compile_err = str(compiled_result.get("error") or "compile failed")
-        result = self.run(source_code, ohlcv_data, timeout_seconds=timeout_seconds, mode="interpret")
-        result["auto_backend"] = "interpret"
-        if compile_err:
-            result["compile_fallback_reason"] = compile_err
+            if self._is_cacheable_compile_failure(compile_err):
+                self._remember_compile_failure(src_key, compile_err)
+        elif reason and self._is_cacheable_compile_failure(reason):
+            self._remember_compile_failure(src_key, reason)
+
+        result = self.run(
+            source_code,
+            ohlcv_data,
+            timeout_seconds=timeout_seconds,
+            mode="interpret",
+            inputs=inputs,
+        )
+        if isinstance(result, dict):
+            result["mode"] = result.get("mode") or "interpret"
+            result["auto_backend"] = "interpret"
+            if compile_err:
+                result["compile_fallback_reason"] = compile_err
         return result
 
     def _run_compiled(self, source_code: str, ohlcv_data: list[dict]) -> dict[str, Any]:
         """Numba/object compile path via pynescript.compiler.
 
         Pure-numeric scripts need Numba; object-mode (UDT/map/drawing) does not.
+        Host caches successful ``CompiledScript`` values by raw-source sha256.
         """
         try:
             from pynescript.compiler.engine import compile_script
         except ImportError as e:
-            return {"error": f"Compile mode unavailable: {e!s}"}
+            return _error_payload(
+                _format_exc_message("Compile mode unavailable", e),
+                kind=ERROR_KIND_COMPILE,
+                exc=e,
+            )
         if not ohlcv_data:
             return {"plots": [], "events": [], "count": 0, "mode": "compile", "series": {}}
-        try:
-            compiled = compile_script(source_code)
-        except Exception as e:
-            return {"error": f"Compile Error: {e!s}"}
+
+        cache_key = self._source_cache_key(source_code)
+        script_id = cache_key[:16]
+        compiled = _HOST_COMPILE_CACHE.get(cache_key)
+        was_cached = compiled is not None
+        if compiled is None:
+            try:
+                compiled = compile_script(source_code)
+            except Exception as e:
+                return _error_payload(
+                    _format_exc_message("Compile Error", e),
+                    kind=ERROR_KIND_COMPILE,
+                    exc=e,
+                )
+            if len(_HOST_COMPILE_CACHE) >= _HOST_COMPILE_CACHE_MAX:
+                try:
+                    _HOST_COMPILE_CACHE.pop(next(iter(_HOST_COMPILE_CACHE)))
+                except StopIteration:
+                    pass
+            _HOST_COMPILE_CACHE[cache_key] = compiled
+            _HOST_COMPILE_FAIL_CACHE.pop(cache_key, None)
+
         opens = [float(b.get("open", 0.0)) for b in ohlcv_data]
         highs = [float(b.get("high", 0.0)) for b in ohlcv_data]
         lows = [float(b.get("low", 0.0)) for b in ohlcv_data]
@@ -792,13 +969,21 @@ class Runtime:
         try:
             series_map = compiled.run(opens, highs, lows, closes, volumes)
         except Exception as e:
-            return {"error": f"Compiled Runtime Error: {e!s}"}
+            return _error_payload(
+                _format_exc_message("Compiled Runtime Error", e),
+                kind=ERROR_KIND_RUNTIME,
+                exc=e,
+            )
         if not isinstance(series_map, dict):
             series_map = {}
-        drawings = series_map.pop("__drawings", [])
-        events = series_map.pop("__events", [])
-        for meta_key in ("__position_size", "__netprofit", "__equity"):
-            series_map.pop(meta_key, None)
+        # Prefer .get so shared maps are not mutated (SoT host hygiene)
+        drawings = series_map.get("__drawings", []) or []
+        events = series_map.get("__events", []) or []
+        series_public = {
+            k: v
+            for k, v in series_map.items()
+            if k not in ("__drawings", "__events", "__position_size", "__netprofit", "__equity")
+        }
 
         # Compile-path GC: trim __drawings by declaration caps (defaults 50)
         drawing_limits: dict[str, int] = {
@@ -830,11 +1015,10 @@ class Runtime:
             pass
 
         final_series: list[Any] = []
-        numeric = {k: v for k, v in series_map.items() if hasattr(v, "tolist")}
+        numeric = {k: v for k, v in series_public.items() if hasattr(v, "tolist")}
         if numeric:
             first = next(iter(numeric.values()))
             final_series = [None if (isinstance(x, float) and x != x) else float(x) for x in first]
-        script_id = hashlib.sha256(source_code.encode("utf-8")).hexdigest()[:16]
         if isinstance(events, list):
             for ev in events:
                 if isinstance(ev, dict):
@@ -842,13 +1026,16 @@ class Runtime:
                     ev.setdefault("run_id", self._run_id)
         return {
             "plots": final_series,
-            "series": {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in series_map.items()},
+            "series": {
+                k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in series_public.items()
+            },
             "drawings": drawings if isinstance(drawings, list) else [],
             "events": events if isinstance(events, list) else [],
             "count": len(ohlcv_data),
             "script_id": script_id,
             "run_id": self._run_id,
             "mode": "compile",
-            "object_mode": compiled.object_mode,
+            "object_mode": getattr(compiled, "object_mode", False),
             "meta": dict(drawing_limits),
+            "compile_cached": was_cached,
         }

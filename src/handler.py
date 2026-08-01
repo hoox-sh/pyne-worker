@@ -431,16 +431,38 @@ async def handle_run(
     if validation_err:
         return _json_response({"error": validation_err}, 400)
 
+    # Optional Pine input.* overrides (force interpret under mode=auto)
+    inputs_raw = data.get("inputs")
+    inputs: dict[str, Any] | None = None
+    if isinstance(inputs_raw, dict) and inputs_raw:
+        inputs = inputs_raw
+
     # Execute with timeout via Runtime
     runtime = Runtime(symbol=symbol)
-    result = runtime.run(script, ohlcv, timeout_seconds=30.0, mode=mode)
+    result = runtime.run(
+        script,
+        ohlcv,
+        timeout_seconds=30.0,
+        mode=mode,
+        inputs=inputs,
+    )
 
     if "error" in result:
         status = 504 if "timed out" in result.get("error", "").lower() else 500
-        return _json_response({"error": result["error"]}, status)
+        err_body: dict[str, Any] = {"error": result["error"]}
+        if result.get("error_kind"):
+            err_body["error_kind"] = result["error_kind"]
+        if result.get("error_type"):
+            err_body["error_type"] = result["error_type"]
+        if result.get("error_bar") is not None:
+            err_body["error_bar"] = result["error_bar"]
+        return _json_response(err_body, status)
 
     if result.get("timed_out"):
-        return _json_response({"error": "Script execution timed out"}, 504)
+        return _json_response(
+            {"error": "Script execution timed out", "error_kind": "runtime"},
+            504,
+        )
 
     resp: dict[str, Any] = {
         "events": result.get("events", []),
@@ -462,6 +484,12 @@ async def handle_run(
         resp["object_mode"] = result["object_mode"]
     if result.get("series") is not None:
         resp["series"] = result["series"]
+    if result.get("drawings") is not None:
+        resp["drawings"] = result["drawings"]
+    if result.get("meta") is not None:
+        resp["meta"] = result["meta"]
+    if result.get("compile_cached") is not None:
+        resp["compile_cached"] = result["compile_cached"]
     return _json_response(resp)
 
 
