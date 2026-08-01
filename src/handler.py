@@ -298,6 +298,7 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
                 "scripts": True,
                 "cron": True,
                 "alerts": True,
+                "alert_webhooks": True,
                 "live_feed": True,
                 "feed_sources": ["bybit", "binance"],
                 "timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],

@@ -26,6 +26,7 @@
   },
   // Production secrets (set via `wrangler secret put`):
   //   API_KEY — shared secret for HTTP auth (X-API-Key header)
+  //   ALERT_WEBHOOK_URL — default HTTPS destination for alert()/alertcondition()
   "services": [
     {
       "binding": "TRADE_SERVICE",

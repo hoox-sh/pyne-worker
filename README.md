@@ -23,6 +23,7 @@ outside TradingView for **$0/month** on Cloudflare's free tier.
 - ✅ **Live market feed** — each cron tick pulls closed klines (Bybit → R2) before eval
 - ✅ **Trade event forwarding** — strategy events → trade-worker via service binding
 - ✅ **Alert engine** — `alert()` / `alertcondition()` firings in `/run` + cron (last-bar filter)
+- ✅ **Alert webhooks (L2)** — POST firings to `ALERT_WEBHOOK_URL` or per-job `webhook_url`
 - ✅ **R2 data provider** — historical bar data from `data/{SYMBOL}/{TIMEFRAME}/{YYYY}.jsonl`
 - ✅ **$0 infrastructure** — free tier OK for light use; Paid recommended for heavy 1m
 - ✅ **3,263 BTCUSDT daily bars** preloaded in R2 (2017–2026); ingest `1m` for live cron
@@ -127,6 +128,56 @@ Cron is configured in `wrangler.jsonc` as `* * * * *` (every minute UTC).
 
 No laptop feeder required for live 1m. Bulk history still optional via `fetch_and_ingest.py`.
 
+### Alert webhooks (L2)
+
+On each cron tick (and on `POST /run` / `POST /cron/run` when alerts are present),
+firings are POSTed as JSON to:
+
+1. Per-job / per-script `webhook_url` (highest priority)
+2. Else Worker env `ALERT_WEBHOOK_URL`
+
+```bash
+# Default destination for all jobs
+echo "https://hooks.example.com/pine" | wrangler secret put ALERT_WEBHOOK_URL
+
+# Or per script when deploying
+curl -sS -X POST https://pyne-worker.cryptolinx.workers.dev/scripts \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{
+    "id":"btc-alerts",
+    "script":"//@version=5\nindicator(\"a\")\nalertcondition(ta.crossover(close, ta.sma(close,20)), \"X\", \"cross\")\nplot(close)",
+    "symbol":"BTCUSDT","timeframe":"1m",
+    "webhook_url":"https://hooks.example.com/btc",
+    "forward_alerts":true
+  }'
+```
+
+Batch body shape:
+
+```json
+{
+  "type": "pine_alert_batch",
+  "source": "pyne-worker",
+  "count": 1,
+  "content": "cross",
+  "alerts": [
+    {
+      "type": "pine_alert",
+      "message": "cross",
+      "title": "X",
+      "freq": "once_per_bar",
+      "alert_source": "alertcondition",
+      "symbol": "BTCUSDT",
+      "timeframe": "1m",
+      "bar_index": 42,
+      "time": 1700000000000
+    }
+  ]
+}
+```
+
+Opt out: `"forward_alerts": false` on the job/script or request body.
+
 ```bash
 # Manual feed only
 curl -sS -X POST https://pyne-worker.cryptolinx.workers.dev/feed/refresh \
@@ -206,12 +257,13 @@ inline `"ohlcv"`/`"data"` in the request body.
 
 1. **pynescript** — Parser, AST, evaluator + compile path (500+ builtins, Pine v5/v6)
 2. **pynescript_backend** — Bar-loop runtime (`mode=interpret|compile|auto`)
-3. **entry.py** — HTTP + `scheduled()` cron entrypoint, trade-worker forwarding
+3. **entry.py** — HTTP + `scheduled()` cron entrypoint, trade + alert forwarding
 4. **handler.py** — Routing, middleware, `/run` / scripts / cron
 5. **scripts_registry.py** — Deployed scripts + cron job config in R2
 6. **scheduler.py** — Bar-close job runner (used by cron and `POST /cron/run`)
-5. **data_provider.py** — R2 reader/writer (JSONL, `data/{SYM}/{TF}/{Y}.jsonl`)
-6. **trade_forwarder.py** — StrategyEvent → trade-worker WebhookPayload mapping
+7. **data_provider.py** — R2 reader/writer (JSONL, `data/{SYM}/{TF}/{Y}.jsonl`)
+8. **trade_forwarder.py** — StrategyEvent → trade-worker WebhookPayload mapping
+9. **alert_engine.py** / **alert_forwarder.py** — last-bar filter + HTTP webhooks
 
 ## Parity
 

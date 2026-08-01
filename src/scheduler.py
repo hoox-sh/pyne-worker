@@ -111,6 +111,12 @@ async def run_scheduled_jobs(
         timeframe = str(job.get("timeframe") or rec.get("timeframe") or timeframe)
         max_bars = int(job.get("max_bars") or rec.get("max_bars") or max_bars)
         forward = bool(job.get("forward_events", rec.get("forward_events", True)))
+        forward_alerts = bool(job.get("forward_alerts", rec.get("forward_alerts", True)))
+        webhook_url = job.get("webhook_url") or rec.get("webhook_url")
+        if isinstance(webhook_url, str):
+            webhook_url = webhook_url.strip() or None
+        else:
+            webhook_url = None
 
         try:
             ohlcv = await fetch_ohlcv_from_r2(r2_bucket, symbol, timeframe)
@@ -191,6 +197,11 @@ async def run_scheduled_jobs(
                 a.setdefault("timeframe", timeframe)
                 a.setdefault("deployed_script_id", script_id)
                 a.setdefault("script_id", script_id)
+                if forward_alerts and webhook_url:
+                    a["webhook_url"] = webhook_url
+                elif not forward_alerts:
+                    # Mark so default env webhook is skipped for this firing
+                    a["forward_alerts"] = False
 
         await put_cron_state(
             r2_bucket,
@@ -219,13 +230,18 @@ async def run_scheduled_jobs(
                 "mode": result.get("mode") or mode,
                 "auto_backend": result.get("auto_backend"),
                 "forward_events": forward,
+                "forward_alerts": forward_alerts,
+                "webhook_url": webhook_url,
             }
         )
 
+    # Aggregate only alerts eligible for webhook delivery
     all_alerts: list[dict[str, Any]] = []
     for r in results:
+        if r.get("forward_alerts") is False:
+            continue
         for a in r.get("alerts") or []:
-            if isinstance(a, dict):
+            if isinstance(a, dict) and a.get("forward_alerts") is not False:
                 all_alerts.append(a)
 
     return {

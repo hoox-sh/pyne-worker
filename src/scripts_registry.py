@@ -153,9 +153,14 @@ async def put_script(bucket: Any, record: dict[str, Any]) -> dict[str, Any]:
         "mode": mode,
         "enabled": bool(record.get("enabled", True)),
         "forward_events": bool(record.get("forward_events", True)),
+        "forward_alerts": bool(record.get("forward_alerts", True)),
         "max_bars": max_bars_i,
         "updated_at": int(time.time() * 1000),
     }
+    # Optional HTTP destination for pine alert() / alertcondition() firings
+    wh = record.get("webhook_url")
+    if isinstance(wh, str) and wh.strip():
+        stored["webhook_url"] = wh.strip()
 
     await _put_json(bucket, _script_key(str(script_id)), stored)
     ids = await load_index(bucket)
@@ -202,19 +207,21 @@ async def list_scripts(bucket: Any) -> list[dict[str, Any]]:
         rec = await get_script(bucket, sid)
         if rec and not rec.get("deleted"):
             # omit full source in list view
-            out.append(
-                {
-                    "id": rec.get("id"),
-                    "name": rec.get("name"),
-                    "symbol": rec.get("symbol"),
-                    "timeframe": rec.get("timeframe"),
-                    "mode": rec.get("mode"),
-                    "enabled": rec.get("enabled", True),
-                    "forward_events": rec.get("forward_events", True),
-                    "max_bars": rec.get("max_bars"),
-                    "updated_at": rec.get("updated_at"),
-                }
-            )
+            item: dict[str, Any] = {
+                "id": rec.get("id"),
+                "name": rec.get("name"),
+                "symbol": rec.get("symbol"),
+                "timeframe": rec.get("timeframe"),
+                "mode": rec.get("mode"),
+                "enabled": rec.get("enabled", True),
+                "forward_events": rec.get("forward_events", True),
+                "forward_alerts": rec.get("forward_alerts", True),
+                "max_bars": rec.get("max_bars"),
+                "updated_at": rec.get("updated_at"),
+            }
+            if rec.get("webhook_url"):
+                item["webhook_url"] = rec.get("webhook_url")
+            out.append(item)
     return out
 
 
@@ -237,16 +244,19 @@ async def load_cron_jobs(bucket: Any) -> list[dict[str, Any]]:
     for rec in await list_scripts(bucket):
         if not rec.get("enabled", True):
             continue
-        derived.append(
-            {
-                "script_id": rec["id"],
-                "symbol": rec.get("symbol") or "BTCUSDT",
-                "timeframe": rec.get("timeframe") or "1m",
-                "mode": rec.get("mode") or "auto",
-                "enabled": True,
-                "max_bars": rec.get("max_bars") or 5000,
-            }
-        )
+        job: dict[str, Any] = {
+            "script_id": rec["id"],
+            "symbol": rec.get("symbol") or "BTCUSDT",
+            "timeframe": rec.get("timeframe") or "1m",
+            "mode": rec.get("mode") or "auto",
+            "enabled": True,
+            "max_bars": rec.get("max_bars") or 5000,
+            "forward_events": rec.get("forward_events", True),
+            "forward_alerts": rec.get("forward_alerts", True),
+        }
+        if rec.get("webhook_url"):
+            job["webhook_url"] = rec.get("webhook_url")
+        derived.append(job)
     return derived
 
 
@@ -265,16 +275,20 @@ async def put_cron_jobs(bucket: Any, jobs: list[dict[str, Any]]) -> list[dict[st
         mode = str(j.get("mode") or "auto").strip().lower()
         if mode not in _VALID_MODES:
             mode = "auto"
-        cleaned.append(
-            {
-                "script_id": sid,
-                "symbol": str(j.get("symbol") or "BTCUSDT").upper(),
-                "timeframe": tf if tf in _VALID_TIMEFRAMES else "1m",
-                "mode": mode,
-                "enabled": bool(j.get("enabled", True)),
-                "max_bars": int(j.get("max_bars") or 5000),
-            }
-        )
+        entry: dict[str, Any] = {
+            "script_id": sid,
+            "symbol": str(j.get("symbol") or "BTCUSDT").upper(),
+            "timeframe": tf if tf in _VALID_TIMEFRAMES else "1m",
+            "mode": mode,
+            "enabled": bool(j.get("enabled", True)),
+            "max_bars": int(j.get("max_bars") or 5000),
+            "forward_events": bool(j.get("forward_events", True)),
+            "forward_alerts": bool(j.get("forward_alerts", True)),
+        }
+        wh = j.get("webhook_url")
+        if isinstance(wh, str) and wh.strip():
+            entry["webhook_url"] = wh.strip()
+        cleaned.append(entry)
     await _put_json(bucket, _cron_jobs_key(), {"jobs": cleaned})
     return cleaned
 

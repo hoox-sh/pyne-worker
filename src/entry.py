@@ -57,11 +57,14 @@ class Default(WorkerEntrypoint):
     - ``OHLCV_DATA`` — R2 bucket for OHLCV bar data.
     - ``API_KEY`` (secret) — Expected API key for auth.
       When unset, auth is disabled (dev mode).
+    - ``ALERT_WEBHOOK_URL`` (var/secret) — Default HTTPS endpoint for
+      pine ``alert()`` / ``alertcondition()`` firings (cron + optional /run).
     """
 
     TRADE_SERVICE: object  # service binding, set by the runtime
     OHLCV_DATA: object  # R2 bucket binding, set by the runtime
     API_KEY: str | None = None  # secret, set by the runtime
+    ALERT_WEBHOOK_URL: str | None = None  # optional default alert webhook
 
     async def fetch(self, request):
         start = time.time()
@@ -94,11 +97,17 @@ class Default(WorkerEntrypoint):
         events = payload.get("events", [])
         # Allow client to opt out of forwarding with "forward_events": false
         _forward_flag: bool = True
+        _forward_alerts: bool = True
+        _req_webhook: str | None = None
         if body:
             try:
                 _parsed = json.loads(body)
                 if isinstance(_parsed, dict):
                     _forward_flag = _parsed.get("forward_events", True)
+                    _forward_alerts = bool(_parsed.get("forward_alerts", True))
+                    wh = _parsed.get("webhook_url")
+                    if isinstance(wh, str) and wh.strip():
+                        _req_webhook = wh.strip()
             except json.JSONDecodeError:
                 pass
         if events and hasattr(self.env, "TRADE_SERVICE") and _forward_flag:
@@ -115,6 +124,25 @@ class Default(WorkerEntrypoint):
                     payload["forward_failed"] = fwd.get("failed", 0)
             except Exception as e:
                 payload["forward_error"] = str(e)
+
+        # -- Alert webhooks (L2): /run, /cron/run payloads with alerts -----
+        if _forward_alerts:
+            try:
+                from alert_forwarder import forward_alert_groups
+
+                alerts_payload = payload.get("alerts") or []
+                default_wh = _req_webhook or getattr(self.env, "ALERT_WEBHOOK_URL", None)
+                if alerts_payload and (default_wh or any(
+                    isinstance(a, dict) and a.get("webhook_url") for a in alerts_payload
+                )):
+                    alert_fwd = await forward_alert_groups(
+                        alerts_payload,
+                        default_url=str(default_wh).strip() if default_wh else None,
+                    )
+                    if alert_fwd.get("destinations"):
+                        payload["alert_forward"] = alert_fwd
+            except Exception as e:
+                payload["alert_forward_error"] = str(e)
 
         # -- Enhanced health dependency checks (async) --------------------
         if path == "/health" and method == "GET":
@@ -199,6 +227,20 @@ class Default(WorkerEntrypoint):
                 except Exception as e:
                     forward_meta[sym] = {"error": str(e)}
             summary["forward"] = forward_meta
+
+        # Forward last-bar alerts to HTTP webhooks (env default + per-job URL)
+        alerts = summary.get("alerts") or []
+        if alerts:
+            try:
+                from alert_forwarder import forward_alert_groups
+
+                default_wh = getattr(self.env, "ALERT_WEBHOOK_URL", None)
+                summary["alert_forward"] = await forward_alert_groups(
+                    alerts,
+                    default_url=str(default_wh).strip() if default_wh else None,
+                )
+            except Exception as e:
+                summary["alert_forward_error"] = str(e)
 
         duration_ms = (time.time() - start) * 1000
         log = LogHelper.as_dict(
