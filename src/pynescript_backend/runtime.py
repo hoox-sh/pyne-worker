@@ -458,6 +458,15 @@ class Runtime:
         evaluator._var_declarations.clear()
         evaluator.current_series = _series_lists
 
+        # Fresh drawing registries so leftover labels/lines from prior runs
+        # do not leak into this response (DrawingRegistry is process-global).
+        try:
+            from pynescript.ast.evaluator.builtins.drawing import DrawingRegistry
+
+            DrawingRegistry.reset()
+        except Exception:
+            pass
+
         # Per-bar first-plot values (worker response keeps simple plots list)
         plot0_values: list[Any] = []
         plot0_append = plot0_values.append
@@ -692,14 +701,30 @@ class Runtime:
             else:
                 plot0_append(None)
 
+        drawings: list[Any] = []
+        drawing_limits: dict[str, int] = {}
+        try:
+            from pynescript.ast.evaluator.builtins.drawing import DrawingRegistry
+
+            bar_times = [b.get("time", 0) for b in ohlcv_data]
+            if not DrawingRegistry.is_empty():
+                drawings = DrawingRegistry.export_for_api(bar_times)
+            drawing_limits = DrawingRegistry.limits_dict()
+        except Exception:
+            drawings = []
+            drawing_limits = {}
+
         result: dict[str, Any] = {
             "plots": plot0_values,
             "events": all_events,
+            "drawings": drawings,
             "count": len(plot0_values),
             "script_id": script_id,
             "run_id": run_id,
             "mode": "interpret",
         }
+        if drawing_limits:
+            result["meta"] = dict(drawing_limits)
         if timed_out:
             result["timed_out"] = True
             result["error"] = "Script execution timed out"
@@ -774,6 +799,36 @@ class Runtime:
         events = series_map.pop("__events", [])
         for meta_key in ("__position_size", "__netprofit", "__equity"):
             series_map.pop(meta_key, None)
+
+        # Compile-path GC: trim __drawings by declaration caps (defaults 50)
+        drawing_limits: dict[str, int] = {
+            "max_lines_count": 50,
+            "max_labels_count": 50,
+            "max_boxes_count": 50,
+            "max_polylines_count": 50,
+        }
+        try:
+            from pynescript.ast.evaluator.builtins.drawing import DrawingRegistry
+
+            _hard = {
+                "max_lines_count": 500,
+                "max_labels_count": 500,
+                "max_boxes_count": 500,
+                "max_polylines_count": 100,
+            }
+            for _key, _cap in _hard.items():
+                _m = re.search(rf"\b{_key}\s*=\s*(\d+)", source_code or "")
+                if _m:
+                    try:
+                        _n = int(_m.group(1))
+                        drawing_limits[_key] = max(1, min(_cap, _n))
+                    except (TypeError, ValueError):
+                        pass
+            if isinstance(drawings, list) and drawings:
+                drawings = DrawingRegistry.gc_exported_drawings(drawings, drawing_limits)
+        except Exception:
+            pass
+
         final_series: list[Any] = []
         numeric = {k: v for k, v in series_map.items() if hasattr(v, "tolist")}
         if numeric:
@@ -795,4 +850,5 @@ class Runtime:
             "run_id": self._run_id,
             "mode": "compile",
             "object_mode": compiled.object_mode,
+            "meta": dict(drawing_limits),
         }
