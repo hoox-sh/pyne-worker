@@ -22,6 +22,7 @@ outside TradingView for **$0/month** on Cloudflare's free tier.
 - ✅ **1m bar-close cron** — `* * * * *` + `POST /cron/run` (runs only on new bar)
 - ✅ **Live market feed** — each cron tick pulls closed klines (Bybit → R2) before eval
 - ✅ **Trade event forwarding** — strategy events → trade-worker via service binding
+- ✅ **Alert engine** — `alert()` / `alertcondition()` firings in `/run` + cron (last-bar filter)
 - ✅ **R2 data provider** — historical bar data from `data/{SYMBOL}/{TIMEFRAME}/{YYYY}.jsonl`
 - ✅ **$0 infrastructure** — free tier OK for light use; Paid recommended for heavy 1m
 - ✅ **3,263 BTCUSDT daily bars** preloaded in R2 (2017–2026); ingest `1m` for live cron

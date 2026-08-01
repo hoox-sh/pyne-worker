@@ -297,6 +297,7 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
                 "modes": ["interpret", "compile", "auto"],
                 "scripts": True,
                 "cron": True,
+                "alerts": True,
                 "live_feed": True,
                 "feed_sources": ["bybit", "binance"],
                 "timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
@@ -486,6 +487,10 @@ async def handle_run(
         resp["series"] = result["series"]
     if result.get("drawings") is not None:
         resp["drawings"] = result["drawings"]
+    if result.get("alerts") is not None:
+        resp["alerts"] = result["alerts"]
+    if result.get("alert_conditions") is not None:
+        resp["alert_conditions"] = result["alert_conditions"]
     if result.get("meta") is not None:
         resp["meta"] = result["meta"]
     if result.get("compile_cached") is not None:

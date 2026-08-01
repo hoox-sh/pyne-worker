@@ -538,6 +538,14 @@ class Runtime:
         except Exception:
             pass
 
+        # Alert engine: clear per-run so prior jobs do not leak firings
+        clear_alerts = getattr(evaluator, "clear_alerts", None)
+        if callable(clear_alerts):
+            try:
+                clear_alerts()
+            except Exception:
+                pass
+
         # Per-bar first-plot values (worker response keeps simple plots list)
         plot0_values: list[Any] = []
         plot0_append = plot0_values.append
@@ -788,15 +796,82 @@ class Runtime:
             drawings = []
             drawing_limits = {}
 
+        # Alert engine export (alert() + true alertcondition firings)
+        alerts: list[dict[str, Any]] = []
+        alert_conditions: list[dict[str, Any]] = []
+        try:
+            try:
+                from pynescript.ast.evaluator.builtins.alerts import (
+                    export_alerts_from_evaluator,
+                )
+
+                alerts = list(export_alerts_from_evaluator(evaluator) or [])
+            except ImportError:
+                # Older vendored pynescript without export helper
+                raw = getattr(evaluator, "get_triggered_alerts", None)
+                items = raw() if callable(raw) else getattr(evaluator, "_triggered_alerts", None) or []
+                for a in items or []:
+                    if hasattr(a, "to_dict"):
+                        alerts.append(a.to_dict())
+                    elif isinstance(a, dict):
+                        alerts.append(dict(a))
+                    else:
+                        t = getattr(a, "time", None)
+                        cur = getattr(t, "current", None)
+                        if cur is not None and not isinstance(t, (int, float)):
+                            t = cur
+                        try:
+                            t_int = int(t) if t is not None else None
+                        except (TypeError, ValueError):
+                            t_int = None
+                        alerts.append(
+                            {
+                                "message": str(getattr(a, "message", a)),
+                                "freq": str(getattr(a, "freq", "once_per_bar")),
+                                "bar_index": getattr(a, "bar_index", None),
+                                "time": t_int,
+                                "source": getattr(a, "source", "alert"),
+                            }
+                        )
+            exp_c = getattr(evaluator, "export_alert_conditions", None)
+            if callable(exp_c):
+                alert_conditions = list(exp_c() or [])
+            else:
+                for c in getattr(evaluator, "_alert_conditions", None) or []:
+                    if hasattr(c, "to_dict"):
+                        alert_conditions.append(c.to_dict())
+                    elif isinstance(c, dict):
+                        alert_conditions.append(dict(c))
+                    else:
+                        alert_conditions.append(
+                            {
+                                "condition": bool(getattr(c, "condition", False)),
+                                "title": str(getattr(c, "title", "Alert")),
+                                "message": str(getattr(c, "message", "Alert")),
+                                "bar_index": getattr(c, "bar_index", None),
+                                "time": getattr(c, "time", None),
+                            }
+                        )
+        except Exception:
+            alerts = []
+            alert_conditions = []
+        for a in alerts:
+            if isinstance(a, dict):
+                a.setdefault("script_id", script_id)
+                a.setdefault("run_id", run_id)
+
         result: dict[str, Any] = {
             "plots": plot0_values,
             "events": all_events,
             "drawings": drawings,
+            "alerts": alerts,
             "count": len(plot0_values),
             "script_id": script_id,
             "run_id": run_id,
             "mode": "interpret",
         }
+        if alert_conditions:
+            result["alert_conditions"] = alert_conditions
         if drawing_limits:
             result["meta"] = dict(drawing_limits)
         if timed_out:

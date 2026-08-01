@@ -178,6 +178,20 @@ async def run_scheduled_jobs(
                     ev.setdefault("deployed_script_id", script_id)
             all_events.extend(ev for ev in events if isinstance(ev, dict))
 
+        # Alert engine: last closed-bar firings for cron consumers
+        from alert_engine import filter_alerts_for_bar
+
+        raw_alerts = result.get("alerts") or []
+        if not isinstance(raw_alerts, list):
+            raw_alerts = []
+        bar_alerts = filter_alerts_for_bar(raw_alerts, last_bar_time)
+        for a in bar_alerts:
+            if isinstance(a, dict):
+                a.setdefault("symbol", symbol)
+                a.setdefault("timeframe", timeframe)
+                a.setdefault("deployed_script_id", script_id)
+                a.setdefault("script_id", script_id)
+
         await put_cron_state(
             r2_bucket,
             jkey,
@@ -187,6 +201,7 @@ async def run_scheduled_jobs(
                 "bars": result.get("count", len(ohlcv)),
                 "mode": result.get("mode") or mode,
                 "auto_backend": result.get("auto_backend"),
+                "alerts_last_bar": len(bar_alerts),
             },
         )
 
@@ -199,11 +214,19 @@ async def run_scheduled_jobs(
                 "bars": result.get("count", len(ohlcv)),
                 "last_bar_time": last_bar_time,
                 "events": len(events) if isinstance(events, list) else 0,
+                "alerts": bar_alerts,
+                "alert_count": len(bar_alerts),
                 "mode": result.get("mode") or mode,
                 "auto_backend": result.get("auto_backend"),
                 "forward_events": forward,
             }
         )
+
+    all_alerts: list[dict[str, Any]] = []
+    for r in results:
+        for a in r.get("alerts") or []:
+            if isinstance(a, dict):
+                all_alerts.append(a)
 
     return {
         "jobs_run": len([r for r in results if r.get("status") == "ok"]),
@@ -211,5 +234,6 @@ async def run_scheduled_jobs(
         "jobs_error": len([r for r in results if r.get("status") == "error"]),
         "results": results,
         "events": all_events,
+        "alerts": all_alerts,
         "feed": feed_results,
     }
