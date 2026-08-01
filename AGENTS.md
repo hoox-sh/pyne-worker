@@ -55,5 +55,13 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 | `src/handler.py` | HTTP routes: `/run`, `/scripts`, `/cron/*`, `/ingest` |
 | `src/scheduler.py` | Bar-close job runner |
 | `src/scripts_registry.py` | Deployed scripts + cron config in R2 |
+| `src/alert_engine.py` | Last-bar alert filter + summary helpers |
+| `src/alert_forwarder.py` | L2 HTTP webhook delivery for alerts |
 | `wrangler.jsonc` | Worker config + cron `* * * * *` |
 | `pyproject.toml` | Package config (editable dep on `pynescript`) |
+
+### Alerts (L2)
+
+- Runtime exports `alerts` on `/run` (pynescript `AlertsMixin`).
+- Cron keeps last closed-bar firings only; POSTs to job `webhook_url` or env `ALERT_WEBHOOK_URL`.
+- Product docs (Mintlify): `pynescript` → `docs/pyne/runtime/alerts.mdx`.
