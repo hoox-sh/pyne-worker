@@ -82,6 +82,41 @@ class TestAutoInputs:
         assert r.get("compile_fallback_reason") == "input.* overrides require interpret path"
         assert r.get("mode") == "interpret"
 
+    def test_inputs_apply_on_interpret(self) -> None:
+        """Overrides must change plot values (not only route auto→interpret)."""
+        script = (
+            "//@version=5\n"
+            "indicator('t')\n"
+            "len = input.int(14, 'Length')\n"
+            "plot(ta.sma(close, len))\n"
+        )
+        bars = _bars(40)
+        r_def = Runtime().run(script, bars, mode="interpret")
+        r_ov = Runtime().run(script, bars, mode="interpret", inputs={"Length": 5})
+        assert "error" not in r_def and "error" not in r_ov
+        p_def = r_def.get("plots") or []
+        p_ov = r_ov.get("plots") or []
+        assert len(p_def) == len(p_ov) == 40
+        # Last bars must differ when length override is applied
+        assert p_def[-1] is not None and p_ov[-1] is not None
+        assert p_def[-1] != p_ov[-1]
+        # Declaration export for UI
+        assert any(d.get("title") == "Length" for d in (r_def.get("inputs") or []))
+
+
+class TestMultiRunParseCache:
+    def test_second_interpret_reuses_tree_correctly(self) -> None:
+        """Bound call-site handlers on shared AST must not leak across Runtime instances."""
+        script = "//@version=5\nindicator('t')\nplot(close)"
+        bars = _bars(15)
+        r1 = Runtime().run(script, bars, mode="interpret")
+        r2 = Runtime().run(script, bars, mode="interpret")
+        assert "error" not in r1 and "error" not in r2
+        assert r1.get("plots")[-1] is not None
+        assert r2.get("plots")[-1] is not None
+        assert r1.get("plots")[-1] == r2.get("plots")[-1]
+        assert r1.get("plots") == r2.get("plots")
+
 
 class TestAutoPrefilter:
     def test_request_falls_back_interpret(self) -> None:

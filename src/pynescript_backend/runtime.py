@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import time
 import uuid
@@ -27,6 +28,7 @@ import uuid
 from typing import Any
 
 from pynescript.ast.helper import parse
+from pynescript.ast.helper import walk
 from pynescript.util.time_parts import apply_utc_parts_to_context
 
 from pynescript_backend.evaluator import CustomEvaluator
@@ -47,6 +49,7 @@ _HOST_COMPILE_FAIL_CACHE: dict[str, str] = {}
 _HOST_COMPILE_FAIL_CACHE_MAX = 128
 
 # Compiler package availability for mode=auto prefilter (None = not probed yet).
+# Numba is NOT required for eligibility — object-mode compile is pure-Python.
 _HAS_COMPILER: bool | None = None
 
 # Structured Runtime error kinds (surfaced as ``error_kind``; keep string ``error``).
@@ -60,6 +63,8 @@ ERROR_KIND_MODE = "mode"
 _CAL_NAME_RE = re.compile(
     r"\b(year|month|dayofmonth|hour|minute|second|dayofweek)\b",
 )
+# fill() needs plot() to return Plot handles (PlotRegistry) on hosts that use it.
+_FILL_CALL_RE = re.compile(r"\bfill\s*\(")
 # Derived built-in series — skip update/append when script never names them.
 _HL2_RE = re.compile(r"\bhl2\b")
 _HLC3_RE = re.compile(r"\bhlc3\b")
@@ -75,7 +80,11 @@ def _error_payload(
     bar_index: int | None = None,
     bar_time: Any = None,
 ) -> dict[str, Any]:
-    """Build a classified Runtime error dict (fail-closed host contract)."""
+    """Build a classified Runtime error dict (fail-closed host contract).
+
+    Always includes ``error`` (human message). Adds ``error_kind`` and optional
+    ``error_type`` / ``error_bar`` / ``error_bar_time`` for hosts and tests.
+    """
     body: dict[str, Any] = {
         "error": message,
         "error_kind": kind,
@@ -90,12 +99,117 @@ def _error_payload(
 
 
 def _format_exc_message(prefix: str, exc: BaseException) -> str:
-    """``Prefix: TypeName: detail``."""
+    """``Prefix: TypeName: detail`` (omit redundant type when message already names it)."""
     et = type(exc).__name__
     detail = str(exc).strip() or et
     if detail == et:
         return f"{prefix}: {et}"
     return f"{prefix}: {et}: {detail}"
+
+
+def _clear_pine_call_sites(tree: Any) -> None:
+    """Drop evaluator-bound call-site caches from a shared AST tree.
+
+    ``visit_Call`` stores ``_pine_call_site`` *on the AST node*, including bound
+    method handlers from the evaluator that first resolved the site. Hosts
+    (and package ``parse``) cache trees by source hash and reuse them across
+    ``Runtime`` instances — without this clear, a second run still invokes the
+    *first* evaluator's ``plot`` / ``ta.*`` handlers (empty plots / wrong state).
+
+    Safe within a single multi-bar run: clear once at run start; bar 0 rebinds
+    for the current evaluator; later bars keep the hot path.
+    """
+    try:
+        for node in walk(tree):
+            if getattr(node, "_pine_call_site", None) is not None:
+                try:
+                    delattr(node, "_pine_call_site")
+                except Exception:
+                    try:
+                        object.__setattr__(node, "_pine_call_site", None)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _json_safe_number(x: Any) -> float | None:
+    """Map NaN/±Inf (and numpy scalars) to ``None`` for strict JSON / browsers."""
+    if x is None:
+        return None
+    try:
+        if hasattr(x, "item") and not isinstance(x, (bytes, str, dict, list)):
+            x = x.item()
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(x, bool):
+        return float(x)
+    if isinstance(x, (int, float)):
+        fx = float(x)
+        if math.isnan(fx) or math.isinf(fx):
+            return None
+        return fx
+    return None
+
+
+def _series_values_jsonable(values: Any) -> list[Any]:
+    """Convert a plot series (list / array-like) to JSON-safe list of floats|null.
+
+    CF worker must not hard-require numpy; use pure-Python path with optional
+    numpy fast path when present (local/dev with full pynescript stack).
+    """
+    if values is None:
+        return []
+    try:
+        import numpy as np  # noqa: PLC0415
+
+        if isinstance(values, np.ndarray):
+            kind = values.dtype.kind
+            if kind in "f":
+                arr = np.asarray(values, dtype=np.float64).ravel()
+                n = int(arr.size)
+                if n == 0:
+                    return []
+                finite = np.isfinite(arr)
+                if bool(finite.all()):
+                    return arr.tolist()
+                out: list[Any] = arr.tolist()
+                bad = np.flatnonzero(~finite)
+                for i in bad:
+                    out[int(i)] = None
+                return out
+            if kind in "iu":
+                return np.asarray(values, dtype=np.float64).ravel().tolist()
+            if kind == "b":
+                return [bool(x) for x in values.ravel()]
+            values = values.tolist()
+    except Exception:
+        pass
+    if hasattr(values, "tolist") and not isinstance(values, (list, tuple)):
+        try:
+            values = values.tolist()
+        except Exception:
+            return []
+    if not isinstance(values, (list, tuple)):
+        return []
+    out_list: list[Any] = []
+    append = out_list.append
+    for x in values:
+        if x is None:
+            append(None)
+        elif isinstance(x, bool):
+            append(x)
+        elif isinstance(x, (int, float)):
+            fx = float(x)
+            if math.isnan(fx) or math.isinf(fx):
+                append(None)
+            else:
+                append(fx)
+        elif hasattr(x, "item") and not isinstance(x, (str, bytes)):
+            append(_json_safe_number(x))
+        else:
+            append(x if isinstance(x, (str, dict, list)) else None)
+    return out_list
 
 
 def _parse_script(source_code: str) -> Any:
@@ -407,12 +521,13 @@ class Runtime:
                 with a ``timed_out`` flag. ``None`` means no timeout.
             mode: ``interpret`` (default), ``compile`` (Numba path), or
                 ``auto`` (try compile, fall back to interpret).
-            inputs: Optional Pine ``input.*`` overrides (title → value). Non-empty
-                inputs force ``mode=auto`` onto interpret (compile cannot apply them).
+            inputs: Optional Pine ``input.*`` overrides (title → value). Applied
+                on interpret. Non-empty inputs force ``mode=auto`` onto interpret
+                (compile cannot apply overrides).
 
         Returns:
-            dict with ``plots``, ``events``, ``count``, ``script_id``,
-            ``run_id``, or ``error`` / ``error_kind`` on failure.
+            dict with ``plots``, ``events``, ``alerts``, ``inputs``, ``count``,
+            ``script_id``, ``run_id``, or ``error`` / ``error_kind`` on failure.
         """
         # Validate bars first
         bar_err = _validate_bars(ohlcv_data)
@@ -450,6 +565,9 @@ class Runtime:
                 kind=ERROR_KIND_PARSE,
                 exc=e,
             )
+        # Shared parse trees carry bound call-site handlers from prior evaluators.
+        # Clear once per run so this evaluator rebinds (cross-bar sites stay hot).
+        _clear_pine_call_sites(tree)
 
         # Initialize Series
         open_series = PineSeries()
@@ -528,6 +646,22 @@ class Runtime:
         evaluator = CustomEvaluator(context=context)
         evaluator._var_declarations.clear()
         evaluator.current_series = _series_lists
+        # Host UI overrides for input.* (keyed by title) — SoT parity
+        if inputs and isinstance(inputs, dict):
+            try:
+                evaluator._input_overrides = dict(inputs)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        try:
+            evaluator._input_declarations = []  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # fill() needs plot handles on hosts with PlotRegistry; worker plot is
+        # scalar-only but keep the flag for shared evaluator/package paths.
+        try:
+            evaluator._pine_need_plot_ids = bool(_FILL_CALL_RE.search(source_code))  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         # Fresh drawing registries so leftover labels/lines from prior runs
         # do not leak into this response (DrawingRegistry is process-global).
@@ -771,6 +905,21 @@ class Runtime:
             if strategy_state is not None and strategy_events:
                 for ev in strategy_state.drain_events():
                     ev_dict = ev.to_dict()
+                    # Worker hosts ``time`` as PineSeries for ``time[n]``; some
+                    # strategy paths still put the series object into bar_time.
+                    bt = ev_dict.get("bar_time")
+                    if bt is not None and not isinstance(bt, (int, float, str, bool)):
+                        cur = getattr(bt, "current", None)
+                        if cur is not None:
+                            try:
+                                ev_dict["bar_time"] = int(cur)
+                            except (TypeError, ValueError):
+                                ev_dict["bar_time"] = cur
+                        else:
+                            try:
+                                ev_dict["bar_time"] = int(bt)  # type: ignore[arg-type]
+                            except (TypeError, ValueError):
+                                pass
                     ev_dict["script_id"] = script_id
                     ev_dict["run_id"] = run_id
                     all_events_append(ev_dict)
@@ -860,11 +1009,42 @@ class Runtime:
                 a.setdefault("script_id", script_id)
                 a.setdefault("run_id", run_id)
 
+        # Export input.* declarations (AXIS/Script Settings parity with SoT)
+        input_defs: list[dict[str, Any]] = []
+        try:
+            decls = list(getattr(evaluator, "_input_declarations", None) or [])
+            seen_titles: set[str] = set()
+            for d in decls:
+                if not isinstance(d, dict):
+                    continue
+                t = str(d.get("title") or "")
+                if t and t in seen_titles:
+                    continue
+                if t:
+                    seen_titles.add(t)
+                safe: dict[str, Any] = {}
+                for k, v in d.items():
+                    if isinstance(v, (str, int, float, bool)) or v is None:
+                        safe[k] = v
+                    elif isinstance(v, (list, tuple)):
+                        safe[k] = [
+                            str(x)
+                            if not isinstance(x, (str, int, float, bool, type(None)))
+                            else x
+                            for x in v
+                        ]
+                    else:
+                        safe[k] = str(v)
+                input_defs.append(safe)
+        except Exception:
+            input_defs = []
+
         result: dict[str, Any] = {
             "plots": plot0_values,
             "events": all_events,
             "drawings": drawings,
             "alerts": alerts,
+            "inputs": input_defs,
             "count": len(plot0_values),
             "script_id": script_id,
             "run_id": run_id,
@@ -872,8 +1052,13 @@ class Runtime:
         }
         if alert_conditions:
             result["alert_conditions"] = alert_conditions
+        meta_out: dict[str, Any] = {}
         if drawing_limits:
-            result["meta"] = dict(drawing_limits)
+            meta_out.update(drawing_limits)
+        if input_defs:
+            meta_out["inputs"] = input_defs
+        if meta_out:
+            result["meta"] = meta_out
         if timed_out:
             result["timed_out"] = True
             result["error"] = "Script execution timed out"
@@ -1036,11 +1221,30 @@ class Runtime:
             _HOST_COMPILE_CACHE[cache_key] = compiled
             _HOST_COMPILE_FAIL_CACHE.pop(cache_key, None)
 
-        opens = [float(b.get("open", 0.0)) for b in ohlcv_data]
-        highs = [float(b.get("high", 0.0)) for b in ohlcv_data]
-        lows = [float(b.get("low", 0.0)) for b in ohlcv_data]
-        closes = [float(b.get("close", 0.0)) for b in ohlcv_data]
-        volumes = [float(b.get("volume", 1.0)) for b in ohlcv_data]
+        # List pack is CF-safe (no hard numpy dep). Optional numpy single-pass
+        # pack is a local/dev optim when available — engine accepts either.
+        try:
+            import numpy as np  # noqa: PLC0415
+
+            n = len(ohlcv_data)
+            opens_a = np.empty(n, dtype=np.float64)
+            highs_a = np.empty(n, dtype=np.float64)
+            lows_a = np.empty(n, dtype=np.float64)
+            closes_a = np.empty(n, dtype=np.float64)
+            volumes_a = np.empty(n, dtype=np.float64)
+            for i, b in enumerate(ohlcv_data):
+                opens_a[i] = float(b.get("open", 0.0))
+                highs_a[i] = float(b.get("high", 0.0))
+                lows_a[i] = float(b.get("low", 0.0))
+                closes_a[i] = float(b.get("close", 0.0))
+                volumes_a[i] = float(b.get("volume", 1.0))
+            opens, highs, lows, closes, volumes = opens_a, highs_a, lows_a, closes_a, volumes_a
+        except Exception:
+            opens = [float(b.get("open", 0.0)) for b in ohlcv_data]
+            highs = [float(b.get("high", 0.0)) for b in ohlcv_data]
+            lows = [float(b.get("low", 0.0)) for b in ohlcv_data]
+            closes = [float(b.get("close", 0.0)) for b in ohlcv_data]
+            volumes = [float(b.get("volume", 1.0)) for b in ohlcv_data]
         try:
             series_map = compiled.run(opens, highs, lows, closes, volumes)
         except Exception as e:
@@ -1054,11 +1258,15 @@ class Runtime:
         # Prefer .get so shared maps are not mutated (SoT host hygiene)
         drawings = series_map.get("__drawings", []) or []
         events = series_map.get("__events", []) or []
-        series_public = {
-            k: v
-            for k, v in series_map.items()
-            if k not in ("__drawings", "__events", "__position_size", "__netprofit", "__equity")
-        }
+
+        # JSON-safe series map (NaN → null) — multi-plot SoT parity
+        json_series: dict[str, list[Any]] = {}
+        _to_json = _series_values_jsonable
+        for k, v in series_map.items():
+            ks = k if isinstance(k, str) else str(k)
+            if ks.startswith("__"):
+                continue
+            json_series[ks] = _to_json(v)
 
         # Compile-path GC: trim __drawings by declaration caps (defaults 50)
         drawing_limits: dict[str, int] = {
@@ -1089,23 +1297,19 @@ class Runtime:
         except Exception:
             pass
 
-        final_series: list[Any] = []
-        numeric = {k: v for k, v in series_public.items() if hasattr(v, "tolist")}
-        if numeric:
-            first = next(iter(numeric.values()))
-            final_series = [None if (isinstance(x, float) and x != x) else float(x) for x in first]
+        final_series: list[Any] = next(iter(json_series.values()), []) if json_series else []
         if isinstance(events, list):
             for ev in events:
                 if isinstance(ev, dict):
                     ev.setdefault("script_id", script_id)
                     ev.setdefault("run_id", self._run_id)
+        # Compile path does not execute interpret-only alert() side effects yet
         return {
             "plots": final_series,
-            "series": {
-                k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in series_public.items()
-            },
+            "series": json_series,
             "drawings": drawings if isinstance(drawings, list) else [],
             "events": events if isinstance(events, list) else [],
+            "alerts": [],
             "count": len(ohlcv_data),
             "script_id": script_id,
             "run_id": self._run_id,

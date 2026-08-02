@@ -492,6 +492,8 @@ async def handle_run(
         resp["alerts"] = result["alerts"]
     if result.get("alert_conditions") is not None:
         resp["alert_conditions"] = result["alert_conditions"]
+    if result.get("inputs") is not None:
+        resp["inputs"] = result["inputs"]
     if result.get("meta") is not None:
         resp["meta"] = result["meta"]
     if result.get("compile_cached") is not None:
