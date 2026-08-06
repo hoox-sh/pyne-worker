@@ -1,0 +1,72 @@
+module Pinescript
+{
+     mod = Script(stmt* body, string* annotations)
+         | Expression(expr body)
+
+     stmt = FunctionDef(identifier name, param* args, stmt* body, int? method, int? export, string* annotations)
+          | TypeDef(identifier name, stmt* body, int? export, string* annotations)
+          | EnumDef(identifier name, stmt* body, int? export, string* annotations)
+          | Assign(expr target, expr? value, expr? type, decl_mode? mode, int? export, string* annotations)
+          | ReAssign(expr target, expr value)
+          | AugAssign(expr target, operator op, expr value)
+          | Import(identifier namespace, identifier name, int version, identifier? alias)
+          | Expr(expr value)
+          | Break
+          | Continue
+
+          attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+
+     expr = BoolOp(bool_op op, expr* values)
+          | BinOp(expr left, operator op, expr right)
+          | UnaryOp(unary_op op, expr operand)
+          | Conditional(expr test, expr body, expr orelse)
+          | Compare(expr left, compare_op* ops, expr* comparators)
+          | Call(expr func, arg* args)
+          | Constant(constant value, string? kind)
+
+          | Attribute(expr value, identifier attr, expr_context ctx)
+          | Subscript(expr value, expr? slice, expr_context ctx)
+          | Name(identifier id, expr_context ctx)
+          | Tuple(expr* elts, expr_context ctx)
+
+          | ForTo(expr target, expr start, expr end, stmt* body, expr? step)
+          | ForIn(expr target, expr iter, stmt* body)
+          | While(expr test, stmt* body)
+          | If(expr test, stmt* body, stmt* orelse)
+          | Switch(case* cases, expr? subject)
+
+          | Qualify(type_qual qualifier, expr value)
+          | Specialize(expr value, expr args)
+
+          attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+
+     decl_mode = Var | VarIp
+
+     type_qual = Const | Input | Simple | Series
+
+     expr_context = Load | Store
+
+     bool_op = And | Or
+
+     operator = Add | Sub | Mult | Div | Mod
+              | BitAnd | BitOr | BitXor | LShift | RShift
+
+     unary_op = Not | UAdd | USub | Invert
+
+     compare_op = Eq | NotEq | Lt | LtE | Gt | GtE
+
+     param = Param(identifier name, expr? default, expr? type)
+
+           attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+
+     arg = Arg(expr value, identifier? name)
+
+         attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+
+     case = Case(stmt* body, expr? pattern)
+
+          attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+
+     cmnt = Comment(string value, string? kind)
+          attributes (int lineno, int col_offset, int? end_lineno, int? end_col_offset)
+}

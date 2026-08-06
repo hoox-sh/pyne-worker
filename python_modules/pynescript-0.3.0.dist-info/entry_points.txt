@@ -1,0 +1,6 @@
+[console_scripts]
+pynescript = pynescript.__main__:cli
+pynescript-lsp = pynescript.langserver.__main__:main
+
+[pygments.lexers]
+pinescript = pynescript.ext.pygments.lexers:PinescriptLexer

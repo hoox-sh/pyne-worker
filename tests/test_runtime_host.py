@@ -39,9 +39,10 @@ def _bars(n: int = 20) -> list[dict]:
 
 @pytest.fixture(autouse=True)
 def _clear_host_caches() -> None:
+    # Parse cache lives in pynescript.ast.helper (process LRU); host only
+    # keeps compile success/fail caches.
     runtime_mod._HOST_COMPILE_CACHE.clear()
     runtime_mod._HOST_COMPILE_FAIL_CACHE.clear()
-    runtime_mod._PARSE_CACHE.clear()
     runtime_mod._HAS_COMPILER = None
     yield
     runtime_mod._HOST_COMPILE_CACHE.clear()

@@ -1,11 +1,16 @@
 # Copyright (c) 2026 HOOX · PYNE · jango-blockchained
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Pynescript runtime glue vendored from pynescript/backend.
+"""Pynescript runtime glue ported from pynescript/backend.
 
-The installable ``pynescript`` wheel does not include ``backend/``; this
-package holds the bar-loop runtime used by pyne-worker. Keep in sync with
-``pynescript/backend/{runtime,evaluator,series}.py``.
+The installable ``pynescript`` / ``hoox-pyne`` wheel does not include
+``backend/``; this package holds the bar-loop Runtime used by pyne-worker.
+
+Keep in sync with ``pynescript/backend/{runtime,evaluator,series}.py``.
+Worker-only deltas (edge contract):
+
+- ``timeout_seconds`` wall-clock budget + ``timed_out`` result flag
+- strict OHLCV bar validation (``error_kind=data``)
 """
 
 # pyne-worker — Python Cloudflare Worker for Pine Script evaluation

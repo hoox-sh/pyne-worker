@@ -1,0 +1,383 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Moving Average indicators module."""
+
+from __future__ import annotations
+
+import math
+
+from typing import Any
+
+from .core import BINARY
+from .core import QUATERNARY
+from .core import TERNARY
+from .core import UNARY
+from .core import TechnicalHelpers
+
+
+class MovingAverageIndicators(TechnicalHelpers):
+    """Moving average and trend-following indicators."""
+
+    def _builtin_ta_sma(self, args: list[Any]) -> list[float | None]:
+        """Simple Moving Average."""
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._sma_inc_update(series, period)
+        return self._finalize_series(self._sma(series, period))
+
+    def _builtin_ta_ema(self, args: list[Any]) -> list[float | None]:
+        """Exponential Moving Average."""
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._ema_inc_update(series, period)
+        return self._finalize_series(self._ema(series, period))
+
+    def _builtin_ta_wma(self, args: list[Any]) -> float | None:
+        """Weighted Moving Average."""
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._wma_inc_update(series, period)
+        return self._wma(series, period)
+
+    def _builtin_ta_rma(self, args: list[Any]) -> list[float]:
+        """Recursive Moving Average (Wilder's smoothing)."""
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._rma_inc_update(series, period)
+        return self._finalize_series(self._rma(series, period))
+
+    def _builtin_ta_hma(self, args: list[Any]) -> float | None:
+        """Hull Moving Average - reduces lag."""
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._hma_inc_update(series, period)
+        return self._hma(series, period)
+
+    def _builtin_ta_vwma(self, args: list[Any]) -> list[float | None]:
+        """Volume Weighted Moving Average.
+
+        Forms:
+        - ``ta.vwma(source, length)`` — volume from chart context
+        - ``ta.vwma(source, volume, length)`` — explicit volume (community form)
+        - ``ta.vwma(length)`` — source=close, volume from context
+        """
+        if len(args) == UNARY and self._is_period_like(args[0]):
+            period = self._expect_int(args[0], "Period must be an integer")
+            if self._use_incremental_ta():
+                series = self._context_source("close")
+                vol = self._context_source("volume")
+                if vol:
+                    return self._vwma_inc_update(series, vol, period)
+            series = self._context_series("close")
+            return self._finalize_series(self._vwma(series, period))
+        if len(args) == TERNARY:
+            period = self._expect_int(args[2], "Period must be an integer")
+            if self._use_incremental_ta():
+                series = args[0]
+                vol = args[1] if not self._is_period_like(args[1]) else self._context_source("volume")
+                if vol:
+                    return self._vwma_inc_update(series, vol, period)
+            series = self._as_series(args[0])
+            vol = self._as_series(args[1]) if not self._is_period_like(args[1]) else self._context_series("volume")
+            return self._finalize_series(self._vwma(series, period))
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            vol = self._context_source("volume")
+            if vol:
+                return self._vwma_inc_update(series, vol, period)
+        vol = self._context_series("volume")
+        if self._use_incremental_ta() and vol:
+            return self._vwma_inc_update(series, vol, period)
+        return self._finalize_series(self._vwma(series, period))
+
+    def _builtin_ta_kama(self, args: list[Any]) -> list[float | None] | float | None:
+        """Kaufman's Adaptive Moving Average.
+
+        TV / community form: ``ta.kama(source, length, fastLength=2, slowLength=30)``.
+        Accepts 2–4 positional args (fast/slow default to Kaufman's 2/30).
+        """
+        n = len(args)
+        if n < BINARY:
+            # Soft-na rather than hard arity error (corpus often hits bare kama
+            # after a same-named UDF series clobber; 1-arg is series-only).
+            if n == UNARY:
+                if self._use_incremental_ta():
+                    return None
+                series = self._as_series(args[0])
+                return self._finalize_series([None] * len(series) if series else [None])
+            self._error("ta.kama() requires source and length")
+
+        length = self._expect_int(args[1], "ta.kama length must be integer")
+        # Kaufman defaults: fast period 2, slow period 30.
+        fast = self._expect_int(args[2], "ta.kama fast_period must be integer") if n >= TERNARY else 2
+        slow = self._expect_int(args[3], "ta.kama slow_period must be integer") if n >= QUATERNARY else 30
+
+        if self._use_incremental_ta():
+            series = self._as_series_or_raw(args[0], last_sample_ok=True)
+            return self._kama_inc_update(series, length, fast, slow)
+
+        series = self._as_series(args[0])
+        if length < 1:
+            return self._finalize_series([None] * len(series))
+
+        kama_values: list[float | None] = [None] * length
+        kama = series[length - 1] if length <= len(series) else 0.0
+
+        for i in range(length, len(series)):
+            change = abs(series[i] - series[i - length])
+            volatility = sum(abs(series[i - j] - series[i - j - 1]) for j in range(length))
+
+            if volatility != 0:
+                efficiency = change / volatility
+                fastest = 2.0 / (fast + 1.0)
+                slowest = 2.0 / (slow + 1.0)
+                smoothing = efficiency * (fastest - slowest) + slowest
+                sc = smoothing * smoothing
+            else:
+                sc = (2.0 / (slow + 1.0)) ** 2
+
+            kama = kama + sc * (series[i] - kama)
+            kama_values.append(kama)
+
+        return self._finalize_series(kama_values)
+
+    def _builtin_ta_dema(self, args: list[Any]) -> list[float | None] | float | None:
+        """Double Exponential Moving Average - reduces lag."""
+        series, length = self._expect_series(
+            args,
+            length=BINARY,
+            last_sample_ok=True,
+        )
+        if self._use_incremental_ta():
+            return self._dema_inc_update(series, length)
+
+        ema1 = self._ema(series, length)
+        ema2 = self._ema(ema1, length)
+
+        dema_values: list[float | None] = []
+        for i in range(len(series)):
+            if ema1[i] is None or ema2[i] is None:
+                dema_values.append(None)
+            else:
+                dema_values.append(2 * ema1[i] - ema2[i])
+
+        return self._finalize_series(dema_values)
+
+    def _builtin_ta_tema(self, args: list[Any]) -> list[float | None] | float | None:
+        """Triple Exponential Moving Average - even less lag than DEMA."""
+        series, length = self._expect_series(
+            args,
+            length=BINARY,
+            last_sample_ok=True,
+        )
+        if self._use_incremental_ta():
+            return self._tema_inc_update(series, length)
+
+        ema1 = self._ema(series, length)
+        ema2 = self._ema(ema1, length)
+        ema3 = self._ema(ema2, length)
+
+        tema_values: list[float | None] = []
+        for i in range(len(series)):
+            if ema1[i] is None or ema2[i] is None or ema3[i] is None:
+                tema_values.append(None)
+            else:
+                tema_values.append(3 * ema1[i] - 3 * ema2[i] + ema3[i])
+
+        return self._finalize_series(tema_values)
+
+    def _builtin_ta_swma(self, args: list[Any]) -> float | None:
+        """Symmetric Weighted Moving Average.
+
+        TV: ``ta.swma(source)`` — fixed 4-period symmetric weights.
+        Also accepts optional length for compatibility.
+        """
+        if len(args) == 1:
+            if self._use_incremental_ta():
+                return self._swma_inc_update(args[0])
+            return self._swma(self._as_series(args[0]))
+        series, length = self._expect_series(args, length=BINARY)
+
+        if length < 1:
+            self._error("ta.swma length must be positive")
+        if len(series) < length:
+            return math.nan
+
+        window = series[-length:]
+        valid_values = [v for v in window if v is not None]
+
+        if not valid_values:
+            return math.nan
+
+        # Symmetric weights: [1, 2, 3, ..., n, ..., 3, 2, 1]
+        n = len(valid_values)
+        if n == 1:
+            return valid_values[0]
+
+        weights = []
+        for i in range(n):
+            if i < n // 2:
+                weights.append(i + 1)
+            elif i > (n - 1) // 2:
+                weights.append(n - i)
+            else:
+                weights.append(n // 2 + 1)
+
+        weighted_sum = sum(v * w for v, w in zip(valid_values, weights, strict=True))
+        return weighted_sum / sum(weights)
+
+    def _builtin_ta_sma_weighted(self, args: list[Any]) -> float | None:
+        """Weighted SMA with custom weighting scheme."""
+        if len(args) < BINARY:
+            msg = "ta.sma_weighted() requires at least 2 arguments: series, period"
+            self._error(msg)
+
+        series = args[0] if isinstance(args[0], list) else [args[0]]
+        period = self._expect_int(args[1], "period must be integer")
+        weight_type = args[2] if len(args) > BINARY else "linear"
+
+        if not isinstance(weight_type, str):
+            weight_type = "linear"
+
+        if len(series) < period:
+            return None
+
+        data = series[-period:]
+        valid_data = [x for x in data if isinstance(x, (int, float))]
+
+        if len(valid_data) < period:
+            return None
+
+        # Calculate weights based on type
+        weights = []
+        for i in range(len(valid_data)):
+            if weight_type == "quadratic":
+                weight = (i + 1) ** 2
+            elif weight_type == "sqrt":
+                weight = (i + 1) ** 0.5
+            else:  # linear (default)
+                weight = i + 1
+            weights.append(weight)
+
+        # Weighted average
+        total_weight = sum(weights)
+        weighted_sum = sum(v * w for v, w in zip(valid_data, weights, strict=True))
+        return weighted_sum / total_weight if total_weight > 0 else None
+
+    def _builtin_ta_ema_cross_signal(self, args: list[Any]) -> dict:
+        """EMA Cross Signal - Signal generation from EMA crossover.
+
+        ta.ema_cross_signal(fast_ema, slow_ema, threshold)
+        Returns: dict with signal, strength, trend_direction
+        """
+        if len(args) < TERNARY:
+            msg = "ta.ema_cross_signal() requires 3 arguments: fast_ema, slow_ema, threshold"
+            self._error(msg)
+
+        fast_ema = self._expect_list(args[0], "fast_ema must be a list")
+        slow_ema = self._expect_list(args[1], "slow_ema must be a list")
+        threshold = args[2] if isinstance(args[2], (int, float)) else 0.0
+
+        if len(fast_ema) < BINARY or len(slow_ema) < BINARY:
+            return {"signal": "neutral", "strength": 0.0, "trend_direction": 0}
+
+        curr_fast = fast_ema[-1] if isinstance(fast_ema[-1], (int, float)) else 0.0
+        curr_slow = slow_ema[-1] if isinstance(slow_ema[-1], (int, float)) else 0.0
+        prev_fast = fast_ema[-2] if isinstance(fast_ema[-2], (int, float)) else 0.0
+        prev_slow = slow_ema[-2] if isinstance(slow_ema[-2], (int, float)) else 0.0
+
+        diff = curr_fast - curr_slow
+        prev_diff = prev_fast - prev_slow
+
+        # Crossover detection
+        crossover = prev_diff <= 0 and diff > 0
+        crossunder = prev_diff >= 0 and diff < 0
+
+        strength = abs(diff)
+        trend_direction = 1 if diff > 0 else -1
+
+        if crossover and strength > threshold:
+            signal = "buy"
+        elif crossunder and strength > threshold:
+            signal = "sell"
+        else:
+            signal = "neutral"
+
+        return {
+            "signal": signal,
+            "strength": strength,
+            "trend_direction": trend_direction,
+        }
+
+    # Helper implementations
+
+    def _hma(self, series: list[float], period: int) -> float | None:
+        """Hull Moving Average: WMA(2*WMA(n/2) - WMA(n), sqrt(n)) last value.
+
+        Requires ``period + sqrt(period) - 1`` samples before the first
+        non-None output (inner full WMA + outer sqrt-length WMA).
+        """
+        if period <= 0:
+            return None
+        half = max(1, period // 2)
+        sqrt_n = max(1, int(math.sqrt(period)))
+        need = period + sqrt_n - 1
+        if len(series) < need:
+            return None
+        # Last ``sqrt_n`` raw-diff samples (oldest → newest), each ending at
+        # successive bars so the outer WMA matches TV/numba readiness.
+        diffs: list[float] = []
+        n = len(series)
+        for t in range(sqrt_n - 1, -1, -1):
+            end = n - t  # exclusive end index into series
+            sub = series[:end]
+            wh = self._wma(sub, half)
+            wf = self._wma(sub, period)
+            if wh is None or wf is None:
+                return None
+            diffs.append(2.0 * float(wh) - float(wf))
+        return self._wma(diffs, sqrt_n)
+
+    def _vwma(self, series: list[float], period: int) -> list[float]:
+        """Volume Weighted Moving Average: sum(src*vol)/sum(vol).
+
+        Falls back to SMA when chart volume is missing or too short.
+        """
+        vol = (getattr(self, "current_series", None) or {}).get("volume") or []
+        if not vol or len(vol) < period or len(series) < period:
+            return self._sma(series, period)
+        out: list[float] = []
+        for i in range(len(series)):
+            if i + 1 < period:
+                out.append(float("nan"))
+                continue
+            window_s = series[i + 1 - period : i + 1]
+            window_v = vol[i + 1 - period : i + 1]
+            if any(x is None or y is None for x, y in zip(window_s, window_v, strict=True)):
+                out.append(float("nan"))
+                continue
+            try:
+                sp = sum(float(x) * float(y) for x, y in zip(window_s, window_v, strict=True))
+                sv = sum(float(y) for y in window_v)
+            except (TypeError, ValueError):
+                out.append(float("nan"))
+                continue
+            out.append(sp / sv if sv else float("nan"))
+        return out

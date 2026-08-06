@@ -1,57 +1,110 @@
 # pyne-worker
 
-Python Cloudflare Worker — Pine Script evaluation on the edge.
+> Production **Python Cloudflare® Worker** for the **[PYNE](https://hoox.sh/pyne)** stack —
+> evaluate TradingView® Pine Script™ on the edge with the same bar-loop contract as the Pro API.
 
-**Deployed at:** `https://pyne-worker.cryptolinx.workers.dev`
+**Version:** 0.5.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript`)
 
-100% compatible with TradingView Pine Script v5/v6. Run your strategies
-outside TradingView for **$0/month** on Cloudflare's free tier.
+**Website:** [hoox.sh/pyne](https://hoox.sh/pyne) · **Docs:** [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) · **Repo:** [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker)
+
+**Edge deploy (example):** [`https://pyne-worker.cryptolinx.workers.dev`](https://pyne-worker.cryptolinx.workers.dev)
+
+_Pine Script™ and TradingView® are trademarks of TradingView, Inc. Cloudflare® is a trademark of Cloudflare, Inc. This project is an independent effort and is not affiliated with or endorsed by TradingView, Inc. or Cloudflare, Inc._
+
+## Ecosystem
+
+Part of the **[HOOX](https://hoox.sh)** open trading stack ([org: `hoox-sh`](https://github.com/hoox-sh)):
+
+| Product | Role | Repo | Website |
+|---------|------|------|---------|
+| **HOOX** | Edge trading framework (Workers mesh) | [hoox-sh/hoox](https://github.com/hoox-sh/hoox) | [hoox.sh](https://hoox.sh) · [docs](https://docs.hoox.sh) |
+| **PYNE** | Pine Script™ toolchain + Pro API | [hoox-sh/pyne](https://github.com/hoox-sh/pyne) | [hoox.sh/pyne](https://hoox.sh/pyne) · [docs](https://hoox.sh/pyne/docs) |
+| **pyne-worker** | Python edge evaluate host (this repo) | [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker) | [hoox.sh/pyne](https://hoox.sh/pyne) |
+| **pine-worker** | TypeScript edge evaluate + trade events | [hoox-sh/pine-worker](https://github.com/hoox-sh/pine-worker) | — |
+| **AXIS** | Installable charting PWA | [hoox-sh/axis](https://github.com/hoox-sh/axis) | [hoox.sh/axis](https://hoox.sh/axis) · [docs](https://hoox.sh/axis/docs) |
+| **trade-worker** | Multi-exchange order routing | [hoox-sh/trade-worker](https://github.com/hoox-sh/trade-worker) | — |
+
+```text
+AXIS / HOOX / CLI
+        │  evaluate contract (POST /run)
+        ▼
+┌───────────────────┐     ┌────────────────────┐
+│  pyne-worker      │────▶│  trade-worker      │  strategy events
+│  (Python edge)    │     │  (execution)       │
+└─────────┬─────────┘     └────────────────────┘
+          │ engine
+          ▼
+   hoox-sh/pyne  (import: pynescript)
+```
+
+Local sibling layout (typical):
+
+```text
+~/Git/hoox            # edge stack (hoox-sh/hoox)
+~/Git/pynescript      # PYNE core (GitHub: hoox-sh/pyne)
+~/Git/pyne-worker     # this repo
+~/Git/pine-worker     # TS edge sibling
+~/Git/axis            # charting PWA
+```
+
+## Overview
+
+**pyne-worker** is the production edge host for PYNE:
+
+- Runs the full **pynescript** bar-loop (`mode=interpret|compile|auto`) on Cloudflare® Workers
+- Speaks the shared **evaluate contract** with Flask Pro API, AXIS, and HOOX ([docs](https://hoox.sh/pyne/docs/api/contract))
+- **Deployed scripts** + **1m bar-close cron** + live Bybit kline feed → R2
+- **`alert()` / `alertcondition()`** export + **L2 HTTP webhooks**
+- Strategy **trade events** forwarded to [trade-worker](https://github.com/hoox-sh/trade-worker) via service binding
+
+Strong real-world Pine coverage via the open PYNE engine — **not** a claim of bit-identical TradingView® platform parity. See [PYNE docs](https://hoox.sh/pyne/docs) and the corpus status in [hoox-sh/pyne](https://github.com/hoox-sh/pyne).
 
 ## Features
 
-- ✅ **Full Pine Script v5/v6** — 500+ builtins via [pynescript](https://github.com/jango-blockchained/pynescript)
-- ✅ **Authentication** — API key validation via `X-API-Key` header / `API_KEY` secret
-- ✅ **Rate limiting** — sliding-window in-memory (100 req/60s)
-- ✅ **Input validation** — script size (100KB), bar count (100K), payload size (5MB), field validation
-- ✅ **Structured logging** — JSON per-request logs with request IDs and timing
-- ✅ **Health checks** — `/health` verifies R2 + service binding connectivity
-- ✅ **Execution timeout** — 30s wall-clock deadline per script run
-- ✅ **R2 data ingestion** — `POST /ingest` for OHLCV (`1m` / `1h` / `1d` / …)
-- ✅ **Compile modes** — `interpret` | `compile` | `auto` on `POST /run`
-- ✅ **Deployed scripts** — R2 registry + `script_id` on `/run`
-- ✅ **1m bar-close cron** — `* * * * *` + `POST /cron/run` (runs only on new bar)
-- ✅ **Live market feed** — each cron tick pulls closed klines (Bybit → R2) before eval
-- ✅ **Trade event forwarding** — strategy events → trade-worker via service binding
-- ✅ **Alert engine** — `alert()` / `alertcondition()` firings in `/run` + cron (last-bar filter)
-- ✅ **Alert webhooks (L2)** — POST firings to `ALERT_WEBHOOK_URL` or per-job `webhook_url`
-- ✅ **R2 data provider** — historical bar data from `data/{SYMBOL}/{TIMEFRAME}/{YYYY}.jsonl`
-- ✅ **$0 infrastructure** — free tier OK for light use; Paid recommended for heavy 1m
-- ✅ **3,263 BTCUSDT daily bars** preloaded in R2 (2017–2026); ingest `1m` for live cron
+- **Full Pine v5/v6 surface** — engine from [hoox-pyne](https://pypi.org/project/hoox-pyne/) / [hoox-sh/pyne](https://github.com/hoox-sh/pyne)
+- **Auth** — `X-API-Key` / Worker secret `API_KEY`
+- **Rate limiting** — sliding window (100 req / 60s)
+- **Input validation** — script size (100KB), bars (100K), payload (5MB)
+- **Structured logging** — JSON per-request with IDs + timing
+- **Health** — `GET /health` (R2 + service binding checks)
+- **30s wall timeout** per `/run`
+- **R2 OHLCV** — `POST /ingest`, `data/{SYMBOL}/{TIMEFRAME}/{YYYY}.jsonl`
+- **Compile modes** — `interpret` · `compile` · `auto` on `POST /run`
+- **Script registry** — deploy by `script_id`, list/get/delete
+- **1m bar-close cron** — `* * * * *` + `POST /cron/run` (runs only on new bar)
+- **Live market feed** — closed klines (Bybit → R2, Binance fallback)
+- **Trade forwarding** — strategy events → trade-worker
+- **Alert engine + L2 webhooks** — `ALERT_WEBHOOK_URL` or per-job `webhook_url`
+- **$0 tier OK** for light use; Paid Workers recommended for heavy 1m cron
+
+Product docs: [Alerts](https://hoox.sh/pyne/docs/runtime/alerts) · [Evaluate contract](https://hoox.sh/pyne/docs/api/contract)
 
 ## Quick start
 
 ```bash
-# Install
+# Install (editable pynescript sibling via pyproject)
 pip install -e ".[dev]"
 
-# Run tests
+# Tests
 pytest -v
 
-# Sync pynescript into python_modules/ (CF vendored tree — required before deploy)
+# Sync engine into python_modules/ (required before Cloudflare deploy)
 ./scripts/sync_vendor.sh
 
 # Deploy
 npx wrangler deploy
-# Then set your API key
 echo "my-secret-key" | wrangler secret put API_KEY
 ```
+
+**Deploy gotcha:** Wrangler packages `python_modules/pynescript`, not the editable install.
+After pulling new PYNE APIs, always re-run `./scripts/sync_vendor.sh`.
 
 ## Endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/health` | No | Health check + feature flags |
-| POST | `/run` | Yes | Execute Pine (`mode`, `script` or `script_id`) |
+| GET | `/health` | No | Health + feature flags |
+| POST | `/run` | Yes | Evaluate Pine (`mode`, `script` or `script_id`) |
 | POST | `/ingest` | Yes | Upload OHLCV to R2 (`1m`, `1h`, `1d`, …) |
 | POST | `/scripts` | Yes | Deploy a Pine script (R2 registry) |
 | GET | `/scripts` | Yes | List deployed scripts (no source) |
@@ -82,21 +135,24 @@ echo "my-secret-key" | wrangler secret put API_KEY
 | `script_id` | Load deployed script from R2 (instead of `script`) |
 | `ohlcv` / `data` | Bars; or omit and set `symbol` + `timeframe` to read R2 |
 | `mode` | `interpret` (default) · `compile` · `auto` (compile then fall back) |
+| `inputs` | Optional `input.*` overrides (title → value); forces interpret under `auto` |
 | `max_bars` | Tail length when loading long R2 history |
 
-Also accepts `"data"` instead of `"ohlcv"` (pynescript Pro API compat).
+Also accepts `"data"` instead of `"ohlcv"` (PYNE Pro API compat). Response includes `plots`, `series`, `alerts`, `events`, `inputs`, `meta`, and structured `error` / `error_kind` on failure.
 
 ### Deploy a script + 1m bar-close cron
 
 ```bash
-# 1) Ingest 1m bars (from your machine — Binance blocks CF IPs)
+export WORKER=https://pyne-worker.cryptolinx.workers.dev   # or your deploy URL
+
+# 1) Ingest 1m bars (from your machine — Binance blocks many CF IPs)
 python scripts/fetch_and_ingest.py \
   --symbol BTCUSDT --timeframe 1m \
-  --ingest-url https://pyne-worker.cryptolinx.workers.dev/ingest \
+  --ingest-url "$WORKER/ingest" \
   --api-key "$API_KEY"
 
 # 2) Deploy Pine
-curl -sS -X POST https://pyne-worker.cryptolinx.workers.dev/scripts \
+curl -sS -X POST "$WORKER/scripts" \
   -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
   -d '{
     "id": "btc-sma",
@@ -109,12 +165,12 @@ curl -sS -X POST https://pyne-worker.cryptolinx.workers.dev/scripts \
   }'
 
 # 3) Optional: explicit cron job list (else all enabled scripts are scheduled)
-curl -sS -X PUT https://pyne-worker.cryptolinx.workers.dev/cron/jobs \
+curl -sS -X PUT "$WORKER/cron/jobs" \
   -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
   -d '{"jobs":[{"script_id":"btc-sma","symbol":"BTCUSDT","timeframe":"1m","mode":"auto","enabled":true}]}'
 
 # 4) Manual trigger (same path as Cron Trigger * * * * *)
-curl -sS -X POST https://pyne-worker.cryptolinx.workers.dev/cron/run \
+curl -sS -X POST "$WORKER/cron/run" \
   -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
   -d '{"force":true}'
 ```
@@ -137,11 +193,13 @@ firings are POSTed as JSON to:
 2. Else Worker env `ALERT_WEBHOOK_URL`
 
 ```bash
+export WORKER=https://pyne-worker.cryptolinx.workers.dev
+
 # Default destination for all jobs
 echo "https://hooks.example.com/pine" | wrangler secret put ALERT_WEBHOOK_URL
 
 # Or per script when deploying
-curl -sS -X POST https://pyne-worker.cryptolinx.workers.dev/scripts \
+curl -sS -X POST "$WORKER/scripts" \
   -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
   -d '{
     "id":"btc-alerts",
@@ -180,10 +238,12 @@ Opt out: `"forward_alerts": false` on the job/script or request body.
 
 ```bash
 # Manual feed only
-curl -sS -X POST https://pyne-worker.cryptolinx.workers.dev/feed/refresh \
+curl -sS -X POST "$WORKER/feed/refresh" \
   -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
   -d '{"symbol":"BTCUSDT","timeframe":"1m","limit":200}'
 ```
+
+Docs: [PYNE alerts + L2 webhooks](https://hoox.sh/pyne/docs/runtime/alerts)
 
 ### POST /ingest
 
@@ -225,20 +285,22 @@ into R2, then evaluates scripts. Binance is a fallback (often blocked on CF IPs)
 Preload long history from Binance (runs locally / GH Actions):
 
 ```bash
+export WORKER=https://pyne-worker.cryptolinx.workers.dev
+
 # Fetch BTCUSDT 1m (or 1d / 1h) for current year
 python scripts/fetch_and_ingest.py --symbol BTCUSDT --timeframe 1m
 python scripts/fetch_and_ingest.py --symbol BTCUSDT --timeframe 1d
 
 # Upload via the /ingest endpoint
 python3 -c "
-import gzip, json, urllib.request
+import gzip, json, urllib.request, os
 with gzip.open('data/BTCUSDT/1d/2026.jsonl.gz', 'rt') as f:
     bars = [json.loads(line) for line in f if line.strip()]
 body = json.dumps({'symbol': 'BTCUSDT', 'timeframe': '1d', 'bars': bars}).encode()
 req = urllib.request.Request(
-    'https://pyne-worker.cryptolinx.workers.dev/ingest',
+    os.environ['WORKER'] + '/ingest',
     data=body,
-    headers={'Content-Type': 'application/json', 'X-API-Key': 'your-key-here'},
+    headers={'Content-Type': 'application/json', 'X-API-Key': os.environ['API_KEY']},
     method='POST',
 )
 with urllib.request.urlopen(req) as resp:
@@ -247,37 +309,40 @@ with urllib.request.urlopen(req) as resp:
 ```
 
 A daily GitHub Actions workflow (`.github/workflows/data-ingest.yml`)
-automatically fetches top symbols at 02:00 UTC.
+can fetch top symbols on a schedule.
 
-**Note:** Binance blocks Cloudflare Workers IPs (HTTP 403), so auto-fetch
-from the Worker itself is not supported. Preload data locally or provide
-inline `"ohlcv"`/`"data"` in the request body.
+**Note:** Binance blocks many Cloudflare Workers IPs (HTTP 403), so auto-fetch
+from the Worker itself is limited. Live cron uses Bybit first; bulk preload
+locally or pass inline `"ohlcv"` / `"data"`.
 
 ## Architecture
 
-1. **pynescript** — Parser, AST, evaluator + compile path (500+ builtins, Pine v5/v6)
-2. **pynescript_backend** — Bar-loop runtime (`mode=interpret|compile|auto`)
-3. **entry.py** — HTTP + `scheduled()` cron entrypoint, trade + alert forwarding
-4. **handler.py** — Routing, middleware, `/run` / scripts / cron
-5. **scripts_registry.py** — Deployed scripts + cron job config in R2
-6. **scheduler.py** — Bar-close job runner (used by cron and `POST /cron/run`)
-7. **data_provider.py** — R2 reader/writer (JSONL, `data/{SYM}/{TF}/{Y}.jsonl`)
-8. **trade_forwarder.py** — StrategyEvent → trade-worker WebhookPayload mapping
-9. **alert_engine.py** / **alert_forwarder.py** — last-bar filter + HTTP webhooks
+1. **[hoox-sh/pyne](https://github.com/hoox-sh/pyne)** (`pynescript`) — Parser, AST, evaluator + compile path  
+2. **`pynescript_backend`** — Bar-loop Runtime port of `pyne/backend` (`interpret|compile|auto`)  
+3. **`entry.py`** — HTTP + `scheduled()` cron entrypoint, trade + alert forwarding  
+4. **`handler.py`** — Routing, middleware, `/run` / scripts / cron  
+5. **`scripts_registry.py`** — Deployed scripts + cron job config in R2  
+6. **`scheduler.py`** — Bar-close job runner  
+7. **`data_provider.py`** — R2 reader/writer (`data/{SYM}/{TF}/{Y}.jsonl`)  
+8. **`trade_forwarder.py`** — StrategyEvent → trade-worker WebhookPayload  
+9. **`alert_engine.py` / `alert_forwarder.py`** — last-bar filter + HTTP webhooks  
 
-## Parity
-
-Python reference: [jango-blockchained/pynescript](https://github.com/jango-blockchained/pynescript)
-
-TypeScript sibling: [pine-worker](https://github.com/jango-blockchained/pine-worker)
+Vendored deploy tree: `python_modules/` (sync with `./scripts/sync_vendor.sh`).
 
 ## Related
 
-- [hoox.sh](https://hoox.sh) — Edge-native trading framework
-- [pynescript](https://github.com/jango-blockchained/pynescript) — Pine Script evaluator
-- [pine-worker](https://github.com/jango-blockchained/pine-worker) — TypeScript port
-- [trade-worker](https://github.com/jango-blockchained/trade-worker) — Trade execution
+| Link | What |
+|------|------|
+| [hoox.sh](https://hoox.sh) | HOOX product home |
+| [hoox.sh/pyne](https://hoox.sh/pyne) | PYNE product + playground entry |
+| [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) | PYNE manuals (runtime, API, alerts) |
+| [hoox-sh/pyne](https://github.com/hoox-sh/pyne) | Pine engine (this worker’s dependency) |
+| [hoox-sh/pine-worker](https://github.com/hoox-sh/pine-worker) | TypeScript edge sibling |
+| [hoox-sh/trade-worker](https://github.com/hoox-sh/trade-worker) | Exchange execution |
+| [hoox-sh/hoox](https://github.com/hoox-sh/hoox) | Edge trading framework |
+| [hoox-sh/axis](https://github.com/hoox-sh/axis) | Charting PWA |
+| [PyPI: hoox-pyne](https://pypi.org/project/hoox-pyne/) | Installable engine |
 
 ## License
 
-AGPL v3 or later. See [LICENSE](LICENSE).
+AGPL-3.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

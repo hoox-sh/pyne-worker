@@ -59,8 +59,8 @@ else
 fi
 
 # Refresh dist-info RECORD is optional; keep version label honest
-if [[ -d "$ROOT/python_modules/pynescript-0.2.0.dist-info" ]]; then
-  touch "$ROOT/python_modules/pynescript-0.2.0.dist-info"
+if [[ -d "$ROOT/python_modules/pynescript-0.3.0.dist-info" ]]; then
+  touch "$ROOT/python_modules/pynescript-0.3.0.dist-info"
 fi
 
 # Sanity checks

@@ -1,0 +1,1422 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""ANTLR parse-tree → ASDL AST builder for Pine Script.
+
+Pipeline role
+-------------
+``helper.parse`` / ``_parse`` orchestrate:
+
+1. **Lexer** — ``PinescriptLexer`` (from grammar resources under
+   ``ast/grammar/antlr4/resource/``, regenerated into
+   ``ast/grammar/antlr4/generated/``).
+2. **Parser** — ``PinescriptParser`` builds a rule-context tree
+   (``start_script`` for full scripts, ``start_expression`` for eval mode).
+3. **This module** — ``PinescriptASTBuilder.visit(tree)`` walks that tree and
+   emits ASDL nodes from ``pynescript.ast.node`` (generated from
+   ``ast/grammar/asdl/resource/Pinescript.asdl``).
+4. **Post-pass** (exec mode only, in ``helper``) — annotation comments
+   (``//@version``, ``//@description``, …) are collected via
+   ``PinescriptCommentParser._parseComment`` and attached to ``Script`` /
+   statements.
+
+Hand-edit rules
+---------------
+- **Edit this file** when mapping parse contexts → AST nodes changes.
+- **Edit only** ``ast/grammar/antlr4/resource/*.g4`` (and ASDL under
+  ``asdl/resource/``) for syntax / node shape; never hand-edit
+  ``ast/grammar/antlr4/generated/`` or ``ast/grammar/asdl/generated/``.
+- After grammar regen, visitor method names must stay aligned with parser
+  rule context classes (``visitFoo`` ↔ ``FooContext``).
+
+Key types
+---------
+- ``PinescriptASTLocator`` — lineno / col_offset / end_* from ANTLR tokens.
+- ``PinescriptCommentParser`` — classifies ``//`` annotations for the helper.
+- ``PinescriptASTBuilder`` — main visitor (stateless; ``helper`` reuses one
+  shared instance).
+
+Most ``visit_*`` methods are mechanical 1:1 rule mappings. Non-obvious cases
+(assignments / store ctx, soft keywords, bitwise recursion, multiline strings,
+UDF return types, comment kinds) carry brief docstrings on the methods.
+"""
+
+from __future__ import annotations
+
+import re
+
+from ast import literal_eval
+
+from antlr4 import ParserRuleContext
+
+from pynescript.ast import node as ast
+from pynescript.ast.grammar.antlr4.parser import PinescriptParser
+from pynescript.ast.grammar.antlr4.visitor import PinescriptParserVisitor
+
+# Empty context/op nodes are immutable in practice (only type is used). Reuse
+# singletons to cut allocation pressure on the builder hot path.
+_LOAD = ast.Load()
+_STORE = ast.Store()
+_ADD = ast.Add()
+_SUB = ast.Sub()
+_MULT = ast.Mult()
+_DIV = ast.Div()
+_MOD = ast.Mod()
+_BIT_OR = ast.BitOr()
+_BIT_XOR = ast.BitXor()
+_BIT_AND = ast.BitAnd()
+_LSHIFT = ast.LShift()
+_RSHIFT = ast.RShift()
+_OR = ast.Or()
+_AND = ast.And()
+_NOT = ast.Not()
+_UADD = ast.UAdd()
+_USUB = ast.USub()
+_INVERT = ast.Invert()
+_EQ = ast.Eq()
+_NOT_EQ = ast.NotEq()
+_LT = ast.Lt()
+_LT_E = ast.LtE()
+_GT = ast.Gt()
+_GT_E = ast.GtE()
+
+
+def _parse_number_literal(text: str):
+    """Parse a Pine number token without always paying for ast.literal_eval."""
+    # Underscore digit separators (Pine / Python-style): strip for fast paths.
+    if "_" in text:
+        compact = text.replace("_", "")
+    else:
+        compact = text
+
+    # Leading-zero decimal ints (e.g. 01) — literal_eval rejects these.
+    if compact.isdigit():
+        return int(compact)
+
+    if len(compact) > 2 and compact[0] == "0":
+        base_ch = compact[1]
+        if base_ch in "xX":
+            return int(compact, 16)
+        if base_ch in "bB":
+            return int(compact, 2)
+        if base_ch in "oO":
+            return int(compact, 8)
+
+    # Common float / scientific forms (incl. ``1.`` / ``.5``)
+    if "." in compact or "e" in compact or "E" in compact:
+        try:
+            return float(compact)
+        except ValueError:
+            pass
+
+    # Imaginary / other exotic forms → literal_eval (may still fail on 01)
+    try:
+        return literal_eval(text if "_" not in text else compact)
+    except (ValueError, SyntaxError):
+        if compact.isdigit():
+            return int(compact)
+        return float(compact)
+
+
+class PinescriptASTLocator:
+    """Extract and manage position metadata from ANTLR parse tree tokens.
+
+    Calculates line numbers, column offsets, and end positions from parser tokens
+    to preserve source location information in AST nodes for error reporting.
+    """
+
+    # ruff: noqa: N802
+
+    def _getLocations(self, ctx: ParserRuleContext) -> dict[str, int]:
+        """Extract location info from a parse tree context.
+
+        Args:
+            ctx: ANTLR parser context node
+
+        Returns:
+            Dict with lineno, col_offset, end_lineno, end_col_offset keys
+        """
+        start = ctx.start
+        stop = ctx.stop
+        stop_text = stop.text
+        stop_len = stop.stop - stop.start + 1
+        if stop_text is not None and "\n" in stop_text:
+            stop_nls = stop_text.count("\n")
+            stop_nlpos = stop_text.rfind("\n")
+            end_lineno = stop.line + stop_nls
+            end_col_offset = stop_len - stop_nlpos + 1
+        else:
+            end_lineno = stop.line
+            end_col_offset = stop.column + stop_len
+        return {
+            "lineno": start.line,
+            "col_offset": start.column,
+            "end_lineno": end_lineno,
+            "end_col_offset": end_col_offset,
+        }
+
+    def _setLocations(self, node: ast.AST, ctx: ParserRuleContext) -> ast.AST:
+        """Attach location metadata from parser context to AST node.
+
+        Args:
+            node: The AST node to annotate
+            ctx: The ANTLR parser context providing location data
+
+        Returns:
+            The modified node with location info attached
+        """
+        # Optimized: directly set attributes; cache stop.text (hot path)
+        start = ctx.start
+        stop = ctx.stop
+        stop_text = stop.text
+        stop_len = stop.stop - stop.start + 1
+
+        node.lineno = start.line  # type: ignore[attr-defined]
+        node.col_offset = start.column  # type: ignore[attr-defined]
+
+        # Most tokens are single-line; avoid count/rfind when no newline present
+        if stop_text is not None and "\n" in stop_text:
+            stop_nls = stop_text.count("\n")
+            stop_nlpos = stop_text.rfind("\n")
+            node.end_lineno = stop.line + stop_nls  # type: ignore[attr-defined]
+            node.end_col_offset = stop_len - stop_nlpos + 1  # type: ignore[attr-defined]
+        else:
+            node.end_lineno = stop.line  # type: ignore[attr-defined]
+            node.end_col_offset = stop.column + stop_len  # type: ignore[attr-defined]
+
+        return node
+
+
+class PinescriptCommentParser:
+    """Classify Pine Script ``//`` annotations for the helper post-pass.
+
+    Used by ``helper._collect_comment_nodes`` / ``visitComment``. Kind strings
+    drive where annotations attach (suffix ``S`` script, ``F`` function, ``T``
+    type, ``V`` variable). Examples:
+
+    - ``//@version=5`` → kind ``@=S`` (script-level language version)
+    - ``//@description …`` → ``@0S``
+    - ``//@function`` / ``//@returns`` → ``@0F``
+    - ``//@param name …`` / ``//@field name …`` → ``@1F`` / ``@1T``
+    - ``//# region`` / ``//# endregion`` → ``#`` (not attached as annotations)
+    - plain ``// …`` → ``//``
+    """
+
+    # ruff: noqa: N802
+
+    _ASSIGNMENT_ANNOTATION_PATTERN = re.compile(r"^(//)(\s*)(@)(\s*)(version)(\s*)(=)(\s*)(.+)$")
+    _SIMPLE_ANNOTATION_PATTERN = re.compile(
+        r"^(//)(\s*)(@)(\s*)(description|function|returns|type|variable|strategy_alert_message)(\s+)(.+)$"
+    )
+    _NAMED_ANNOTATION_PATTERN = re.compile(r"^(//)(\s*)(@)(\s*)(param|field)(\s+)(\w+)(\s+)(.+)$")
+    _REGION_BORDER_PATTERN = re.compile(r"^(//)(\s*)(#)(\s*)(region|endregion)$")
+
+    def _parseComment(self, comment: str) -> tuple[str, tuple[str, ...]]:  # noqa: C901
+        """Return ``(kind, parts)`` for one comment line.
+
+        Kind encoding (first chars + scope suffix) is consumed by
+        ``helper._add_annotations``. ``//@version=…`` is the only
+        assignment-style form and is always script-scoped (``S``).
+        """
+        # //@version = 5  →  ("@=S", ("version", "5"))
+        m = self._ASSIGNMENT_ANNOTATION_PATTERN.match(comment)
+        if m:
+            kind = "@="
+            parts = (m.group(5), m.group(9))
+            if parts[0] in {"version"}:
+                kind += "S"
+            return kind, parts
+        # //@description "text"
+        m = self._SIMPLE_ANNOTATION_PATTERN.match(comment)
+        if m:
+            kind = "@0"
+            parts = (m.group(5), m.group(7))
+            if parts[0] in {"description", "strategy_alert_message"}:
+                kind += "S"
+            elif parts[0] in {"function", "returns"}:
+                kind += "F"
+            elif parts[0] in {"type"}:
+                kind += "T"
+            elif parts[0] in {"variable"}:
+                kind += "V"
+            return kind, parts
+        m = self._NAMED_ANNOTATION_PATTERN.match(comment)
+        if m:
+            kind = "@1"
+            parts = (m.group(5), m.group(7), m.group(9))  # type: ignore[assignment]
+            if parts[0] in {"param"}:
+                kind += "F"
+            elif parts[0] in {"field"}:
+                kind += "T"
+            return kind, parts
+        m = self._REGION_BORDER_PATTERN.match(comment)
+        if m:
+            kind = "#"
+            parts = (m.group(5),)  # type: ignore[assignment]
+            return kind, parts
+        kind = "//"
+        parts = (comment,)  # type: ignore[assignment]
+        return kind, parts
+
+
+class PinescriptASTBuilder(
+    PinescriptParserVisitor,
+    PinescriptASTLocator,
+    PinescriptCommentParser,
+):
+    """Visitor that maps ``PinescriptParser`` rule contexts to ASDL AST nodes.
+
+    Responsibilities
+    ----------------
+    - Implement one ``visit_<rule>`` per grammar rule that yields structure
+      (statements, expressions, types, names, comments).
+    - Attach source locations via ``PinescriptASTLocator._setLocations``.
+    - Choose load vs store ``expr_context`` on targets (``Name``,
+      ``Attribute``, ``Subscript``, nested ``Tuple``).
+    - Reuse module-level op/context singletons (``_LOAD``, ``_ADD``, …) so
+      the hot path does not allocate empty nodes.
+
+    State
+    -----
+    Intentionally **stateless** across visits: no document, scope, or version
+    fields. ``helper._SHARED_BUILDER`` may be reused for every parse.
+    Comment classification is pure (``_parseComment``); annotation attachment
+    happens outside this class in ``helper._add_annotations``.
+
+    Context mapping
+    ---------------
+    Entry is the ANTLR visitor API — call ``builder.visit(parse_tree)``, not a
+    custom ``build()``. Top-level rules:
+
+    - ``visitStart_script`` → ``ast.Script`` (mode ``"exec"``)
+    - ``visitStart_expression`` → ``ast.Expression`` (mode ``"eval"``)
+    - ``visitStart`` / ``visitStart_comments`` — thin dispatch / comment lists
+
+    Each method takes a typed ``*Context`` from the generated parser, visits
+    children, and returns ASDL nodes (or lists of statements / params / args).
+    Operator and bool-op nodes are shared singletons; compound ops build
+    ``BinOp`` / ``BoolOp`` / ``Compare`` trees mirroring grammar precedence.
+
+    Grammar ↔ this class: method names are ANTLR-style (``visitX``). Do not
+    rename them without regenerating the visitor base and updating the
+    resource grammar.
+    """
+
+    # ruff: noqa: N802
+
+    def _set_store_ctx(self, node):
+        """Mark an assignment target tree as store (recurse into tuples).
+
+        Reassignment / augassignment parse the LHS as a primary expression
+        (load). After visit, flip ``ctx`` to ``Store`` so later passes treat
+        the node as a write target.
+        """
+        if hasattr(node, "ctx"):
+            node.ctx = _STORE
+        if isinstance(node, ast.Tuple):
+            for elt in node.elts:
+                self._set_store_ctx(elt)
+        return node
+
+    def visitStart(self, ctx: PinescriptParser.StartContext):
+        """Dispatch to the single alternative under the generic start rule."""
+        return self.visitChildren(ctx)
+
+    def visitStart_script(self, ctx: PinescriptParser.Start_scriptContext):
+        """Build a full-script ``ast.Script`` (helper parse mode ``exec``)."""
+        stmts = ctx.statements()
+        body = (stmts and self.visit(stmts)) or []
+        script = ast.Script(body)
+        return script
+
+    def visitStart_expression(self, ctx: PinescriptParser.Start_expressionContext):
+        """Build an ``ast.Expression`` wrapper (helper parse mode ``eval``)."""
+        expr = ctx.expression()
+        body = self.visit(expr)
+        expr = ast.Expression(body)
+        return expr
+
+    def visitStatements(self, ctx: PinescriptParser.StatementsContext):
+        stmts = ctx.statement()
+        stmts = [self.visit(stmt) for stmt in stmts]
+        # Each visitStatement returns a list (simple lines may have several).
+        stmts = [s for stmt in stmts for s in stmt]
+        return stmts
+
+    def visitStatement(self, ctx: PinescriptParser.StatementContext):
+        comp = ctx.compound_statement()
+        simp = ctx.simple_statements()
+        trail = ctx.trailing_structure_statements()
+        if comp:
+            return [self.visit(comp)]
+        if simp:
+            return self.visit(simp)
+        if trail:
+            return self.visit(trail)
+
+    def visitTrailing_structure_statements(
+        self, ctx: PinescriptParser.Trailing_structure_statementsContext
+    ):
+        """Comma-separated simple statements ending with a structure (for/if/while/switch)."""
+        stmts = [self.visit(s) for s in ctx.simple_statement()]
+        structure = self.visit(ctx.structure())
+        # Match visitStructure_statement: structures live as Expr wrappers.
+        structure_stmt = ast.Expr(structure)
+        self._setLocations(structure_stmt, ctx.structure())
+        stmts.append(structure_stmt)
+        return stmts
+
+    def visitCompound_name_initialization(self, ctx: PinescriptParser.Compound_name_initializationContext):
+        assign = ctx.variable_declaration()
+        value = ctx.structure_expression()
+        assign = self.visit(assign)
+        value = self.visit(value)
+        assign.value = value
+        # Library export of const variables (Pine June 2025)
+        if ctx.EXPORT():
+            assign.export = 1
+        self._setLocations(assign, ctx)
+        return assign
+
+    def visitCompound_tuple_initialization(self, ctx: PinescriptParser.Compound_tuple_initializationContext):
+        target = ctx.tuple_declaration()
+        value = ctx.structure_expression()
+        target = self.visit(target)
+        value = self.visit(value)
+        assign = ast.Assign(
+            target=target,
+            value=value,
+        )
+        self._setLocations(assign, ctx)
+        return assign
+
+    def visitCompound_reassignment(self, ctx: PinescriptParser.Compound_reassignmentContext):
+        """``lhs := structure`` — primary LHS visited as load, then store-ctx."""
+        target = ctx.primary_expression()
+        value = ctx.structure_expression()
+        target = self.visit(target)
+        self._set_store_ctx(target)
+        value = self.visit(value)
+        re_assign = ast.ReAssign(
+            target=target,
+            value=value,
+        )
+        self._setLocations(re_assign, ctx)
+        return re_assign
+
+    def visitCompound_augassignment(self, ctx: PinescriptParser.Compound_augassignmentContext):
+        """``lhs op= structure`` (e.g. ``+=``); same store-ctx fixup as reassignment."""
+        target = ctx.primary_expression()
+        op = ctx.augassign_op()
+        value = ctx.structure_expression()
+        target = self.visit(target)
+        self._set_store_ctx(target)
+        op = self.visit(op)
+        value = self.visit(value)
+        aug_assign = ast.AugAssign(
+            target=target,
+            op=op,
+            value=value,
+        )
+        self._setLocations(aug_assign, ctx)
+        return aug_assign
+
+    def visitSimple_name_initialization(self, ctx: PinescriptParser.Simple_name_initializationContext):
+        assign = ctx.variable_declaration()
+        value = ctx.expression()
+        assign = self.visit(assign)
+        value = self.visit(value)
+        assign.value = value
+        # Library export of const variables (Pine June 2025)
+        if ctx.EXPORT():
+            assign.export = 1
+        self._setLocations(assign, ctx)
+        return assign
+
+    def visitSimple_tuple_initialization(self, ctx: PinescriptParser.Simple_tuple_initializationContext):
+        target = ctx.tuple_declaration()
+        value = ctx.expression()
+        target = self.visit(target)
+        value = self.visit(value)
+        assign = ast.Assign(
+            target=target,
+            value=value,
+        )
+        self._setLocations(assign, ctx)
+        return assign
+
+    def visitSimple_reassignment(self, ctx: PinescriptParser.Simple_reassignmentContext):
+        target = ctx.primary_expression()
+        value = ctx.expression()
+        target = self.visit(target)
+        self._set_store_ctx(target)
+        value = self.visit(value)
+        re_assign = ast.ReAssign(
+            target=target,
+            value=value,
+        )
+        self._setLocations(re_assign, ctx)
+        return re_assign
+
+    def visitSimple_augassignment(self, ctx: PinescriptParser.Simple_augassignmentContext):
+        target = ctx.primary_expression()
+        op = ctx.augassign_op()
+        value = ctx.expression()
+        target = self.visit(target)
+        self._set_store_ctx(target)
+        op = self.visit(op)
+        value = self.visit(value)
+        aug_assign = ast.AugAssign(
+            target=target,
+            op=op,
+            value=value,
+        )
+        self._setLocations(aug_assign, ctx)
+        return aug_assign
+
+    def visitVariable_declaration(self, ctx: PinescriptParser.Variable_declarationContext):
+        """LHS of ``[=]`` init: optional type + ``var``/``varip`` mode; value filled by parent."""
+        target = ctx.name_store()
+        type_spec = ctx.type_specification()
+        dec_mode = ctx.declaration_mode()
+        target = self.visit(target)
+        type_spec = type_spec and self.visit(type_spec)
+        dec_mode = dec_mode and self.visit(dec_mode)
+        assign = ast.Assign(
+            target=target,
+            type=type_spec,
+            mode=dec_mode,
+        )
+        self._setLocations(assign, ctx)
+        return assign
+
+    def visitTuple_declaration(self, ctx: PinescriptParser.Tuple_declarationContext):
+        elts = ctx.name_store()
+        elts = [self.visit(elt) for elt in elts]
+        tup = ast.Tuple(
+            elts=elts,
+            ctx=_STORE,
+        )
+        self._setLocations(tup, ctx)
+        return tup
+
+    def visitDeclaration_mode(self, ctx: PinescriptParser.Declaration_modeContext):
+        if ctx.VARIP():
+            return ast.VarIp()
+        if ctx.VAR():
+            return ast.Var()
+
+    def visitAssignment_target_attribute(self, ctx: PinescriptParser.Assignment_target_attributeContext):
+        value = ctx.primary_expression()
+        name = ctx.name_store()
+        value = self.visit(value)
+        name = self.visit(name)
+        attr = ast.Attribute(
+            value=value,
+            attr=name.id,
+            ctx=_STORE,
+        )
+        self._setLocations(attr, ctx)
+        return attr
+
+    def visitAssignment_target_subscript(self, ctx: PinescriptParser.Assignment_target_subscriptContext):
+        value = ctx.primary_expression()
+        items = ctx.subscript_slice()
+        value = self.visit(value)
+        items = self.visit(items)
+        sub = ast.Subscript(
+            value=value,
+            slice=items,
+            ctx=_STORE,
+        )
+        self._setLocations(sub, ctx)
+        return sub
+
+    def visitAssignment_target_name(self, ctx: PinescriptParser.Assignment_target_nameContext):
+        return self.visit(ctx.name_store())
+
+    def visitAssignment_target_group(self, ctx: PinescriptParser.Assignment_target_groupContext):
+        return self.visit(ctx.assignment_target())
+
+    def visitAugassign_op(self, ctx: PinescriptParser.Augassign_opContext):
+        if ctx.STAREQUAL():
+            return _MULT
+        if ctx.SLASHEQUAL():
+            return _DIV
+        if ctx.PERCENTEQUAL():
+            return _MOD
+        if ctx.PLUSEQUAL():
+            return _ADD
+        if ctx.MINEQUAL():
+            return _SUB
+
+    def visitFunction_declaration(self, ctx: PinescriptParser.Function_declarationContext):
+        """UDF: ``export? [return_type] name(params) => body``.
+
+        Grammar allows a leading ``type_specification`` as the return type
+        (Pine v5+/v6). ASDL ``FunctionDef`` has no returns field yet, so that
+        context is intentionally not mapped — parse succeeds; type is dropped.
+        """
+        name = ctx.name()
+        args = ctx.parameter_list()
+        body = ctx.local_block()
+        name = self.visit(name)
+        args = (args and self.visit(args)) or []
+        body = self.visit(body)
+        export = ctx.EXPORT()
+        export = 1 if export else 0
+        func_def = ast.FunctionDef(
+            name=name,
+            args=args,
+            body=body,
+            method=0,  # Regular functions have method=0
+            export=export,
+        )
+        self._setLocations(func_def, ctx)
+        return func_def
+
+    def visitMethod_declaration(self, ctx: PinescriptParser.Method_declarationContext):
+        """Same shape as ``visitFunction_declaration`` with ``method=1``.
+
+        Optional return ``type_specification`` is also ignored (no ASDL field).
+        """
+        name = ctx.name()
+        args = ctx.method_parameter_list()
+        body = ctx.local_block()
+        name = self.visit(name)
+        args = (args and self.visit(args)) or []
+        body = self.visit(body)
+        export = ctx.EXPORT()
+        export = 1 if export else 0
+        func_def = ast.FunctionDef(
+            name=name,
+            args=args,
+            body=body,
+            method=1,  # Methods have method=1
+            export=export,
+        )
+        self._setLocations(func_def, ctx)
+        return func_def
+
+    def visitParameter_list(self, ctx: PinescriptParser.Parameter_listContext):
+        params = ctx.parameter_definition()
+        params = [self.visit(param) for param in params]
+        return params
+
+    def visitParameter_definition(self, ctx: PinescriptParser.Parameter_definitionContext):
+        name = ctx.name_store()
+        default = ctx.expression()
+        type_spec = ctx.type_specification()
+        name = self.visit(name)
+        default = default and self.visit(default)
+        type_spec = type_spec and self.visit(type_spec)
+        param = ast.Param(
+            name=name.id,
+            default=default,
+            type=type_spec,
+        )
+        self._setLocations(param, ctx)
+        return param
+
+    def visitMethod_parameter_list(self, ctx: PinescriptParser.Method_parameter_listContext):
+        params = ctx.method_parameter_definition()
+        params = [self.visit(param) for param in params]
+        return params
+
+    def visitMethod_parameter_definition(self, ctx: PinescriptParser.Method_parameter_definitionContext):
+        """Method params: first form is typed ``this``-style (type + name, no default)."""
+        # ``type_specification name_store`` vs ordinary ``parameter_definition``.
+        if ctx.type_specification() and ctx.name_store():
+            type_spec = self.visit(ctx.type_specification())
+            name = self.visit(ctx.name_store())
+            param = ast.Param(
+                name=name.id,  # Extract string ID from Name node
+                default=None,
+                type=type_spec,
+            )
+            self._setLocations(param, ctx)
+            return param
+        else:
+            param_def = ctx.parameter_definition()
+            return self.visit(param_def)
+
+    def visitType_declaration(self, ctx: PinescriptParser.Type_declarationContext):
+        name = ctx.name()
+        body = ctx.field_definitions()
+        export = ctx.EXPORT()
+        name = self.visit(name)
+        body = self.visit(body)
+        export = 1 if export else 0
+        type_def = ast.TypeDef(
+            name=name,
+            body=body,
+            export=export,
+        )
+        self._setLocations(type_def, ctx)
+        return type_def
+
+    def visitEnum_declaration(self, ctx: PinescriptParser.Enum_declarationContext):
+        name = ctx.name()
+        body = ctx.enum_definitions()
+        export = ctx.EXPORT()
+        name = self.visit(name)
+        body = self.visit(body)
+        export = 1 if export else 0
+        enum_def = ast.EnumDef(
+            name=name,
+            body=body,
+            export=export,
+        )
+        self._setLocations(enum_def, ctx)
+        return enum_def
+
+    def visitField_definitions(self, ctx: PinescriptParser.Field_definitionsContext):
+        defs = ctx.field_definition()
+        defs = [self.visit(d) for d in defs]
+        return defs
+
+    def visitField_definition(self, ctx: PinescriptParser.Field_definitionContext):
+        target = ctx.name_store()
+        target = self.visit(target)
+        value = ctx.expression()
+        value = value and self.visit(value)
+        type_spec = ctx.type_specification()
+        type_spec = type_spec and self.visit(type_spec)
+        varip = ctx.VARIP()
+        varip = 1 if varip else 0
+        stmt = ast.Assign(
+            target=target,
+            value=value,
+            type=type_spec,
+            mode=ast.VarIp() if varip else None,
+        )
+        self._setLocations(stmt, ctx)
+        return stmt
+
+    def visitEnum_definitions(self, ctx: PinescriptParser.Enum_definitionsContext):
+        defs = ctx.enum_definition()
+        defs = [self.visit(d) for d in defs]
+        return defs
+
+    def visitEnum_definition(self, ctx: PinescriptParser.Enum_definitionContext):
+        target = ctx.name_store()
+        target = self.visit(target)
+        value = ctx.expression()
+        value = value and self.visit(value)
+        stmt = ast.Assign(
+            target=target,
+            value=value,
+        )
+        self._setLocations(stmt, ctx)
+        return stmt
+
+    def visitStructure_statement(self, ctx: PinescriptParser.Structure_statementContext):
+        struct = ctx.structure()
+        struct = self.visit(struct)
+        stmt = ast.Expr(struct)
+        self._setLocations(stmt, ctx)
+        return stmt
+
+    def visitStructure_expression(self, ctx: PinescriptParser.Structure_expressionContext):
+        struct = ctx.structure()
+        struct = self.visit(struct)
+        expr = struct
+        self._setLocations(expr, ctx)
+        return expr
+
+    def visitIf_structure(self, ctx: PinescriptParser.If_structureContext):
+        test = ctx.expression()
+        body = ctx.local_block()
+        test = self.visit(test)
+        body = self.visit(body)
+
+        orelse = []
+        if ctx.if_tail():
+            orelse = self.visit(ctx.if_tail())
+
+        if_struct = ast.If(
+            test=test,
+            body=body,
+            orelse=orelse,
+        )
+        self._setLocations(if_struct, ctx)
+        return if_struct
+
+    def visitElif_structure(self, ctx: PinescriptParser.Elif_structureContext):
+        """``elif`` chain: nested ``If`` wrapped in ``Expr`` so ``orelse`` stays stmt*.
+
+        Nested elifs return a one-element list (statement list for ``orelse``),
+        not a bare ``If`` — matches structure-as-expression wrapping elsewhere.
+        """
+        test = ctx.expression()
+        body = ctx.local_block()
+        test = self.visit(test)
+        body = self.visit(body)
+
+        orelse = []
+        if ctx.if_tail():
+            orelse = self.visit(ctx.if_tail())
+
+        elif_struct = ast.If(
+            test=test,
+            body=body,
+            orelse=orelse,
+        )
+        self._setLocations(elif_struct, ctx)
+        elif_struct_expr = ast.Expr(elif_struct)  # Match how Elif was wrapped in Expr
+        self._setLocations(elif_struct_expr, ctx)
+        return [elif_struct_expr]
+
+    def visitIf_tail(self, ctx: PinescriptParser.If_tailContext):
+        if ctx.elif_structure():
+            return self.visit(ctx.elif_structure())
+        if ctx.else_block():
+            return self.visit(ctx.else_block())
+        return []
+
+    def visitConditional_expression(self, ctx: PinescriptParser.Conditional_expressionContext):
+        test = self.visit(ctx.disjunction_expression())
+        if ctx.QUESTION():
+            body = self.visit(ctx.expression(0))
+            orelse = self.visit(ctx.expression(1))
+            expr = ast.Conditional(
+                test=test,
+                body=body,
+                orelse=orelse,
+            )
+            self._setLocations(expr, ctx)
+            return expr
+        return test
+
+    def visitDisjunction_expression(self, ctx: PinescriptParser.Disjunction_expressionContext):
+        exprs = ctx.conjunction_expression()
+        if len(exprs) > 1:
+            exprs = [self.visit(expr) for expr in exprs]
+            expr = ast.BoolOp(
+                op=_OR,
+                values=exprs,
+            )
+            self._setLocations(expr, ctx)
+            return expr
+        return self.visit(exprs[0])
+
+    def visitConjunction_expression(self, ctx: PinescriptParser.Conjunction_expressionContext):
+        exprs = ctx.bitwise_or_expression()
+        if len(exprs) > 1:
+            exprs = [self.visit(expr) for expr in exprs]
+            expr = ast.BoolOp(
+                op=_AND,
+                values=exprs,
+            )
+            self._setLocations(expr, ctx)
+            return expr
+        return self.visit(exprs[0])
+
+    def visitBitwise_or_expression(self, ctx: PinescriptParser.Bitwise_or_expressionContext):
+        """Left-recursive ``|`` → nested ``BinOp``; xor/and visitors use the same shape."""
+        if ctx.bitwise_or_expression() is not None:
+            left = self.visit(ctx.bitwise_or_expression())
+            right = self.visit(ctx.bitwise_xor_expression())
+            expr = ast.BinOp(left=left, op=_BIT_OR, right=right)
+            self._setLocations(expr, ctx)
+            return expr
+        return self.visit(ctx.bitwise_xor_expression())
+
+    def visitBitwise_xor_expression(self, ctx: PinescriptParser.Bitwise_xor_expressionContext):
+        if ctx.bitwise_xor_expression() is not None:
+            left = self.visit(ctx.bitwise_xor_expression())
+            right = self.visit(ctx.bitwise_and_expression())
+            expr = ast.BinOp(left=left, op=_BIT_XOR, right=right)
+            self._setLocations(expr, ctx)
+            return expr
+        return self.visit(ctx.bitwise_and_expression())
+
+    def visitBitwise_and_expression(self, ctx: PinescriptParser.Bitwise_and_expressionContext):
+        if ctx.bitwise_and_expression() is not None:
+            left = self.visit(ctx.bitwise_and_expression())
+            right = self.visit(ctx.equality_expression())
+            expr = ast.BinOp(left=left, op=_BIT_AND, right=right)
+            self._setLocations(expr, ctx)
+            return expr
+        return self.visit(ctx.equality_expression())
+
+    def visitEquality_expression(self, ctx: PinescriptParser.Equality_expressionContext):
+        expr = ctx.inequality_expression()
+        expr = self.visit(expr)
+        pairs = ctx.equality_trailing_pair()
+        if pairs:
+            pairs = [self.visit(pair) for pair in pairs]
+            ops = [pair[0] for pair in pairs]
+            comparators = [pair[1] for pair in pairs]
+            expr = ast.Compare(
+                left=expr,
+                ops=ops,
+                comparators=comparators,
+            )
+            self._setLocations(expr, ctx)
+        return expr
+
+    def visitInequality_expression(self, ctx: PinescriptParser.Inequality_expressionContext):
+        expr = ctx.shift_expression()
+        expr = self.visit(expr)
+        pairs = ctx.inequality_trailing_pair()
+        if pairs:
+            pairs = [self.visit(pair) for pair in pairs]
+            ops = [pair[0] for pair in pairs]
+            comparators = [pair[1] for pair in pairs]
+            expr = ast.Compare(
+                left=expr,
+                ops=ops,
+                comparators=comparators,
+            )
+            self._setLocations(expr, ctx)
+        return expr
+
+    def visitShift_op(self, ctx: PinescriptParser.Shift_opContext):
+        if ctx.LSHIFT():
+            return _LSHIFT
+        if ctx.RSHIFT():
+            return _RSHIFT
+
+    def visitShift_expression(self, ctx: PinescriptParser.Shift_expressionContext):
+        if ctx.shift_op():
+            op = self.visit(ctx.shift_op())
+            left = self.visit(ctx.shift_expression())
+            right = self.visit(ctx.additive_expression())
+            expr = ast.BinOp(left=left, op=op, right=right)
+            self._setLocations(expr, ctx)
+            return expr
+        return self.visit(ctx.additive_expression())
+
+    def visitElse_block(self, ctx: PinescriptParser.Else_blockContext):
+        return self.visit(ctx.local_block())
+
+    def visitFor_iterator(self, ctx: PinescriptParser.For_iteratorContext):
+        """Loop variable; optional type annotation is accepted but not stored on ForTo/ForIn."""
+        if ctx.tuple_declaration():
+            return self.visit(ctx.tuple_declaration())
+        # Typed form: type_specification name_store — only the name is the target.
+        return self.visit(ctx.name_store())
+
+    def visitFor_structure_to(self, ctx: PinescriptParser.For_structure_toContext):
+        target = ctx.for_iterator()
+        start = ctx.expression(0)
+        end = ctx.expression(1)
+        step = ctx.expression(2)
+        body = ctx.local_block()
+        target = self.visit(target)
+        start = self.visit(start)
+        end = self.visit(end)
+        step = step and self.visit(step)
+        body = self.visit(body)
+        for_struct = ast.ForTo(
+            target=target,
+            start=start,
+            end=end,
+            body=body,
+            step=step,
+        )
+        self._setLocations(for_struct, ctx)
+        return for_struct
+
+    def visitFor_structure_in(self, ctx: PinescriptParser.For_structure_inContext):
+        target = ctx.for_iterator()
+        iterable = ctx.expression()
+        body = ctx.local_block()
+        target = self.visit(target)
+        iterable = self.visit(iterable)
+        body = self.visit(body)
+        for_struct = ast.ForIn(
+            target=target,
+            iter=iterable,
+            body=body,
+        )
+        self._setLocations(for_struct, ctx)
+        return for_struct
+
+    def visitWhile_structure(self, ctx: PinescriptParser.While_structureContext):
+        test = ctx.expression()
+        body = ctx.local_block()
+        test = self.visit(test)
+        body = self.visit(body)
+        while_struct = ast.While(
+            test=test,
+            body=body,
+        )
+        self._setLocations(while_struct, ctx)
+        return while_struct
+
+    def visitSwitch_structure(self, ctx: PinescriptParser.Switch_structureContext):
+        cases = ctx.switch_cases()
+        subject = ctx.expression()
+        cases = self.visit(cases)
+        subject = subject and self.visit(subject)
+        switch_struct = ast.Switch(
+            cases=cases,
+            subject=subject,
+        )
+        self._setLocations(switch_struct, ctx)
+        return switch_struct
+
+    def visitSwitch_cases(self, ctx: PinescriptParser.Switch_casesContext):
+        pattern_cases = ctx.switch_pattern_case()
+        default_case = ctx.switch_default_case()
+        cases = [self.visit(case) for case in pattern_cases]
+        if default_case:
+            case = self.visit(default_case)
+            cases.append(case)
+        return cases
+
+    def visitSwitch_pattern_case(self, ctx: PinescriptParser.Switch_pattern_caseContext):
+        body = ctx.local_block()
+        pattern = ctx.expression()
+        body = self.visit(body)
+        pattern = self.visit(pattern)
+        case = ast.Case(
+            body=body,
+            pattern=pattern,
+        )
+        self._setLocations(case, ctx)
+        return case
+
+    def visitSwitch_default_case(self, ctx: PinescriptParser.Switch_default_caseContext):
+        body = ctx.local_block()
+        body = self.visit(body)
+        case = ast.Case(
+            body=body,
+        )
+        self._setLocations(case, ctx)
+        return case
+
+    def visitIndented_local_block(self, ctx: PinescriptParser.Indented_local_blockContext):
+        return self.visit(ctx.statements())
+
+    def visitInline_local_block(self, ctx: PinescriptParser.Inline_local_blockContext):
+        return self.visit(ctx.statement())
+
+    def visitSimple_statements(self, ctx: PinescriptParser.Simple_statementsContext):
+        stmts = ctx.simple_statement()
+        stmts = [self.visit(stmt) for stmt in stmts]
+        return stmts
+
+    def visitExpression_statement(self, ctx: PinescriptParser.Expression_statementContext):
+        expr = ctx.expression()
+        expr = self.visit(expr)
+        stmt = ast.Expr(
+            value=expr,
+        )
+        self._setLocations(stmt, ctx)
+        return stmt
+
+    def visitEqual_trailing_pair(self, ctx: PinescriptParser.Equal_trailing_pairContext):
+        return (_EQ, self.visit(ctx.inequality_expression()))
+
+    def visitNot_equal_trailing_pair(self, ctx: PinescriptParser.Not_equal_trailing_pairContext):
+        return (_NOT_EQ, self.visit(ctx.inequality_expression()))
+
+    def visitLess_than_equal_trailing_pair(self, ctx: PinescriptParser.Less_than_equal_trailing_pairContext):
+        return (_LT_E, self.visit(ctx.shift_expression()))
+
+    def visitLess_than_trailing_pair(self, ctx: PinescriptParser.Less_than_trailing_pairContext):
+        return (_LT, self.visit(ctx.shift_expression()))
+
+    def visitGreater_than_equal_trailing_pair(self, ctx: PinescriptParser.Greater_than_equal_trailing_pairContext):
+        return (_GT_E, self.visit(ctx.shift_expression()))
+
+    def visitGreater_than_trailing_pair(self, ctx: PinescriptParser.Greater_than_trailing_pairContext):
+        return (_GT, self.visit(ctx.shift_expression()))
+
+    def visitAdditive_op(self, ctx: PinescriptParser.Additive_opContext):
+        if ctx.PLUS():
+            return _ADD
+        if ctx.MINUS():
+            return _SUB
+
+    def visitAdditive_expression(self, ctx: PinescriptParser.Additive_expressionContext):
+        if ctx.additive_op():
+            op = ctx.additive_op()
+            op = self.visit(op)
+            left = ctx.additive_expression()
+            right = ctx.multiplicative_expression()
+            left = self.visit(left)
+            right = self.visit(right)
+            expr = ast.BinOp(
+                left=left,
+                op=op,
+                right=right,
+            )
+            self._setLocations(expr, ctx)
+            return expr
+        else:
+            return self.visit(ctx.multiplicative_expression())
+
+    def visitMultiplicative_op(self, ctx: PinescriptParser.Multiplicative_opContext):
+        if ctx.STAR():
+            return _MULT
+        if ctx.SLASH():
+            return _DIV
+        if ctx.PERCENT():
+            return _MOD
+
+    def visitMultiplicative_expression(self, ctx: PinescriptParser.Multiplicative_expressionContext):
+        if ctx.multiplicative_op():
+            op = ctx.multiplicative_op()
+            op = self.visit(op)
+            left = ctx.multiplicative_expression()
+            right = ctx.unary_expression()
+            left = self.visit(left)
+            right = self.visit(right)
+            expr = ast.BinOp(
+                left=left,
+                op=op,
+                right=right,
+            )
+            self._setLocations(expr, ctx)
+            return expr
+        else:
+            return self.visit(ctx.unary_expression())
+
+    def visitUnary_op(self, ctx: PinescriptParser.Unary_opContext):
+        if ctx.NOT():
+            return _NOT
+        if ctx.PLUS():
+            return _UADD
+        if ctx.MINUS():
+            return _USUB
+        if ctx.TILDE():
+            return _INVERT
+
+    def visitUnary_expression(self, ctx: PinescriptParser.Unary_expressionContext):
+        if ctx.unary_op():
+            op = ctx.unary_op()
+            op = self.visit(op)
+            operand = ctx.unary_expression()
+            operand = self.visit(operand)
+            expr = ast.UnaryOp(
+                op=op,
+                operand=operand,
+            )
+            self._setLocations(expr, ctx)
+            return expr
+        else:
+            return self.visit(ctx.primary_expression())
+
+    def visitPrimary_expression_subscript(self, ctx: PinescriptParser.Primary_expression_subscriptContext):
+        value = ctx.primary_expression()
+        items = ctx.subscript_slice()
+        value = self.visit(value)
+        items = self.visit(items)
+        expr = ast.Subscript(
+            value=value,
+            slice=items,
+            ctx=_LOAD,
+        )
+        self._setLocations(expr, ctx)
+        return expr
+
+    def visitPrimary_expression_call(self, ctx: PinescriptParser.Primary_expression_callContext):
+        """Call; optional ``<typeargs>`` becomes ``Specialize`` on the callee."""
+        func = ctx.primary_expression()
+        spec = ctx.template_spec_suffix()
+        args = ctx.argument_list()
+        func = self.visit(func)
+        if spec:
+            spec_args = self.visit(spec)
+            # Span: start of callee through end of type-arg list (not full call).
+            func = ast.Specialize(
+                value=func,
+                args=spec_args,
+                lineno=func.lineno,
+                col_offset=func.col_offset,
+                end_lineno=spec_args.end_lineno,
+                end_col_offset=spec_args.end_col_offset,
+            )
+        args = (args and self.visit(args)) or []
+        expr = ast.Call(
+            func=func,
+            args=args,
+        )
+        self._setLocations(expr, ctx)
+        return expr
+
+    def visitPrimary_expression_attribute(self, ctx: PinescriptParser.Primary_expression_attributeContext):
+        value = ctx.primary_expression()
+        name = ctx.name_load()
+        value = self.visit(value)
+        name = self.visit(name)
+        expr = ast.Attribute(
+            value=value,
+            attr=name.id,
+            ctx=_LOAD,
+        )
+        self._setLocations(expr, ctx)
+        return expr
+
+    def visitArgument_list(self, ctx: PinescriptParser.Argument_listContext):
+        args = ctx.argument_definition()
+        args = [self.visit(arg) for arg in args]
+        return args
+
+    def visitArgument_definition(self, ctx: PinescriptParser.Argument_definitionContext):
+        name = ctx.name_store()
+        value = ctx.expression()
+        if name:
+            name = self.visit(name)
+            name = name.id
+        value = self.visit(value)
+        arg = ast.Arg(
+            value=value,
+            name=name,
+        )
+        self._setLocations(arg, ctx)
+        return arg
+
+    def visitSubscript_slice(self, ctx: PinescriptParser.Subscript_sliceContext):
+        items = ctx.expression()
+        items = [self.visit(item) for item in items]
+        if len(items) == 1:
+            items = items[0]
+        else:
+            items = ast.Tuple(
+                elts=items,
+                ctx=_LOAD,
+            )
+            self._setLocations(items, ctx)
+        return items
+
+    def visitLiteral_expression(self, ctx: PinescriptParser.Literal_expressionContext):
+        child = ctx.getChild(0)
+        value = self.visit(child)
+        expr = ast.Constant(
+            value=value,
+        )
+        self._setLocations(expr, ctx)
+        if ctx.literal_color():
+            expr.kind = "#"
+        return expr
+
+    def visitLiteral_number(self, ctx: PinescriptParser.Literal_numberContext):
+        return _parse_number_literal(ctx.getText())
+
+    def visitLiteral_string(self, ctx: PinescriptParser.Literal_stringContext):
+        """String token → Python str; v6 triple-quoted forms keep raw interior text.
+
+        Single/double quotes use ``literal_eval`` (escapes). Multiline
+        triple-quoted strings strip only the delimiters so newlines and
+        indentation stay as in source (not Python-string-normalized).
+        """
+        text = ctx.getText()
+        if (text.startswith('"""') and text.endswith('"""')) or (text.startswith("'''") and text.endswith("'''")):
+            return text[3:-3]
+        return literal_eval(text)
+
+    def visitLiteral_bool(self, ctx: PinescriptParser.Literal_boolContext):
+        if ctx.TRUE():
+            return True
+        if ctx.FALSE():
+            return False
+
+    def visitLiteral_color(self, ctx: PinescriptParser.Literal_colorContext):
+        text = ctx.getText()
+        return text
+
+    def visitGrouped_expression(self, ctx: PinescriptParser.Grouped_expressionContext):
+        return self.visit(ctx.expression())
+
+    def visitTuple_expression(self, ctx: PinescriptParser.Tuple_expressionContext):
+        elts = ctx.expression()
+        elts = [self.visit(elt) for elt in elts]
+        expr = ast.Tuple(
+            elts=elts,
+            ctx=_LOAD,
+        )
+        self._setLocations(expr, ctx)
+        return expr
+
+    def visitImport_statement(self, ctx: PinescriptParser.Import_statementContext):
+        namespace = ctx.name(0)
+        name = ctx.name(1)
+        version = ctx.literal_number()
+        alias = ctx.name(2)
+        namespace = self.visit(namespace)
+        name = self.visit(name)
+        version = self.visit(version)
+        alias = alias and self.visit(alias)
+        stmt = ast.Import(
+            namespace=namespace,
+            name=name,
+            version=version,
+            alias=alias,
+        )
+        self._setLocations(stmt, ctx)
+        return stmt
+
+    def visitBreak_statement(self, ctx: PinescriptParser.Break_statementContext):
+        stmt = ast.Break()
+        self._setLocations(stmt, ctx)
+        return stmt
+
+    def visitContinue_statement(self, ctx: PinescriptParser.Continue_statementContext):
+        stmt = ast.Continue()
+        self._setLocations(stmt, ctx)
+        return stmt
+
+    def visitType_specification(self, ctx: PinescriptParser.Type_specificationContext):
+        """Compose type expr: base name, then ``<>`` specialize, ``[]``, outer qualify.
+
+        Location spans are stitched so the outermost node covers the full type
+        text while nested pieces keep their own token ranges.
+        """
+        type_qual = ctx.type_qualifier()
+        ident = ctx.attributed_type_name()
+        temp_spec = ctx.template_spec_suffix()
+        array_suffix = ctx.array_type_suffix()
+        type_spec = self.visit(ident)
+        if temp_spec:
+            args = self.visit(temp_spec)
+            new_type_spec = ast.Specialize(
+                value=type_spec,
+                args=args,
+            )
+            self._setLocations(new_type_spec, temp_spec)
+            new_type_spec.lineno = type_spec.lineno
+            new_type_spec.col_offset = type_spec.col_offset
+            type_spec = new_type_spec
+        if array_suffix:
+            new_type_spec = ast.Subscript(  # type: ignore[assignment]
+                value=type_spec,
+            )
+            self._setLocations(new_type_spec, array_suffix)
+            new_type_spec.lineno = type_spec.lineno
+            new_type_spec.col_offset = type_spec.col_offset
+            type_spec = new_type_spec  # type: ignore[assignment]
+        if type_qual:
+            qualifier = self.visit(type_qual)
+            new_type_spec = ast.Qualify(  # type: ignore[assignment]
+                qualifier=qualifier,
+                value=type_spec,
+            )
+            self._setLocations(new_type_spec, type_qual)
+            new_type_spec.end_lineno = type_spec.end_lineno
+            new_type_spec.end_col_offset = type_spec.end_col_offset
+            type_spec = new_type_spec  # type: ignore[assignment]
+        return type_spec
+
+    def visitType_qualifier(self, ctx: PinescriptParser.Type_qualifierContext):
+        if ctx.CONST():
+            return ast.Const()
+        if ctx.INPUT():
+            return ast.Input()
+        if ctx.SIMPLE():
+            return ast.Simple()
+        if ctx.SERIES():
+            return ast.Series()
+
+    def visitAttributed_type_name(self, ctx: PinescriptParser.Attributed_type_nameContext):
+        names = ctx.name_load()
+        names = [self.visit(name) for name in names]
+        if len(names) == 1:
+            ident = names[0]
+        else:
+            value = names[0]
+            attr = names[1]
+            ident = ast.Attribute(
+                value=value,
+                attr=attr.id,
+                ctx=_LOAD,
+                lineno=value.lineno,
+                col_offset=value.col_offset,
+                end_lineno=attr.end_lineno,
+                end_col_offset=attr.end_col_offset,
+            )
+            for attr in names[2:]:
+                ident = ast.Attribute(
+                    value=ident,
+                    attr=attr.id,
+                    ctx=_LOAD,
+                    lineno=ident.lineno,
+                    col_offset=ident.col_offset,
+                    end_lineno=attr.end_lineno,
+                    end_col_offset=attr.end_col_offset,
+                )
+        return ident
+
+    def visitTemplate_spec_suffix(self, ctx: PinescriptParser.Template_spec_suffixContext):
+        args = ctx.type_argument_list()
+        args = args and self.visit(args)
+        return args
+
+    def visitType_argument_list(self, ctx: PinescriptParser.Type_argument_listContext):
+        args = ctx.type_specification()
+        args = [self.visit(arg) for arg in args]
+        if len(args) == 1:
+            args = args[0]
+        else:
+            args = ast.Tuple(
+                elts=args,
+                ctx=_LOAD,
+            )
+            self._setLocations(args, ctx)
+        return args
+
+    def visitName(self, ctx: PinescriptParser.NameContext):
+        """Identifier text, including soft keywords (``type``, ``method``, ``as``, …).
+
+        Grammar ``name`` is ``NAME | TYPE | METHOD | …`` so reserved words used
+        as identifiers are still plain strings here — no special casing needed.
+        """
+        return ctx.getText()
+
+    def visitName_load(self, ctx: PinescriptParser.Name_loadContext):
+        # Inline name text: avoids an extra visit() hop for every identifier.
+        name = ast.Name(
+            id=ctx.name().getText(),
+            ctx=_LOAD,
+        )
+        self._setLocations(name, ctx)
+        return name
+
+    def visitName_store(self, ctx: PinescriptParser.Name_storeContext):
+        name = ast.Name(
+            id=ctx.name().getText(),
+            ctx=_STORE,
+        )
+        self._setLocations(name, ctx)
+        return name
+
+    def visitStart_comments(self, ctx: PinescriptParser.Start_commentsContext):
+        comments = ctx.comments()
+        comments = self.visit(comments) if comments else []
+        return comments
+
+    def visitComments(self, ctx: PinescriptParser.CommentsContext):
+        comments = ctx.comment()
+        comments = [self.visit(comment) for comment in comments]
+        return comments
+
+    def visitComment(self, ctx: PinescriptParser.CommentContext):
+        """``Comment`` node; ``kind`` from ``_parseComment`` (``//@version``, tags, …)."""
+        comment = ctx.getText()
+        kind, _parts = self._parseComment(comment)  # type: ignore[assignment]
+        comment = ast.Comment(
+            value=comment,
+            kind=kind,
+        )
+        self._setLocations(comment, ctx)
+        return comment

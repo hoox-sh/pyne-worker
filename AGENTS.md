@@ -17,21 +17,24 @@ Python Cloudflare Worker that evaluates Pine Script strategies on the edge using
 
 ## Sister Repos
 
-All repos below are part of the **HOOX** project. When working on pyne-worker, be aware of the others.
+All repos below are part of the **HOOX** stack under GitHub org **[`hoox-sh`](https://github.com/hoox-sh)**.
+Product site: [hoox.sh](https://hoox.sh) · PYNE: [hoox.sh/pyne](https://hoox.sh/pyne).
 
-| Repo | Path | Purpose |
+| Repo (GitHub) | Local path | Purpose |
 |---|---|---|
-| `hoox-setup` | `/home/jango/Git/hoox-setup` | Monorepo: all Cloudflare Workers, Docker, CI/CD |
-| `hoox-landing-page` | `/home/jango/Git/hoox-landing-page` | Marketing landing site (Next.js 16) |
-| `pynescript` | `/home/jango/Git/pynescript` | Pine Script parser/evaluator (Python, ANTLR4) — **this repo's core dependency** |
-| `pyne-worker` | `/home/jango/Git/pyne-worker` | Python Cloudflare Worker — Pine Script evaluation on the edge |
-| `pine-worker` | `/home/jango/Git/pine-worker` | TypeScript Cloudflare Worker — Pine Script evaluator + trade event emitter |
+| [hoox-sh/hoox](https://github.com/hoox-sh/hoox) | `/home/jango/Git/hoox` (or `hoox-setup`) | Edge trading framework / Workers mesh |
+| [hoox-sh/pyne](https://github.com/hoox-sh/pyne) | `/home/jango/Git/pynescript` | Pine Script™ engine — **this repo's core dependency** |
+| [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker) | `/home/jango/Git/pyne-worker` | Python CF Worker — edge evaluate (this repo) |
+| [hoox-sh/pine-worker](https://github.com/hoox-sh/pine-worker) | `/home/jango/Git/pine-worker` | TypeScript CF Worker — evaluate + trade events |
+| [hoox-sh/trade-worker](https://github.com/hoox-sh/trade-worker) | — | Multi-exchange execution |
+| [hoox-sh/axis](https://github.com/hoox-sh/axis) | `/home/jango/Git/axis` | Charting PWA |
+| landing | `/home/jango/Git/hoox-landing-page` | Marketing site (Next.js → hoox.sh) |
 
-**Key:** `pyne-worker` → `pynescript` (editable install). `pine-worker` depends on `@jango-blockchained/hoox-shared` from `hoox-setup`.
+**Key:** `pyne-worker` → `pynescript` (editable install of [hoox-sh/pyne](https://github.com/hoox-sh/pyne)).
 ```
-pynescript ←── pyne-worker (depends on this)
-  │
-  └── shared Pine Script parser/evaluator
+hoox-sh/pyne (pynescript) ←── pyne-worker (depends on this)
+         │
+         └── shared Pine Script parser/evaluator
 ```
 
 ## Commands
@@ -64,4 +67,5 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 
 - Runtime exports `alerts` on `/run` (pynescript `AlertsMixin`).
 - Cron keeps last closed-bar firings only; POSTs to job `webhook_url` or env `ALERT_WEBHOOK_URL`.
-- Product docs (Mintlify): `pynescript` → `docs/pyne/runtime/alerts.mdx`.
+- Product docs: [hoox.sh/pyne/docs/runtime/alerts](https://hoox.sh/pyne/docs/runtime/alerts)
+  (source: [hoox-sh/pyne](https://github.com/hoox-sh/pyne) → `docs/pyne/runtime/alerts.mdx`).
