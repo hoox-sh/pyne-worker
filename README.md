@@ -20,9 +20,12 @@ Part of the **[HOOX](https://hoox.sh)** open trading stack ([org: `hoox-sh`](htt
 | **HOOX** | Edge trading framework (Workers mesh) | [hoox-sh/hoox](https://github.com/hoox-sh/hoox) | [hoox.sh](https://hoox.sh) · [docs](https://docs.hoox.sh) |
 | **PYNE** | Pine Script™ toolchain + Pro API | [hoox-sh/pyne](https://github.com/hoox-sh/pyne) | [hoox.sh/pyne](https://hoox.sh/pyne) · [docs](https://hoox.sh/pyne/docs) |
 | **pyne-worker** | Python edge evaluate host (this repo) | [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker) | [hoox.sh/pyne](https://hoox.sh/pyne) |
+| **pyne-agent-worker** | NL → PYNE scripts (Workers AI™; optional validate via this worker) | [hoox-sh/pyne-agent-worker](https://github.com/hoox-sh/pyne-agent-worker) | [AXIS plugin docs](https://hoox.sh/axis/docs/plugins/pine-agent) · [PYNE agent](https://hoox.sh/pyne/docs/agent) |
 | **pine-worker** | TypeScript edge evaluate + trade events | [hoox-sh/pine-worker](https://github.com/hoox-sh/pine-worker) | — |
 | **AXIS** | Installable charting PWA | [hoox-sh/axis](https://github.com/hoox-sh/axis) | [hoox.sh/axis](https://hoox.sh/axis) · [docs](https://hoox.sh/axis/docs) |
 | **trade-worker** | Multi-exchange order routing | [hoox-sh/trade-worker](https://github.com/hoox-sh/trade-worker) | — |
+
+**Note:** [pyne-agent-worker](https://github.com/hoox-sh/pyne-agent-worker) is fully usable **without** this evaluate host (standalone chat). When `PYNE_WORKER_URL` or a service binding points here, the agent can **generate → `POST /run` → retry** for higher-quality scripts.
 
 ```text
 AXIS / HOOX / CLI
