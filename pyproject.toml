@@ -30,6 +30,7 @@ packages = ["src"]
 testpaths = ["tests"]
 pythonpath = [
     "src",
-    "/mnt/data/home/jango/Git/pynescript",
+    "../../../pynescript/src",
+    "../../../pynescript",
 ]
 asyncio_mode = "auto"

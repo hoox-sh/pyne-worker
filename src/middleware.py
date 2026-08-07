@@ -50,14 +50,29 @@ def validate_api_key(
         expected_key: The expected key from environment / secrets.
 
     Returns:
-        ``True`` if the key is valid. If ``expected_key`` is ``None`` or empty
-        (dev mode), all requests are allowed.
+        ``True`` if the key is valid.
+
+    Fail-closed rules:
+      - When ``expected_key`` is a non-empty secret, missing/wrong client key → deny.
+      - When ``expected_key`` is ``None`` or empty (dev / local), allow (documented
+        open mode). Production **must** set Worker secret ``API_KEY``.
+      - Comparison is constant-time via :func:`hmac.compare_digest` on UTF-8 bytes
+        so length mismatches do not raise and do not leak via exception paths.
     """
-    if not expected_key:
-        return True  # dev mode — no key configured
-    if not api_key:
+    if expected_key is None or expected_key == "":
+        return True  # dev mode — no key configured (documented)
+    if not api_key or not isinstance(api_key, str):
         return False
-    return hmac.compare_digest(api_key, expected_key)
+    if not isinstance(expected_key, str):
+        return False
+    try:
+        # Bytes path: compare_digest is constant-time; unequal lengths → False.
+        return hmac.compare_digest(
+            api_key.encode("utf-8"),
+            expected_key.encode("utf-8"),
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -95,16 +110,33 @@ class RateLimiter:
         now = time.time()
         cutoff = now - self._window_seconds
 
-        timestamps = self._buckets.get(key, [])
+        # Cap key length so callers cannot grow memory via huge API keys
+        bucket_key = key if len(key) <= 128 else key[:128]
+
+        timestamps = self._buckets.get(bucket_key, [])
         timestamps = [t for t in timestamps if t > cutoff]
 
         allowed = len(timestamps) < self._max_requests
-        remaining = max(0, self._max_requests - len(timestamps))
+        remaining = max(0, self._max_requests - len(timestamps) - (1 if allowed else 0))
         reset_epoch = int(now) + self._window_seconds
 
         if allowed:
             timestamps.append(now)
-            self._buckets[key] = timestamps
+            self._buckets[bucket_key] = timestamps
+        elif timestamps:
+            self._buckets[bucket_key] = timestamps
+        else:
+            self._buckets.pop(bucket_key, None)
+
+        # Opportunistic prune of stale buckets (cheap bound on isolate memory)
+        if len(self._buckets) > 256:
+            stale = [
+                k
+                for k, ts in self._buckets.items()
+                if k != bucket_key and (not ts or ts[-1] <= cutoff)
+            ]
+            for k in stale[:64]:
+                self._buckets.pop(k, None)
 
         return allowed, {
             "X-RateLimit-Limit": str(self._max_requests),

@@ -25,14 +25,17 @@ from scripts_registry import get_cron_state
 from scripts_registry import get_script
 from scripts_registry import load_cron_jobs
 from scripts_registry import put_cron_state
+from security import sanitize_symbol
+from security import sanitize_timeframe
+from security import validate_webhook_url
 
 HttpGetJson = Callable[[str], Awaitable[Any]]
 
 
 def _job_key(job: dict[str, Any]) -> str:
     sid = str(job.get("script_id") or "unknown")
-    sym = str(job.get("symbol") or "BTCUSDT").upper()
-    tf = str(job.get("timeframe") or "1m")
+    sym = sanitize_symbol(str(job.get("symbol") or "BTCUSDT")) or "BTCUSDT"
+    tf = sanitize_timeframe(str(job.get("timeframe") or "1m")) or "1m"
     return f"{sid}:{sym}:{tf}"
 
 
@@ -87,10 +90,14 @@ async def run_scheduled_jobs(
             continue
 
         script_id = str(job.get("script_id"))
-        symbol = str(job.get("symbol") or "BTCUSDT").upper()
-        timeframe = str(job.get("timeframe") or "1m")
+        symbol = sanitize_symbol(str(job.get("symbol") or "BTCUSDT")) or "BTCUSDT"
+        timeframe = sanitize_timeframe(str(job.get("timeframe") or "1m")) or "1m"
         mode = str(job.get("mode") or "auto").strip().lower()
-        max_bars = int(job.get("max_bars") or 5000)
+        try:
+            max_bars = int(job.get("max_bars") or 5000)
+        except (TypeError, ValueError):
+            max_bars = 5000
+        max_bars = max(50, min(max_bars, 100_000))
         jkey = _job_key(job)
 
         rec = await get_script(r2_bucket, script_id)
@@ -107,14 +114,24 @@ async def run_scheduled_jobs(
         # Job fields override stored defaults when present
         script = str(rec["script"])
         mode = str(job.get("mode") or rec.get("mode") or "auto").strip().lower()
-        symbol = str(job.get("symbol") or rec.get("symbol") or symbol).upper()
-        timeframe = str(job.get("timeframe") or rec.get("timeframe") or timeframe)
-        max_bars = int(job.get("max_bars") or rec.get("max_bars") or max_bars)
+        symbol = (
+            sanitize_symbol(str(job.get("symbol") or rec.get("symbol") or symbol))
+            or "BTCUSDT"
+        )
+        timeframe = (
+            sanitize_timeframe(str(job.get("timeframe") or rec.get("timeframe") or timeframe))
+            or "1m"
+        )
+        try:
+            max_bars = int(job.get("max_bars") or rec.get("max_bars") or max_bars)
+        except (TypeError, ValueError):
+            max_bars = 5000
+        max_bars = max(50, min(max_bars, 100_000))
         forward = bool(job.get("forward_events", rec.get("forward_events", True)))
         forward_alerts = bool(job.get("forward_alerts", rec.get("forward_alerts", True)))
         webhook_url = job.get("webhook_url") or rec.get("webhook_url")
         if isinstance(webhook_url, str):
-            webhook_url = webhook_url.strip() or None
+            webhook_url = validate_webhook_url(webhook_url)
         else:
             webhook_url = None
 

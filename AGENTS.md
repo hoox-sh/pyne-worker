@@ -67,5 +67,14 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 
 - Runtime exports `alerts` on `/run` (pynescript `AlertsMixin`).
 - Cron keeps last closed-bar firings only; POSTs to job `webhook_url` or env `ALERT_WEBHOOK_URL`.
+- Webhook URLs must be **HTTPS public hosts** (`security.validate_webhook_url`) — private IPs / localhost rejected.
 - Product docs: [hoox.sh/pyne/docs/runtime/alerts](https://hoox.sh/pyne/docs/runtime/alerts)
   (source: [hoox-sh/pyne](https://github.com/hoox-sh/pyne) → `docs/pyne/runtime/alerts.mdx`).
+
+### Security helpers
+
+| Module | Role |
+|---|---|
+| `src/security.py` | Symbol/timeframe sanitization (R2 path safety), webhook SSRF checks |
+| `src/middleware.py` | `validate_api_key` (constant-time), rate limiter |
+| Auth | `API_KEY` secret + `X-API-Key` — **not** mesh `INTERNAL_KEY_BINDING` |

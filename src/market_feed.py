@@ -17,8 +17,11 @@ from typing import Any
 from typing import Awaitable
 from typing import Callable
 from typing import Protocol
+from urllib.parse import quote
 
 from data_provider import ingest_ohlcv_to_r2
+from security import sanitize_symbol
+from security import sanitize_timeframe
 
 # Pine / Binance-style TF → milliseconds
 _TF_MS: dict[str, int] = {
@@ -125,15 +128,22 @@ async def fetch_klines_bybit(
     category: str = "spot",
 ) -> list[dict[str, Any]]:
     """Fetch OHLCV from Bybit v5 public kline API."""
-    interval = _BYBIT_INTERVAL.get(timeframe)
-    if not interval:
+    sym = sanitize_symbol(symbol)
+    tf = sanitize_timeframe(timeframe)
+    if sym is None:
+        raise ValueError(f"Invalid symbol: {symbol!r}")
+    if tf is None or tf not in _BYBIT_INTERVAL:
         raise ValueError(f"Unsupported timeframe for Bybit: {timeframe}")
+    interval = _BYBIT_INTERVAL[tf]
+
+    # Only allow known Bybit category tokens (prevent query injection)
+    cat = category if category in ("spot", "linear", "inverse") else "spot"
 
     limit = max(1, min(int(limit), 1000))
     url = (
         "https://api.bybit.com/v5/market/kline"
-        f"?category={category}&symbol={symbol.upper()}"
-        f"&interval={interval}&limit={limit}"
+        f"?category={quote(cat, safe='')}&symbol={quote(sym, safe='')}"
+        f"&interval={quote(interval, safe='')}&limit={limit}"
     )
     data = await http_get_json(url)
     if not isinstance(data, dict):
@@ -170,14 +180,18 @@ async def fetch_klines_binance(
     http_get_json: HttpGetJson = default_http_get_json,
 ) -> list[dict[str, Any]]:
     """Fetch OHLCV from Binance spot (often blocked on CF; used as fallback)."""
-    interval = _BINANCE_INTERVAL.get(timeframe)
-    if not interval:
+    sym = sanitize_symbol(symbol)
+    tf = sanitize_timeframe(timeframe)
+    if sym is None:
+        raise ValueError(f"Invalid symbol: {symbol!r}")
+    if tf is None or tf not in _BINANCE_INTERVAL:
         raise ValueError(f"Unsupported timeframe for Binance: {timeframe}")
+    interval = _BINANCE_INTERVAL[tf]
 
     limit = max(1, min(int(limit), 1000))
     url = (
         "https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+        f"?symbol={quote(sym, safe='')}&interval={quote(interval, safe='')}&limit={limit}"
     )
     data = await http_get_json(url)
     if not isinstance(data, list):
@@ -279,12 +293,12 @@ async def refresh_pairs_for_jobs(
     for job in jobs:
         if not job.get("enabled", True):
             continue
-        sym = str(job.get("symbol") or "BTCUSDT").upper()
-        tf = str(job.get("timeframe") or "1m")
+        sym = sanitize_symbol(str(job.get("symbol") or "BTCUSDT")) or "BTCUSDT"
+        tf = sanitize_timeframe(str(job.get("timeframe") or "1m"))
+        if tf is None or tf not in _TF_MS:
+            continue
         key = (sym, tf)
         if key in seen:
-            continue
-        if tf not in _TF_MS:
             continue
         seen.add(key)
         pairs.append(key)

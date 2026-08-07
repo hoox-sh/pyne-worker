@@ -75,11 +75,20 @@ class Default(WorkerEntrypoint):
         # Read optional auth header
         api_key = request.headers.get("X-API-Key", None)
 
-        # Read body for POST
+        # Read body for POST (hard cap before full pipeline — fail closed on size)
         body = None
-        if method == "POST":
+        if method in ("POST", "PUT"):
             raw = await request.text()
-            # Only parse if non-empty
+            # 5 MB hard limit (matches handler._MAX_PAYLOAD_BYTES)
+            if len(raw) > 5 * 1024 * 1024:
+                return Response(
+                    json.dumps({"error": "Request body too large"}),
+                    status=413,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Request-ID": request_id,
+                    },
+                )
             if raw.strip():
                 body = raw
 
@@ -107,7 +116,9 @@ class Default(WorkerEntrypoint):
                     _forward_alerts = bool(_parsed.get("forward_alerts", True))
                     wh = _parsed.get("webhook_url")
                     if isinstance(wh, str) and wh.strip():
-                        _req_webhook = wh.strip()
+                        from security import validate_webhook_url
+
+                        _req_webhook = validate_webhook_url(wh)
             except json.JSONDecodeError:
                 pass
         if events and hasattr(self.env, "TRADE_SERVICE") and _forward_flag:

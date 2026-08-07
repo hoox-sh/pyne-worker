@@ -32,8 +32,12 @@ Usage:
 
 from __future__ import annotations
 
+import datetime
 import json
 from typing import Any
+
+from security import sanitize_symbol
+from security import sanitize_timeframe
 
 
 # ---------------------------------------------------------------------------
@@ -59,8 +63,22 @@ def _is_r2_hit(obj: Any) -> bool:
 
 
 def _ohlcv_key(symbol: str, timeframe: str, year: int) -> str:
-    """Return the R2 object key for a symbol/timeframe/year combo."""
-    return f"data/{symbol.upper()}/{timeframe}/{year}.jsonl"
+    """Return the R2 object key for a symbol/timeframe/year combo.
+
+    *symbol* / *timeframe* must already be sanitized; this function
+    re-validates and raises ``ValueError`` on path-unsafe input.
+    """
+    sym = sanitize_symbol(symbol)
+    tf = sanitize_timeframe(timeframe)
+    if sym is None:
+        raise ValueError(f"Invalid symbol for R2 key: {symbol!r}")
+    if tf is None:
+        raise ValueError(f"Invalid timeframe for R2 key: {timeframe!r}")
+    # year is always int from caller; keep it numeric-only
+    y = int(year)
+    if y < 1970 or y > 2100:
+        raise ValueError(f"Invalid year for R2 key: {year!r}")
+    return f"data/{sym}/{tf}/{y}.jsonl"
 
 
 async def fetch_ohlcv_from_r2(
@@ -83,15 +101,18 @@ async def fetch_ohlcv_from_r2(
         List of ``{open, high, low, close, time, volume?}`` dicts, sorted
         ascending by time. Empty list if no data found.
     """
+    sym = sanitize_symbol(symbol)
+    tf = sanitize_timeframe(timeframe)
+    if sym is None or tf is None:
+        return []
+
     bars: list[dict[str, Any]] = []
     seen_years: set[int] = set()
 
     # Scan plausible years (current year back 10 years)
-    import datetime
-
     now = datetime.datetime.now(datetime.timezone.utc)
     for year in range(now.year, now.year - 10, -1):
-        key = _ohlcv_key(symbol, timeframe, year)
+        key = _ohlcv_key(sym, tf, year)
         obj = await bucket.get(key)
         if not _is_r2_hit(obj):
             continue
@@ -144,9 +165,12 @@ async def ingest_ohlcv_to_r2(
     if not bars:
         return 0
 
-    import datetime
-    import gzip
-    import io
+    sym = sanitize_symbol(symbol)
+    tf = sanitize_timeframe(timeframe)
+    if sym is None:
+        raise ValueError(f"Invalid symbol: {symbol!r}")
+    if tf is None:
+        raise ValueError(f"Invalid timeframe: {timeframe!r}")
 
     # Group bars by year
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -162,7 +186,7 @@ async def ingest_ohlcv_to_r2(
 
     total = 0
     for year, year_bars in by_year.items():
-        key = _ohlcv_key(symbol, timeframe, year)
+        key = _ohlcv_key(sym, tf, year)
         existing_bars: list[dict[str, Any]] = []
 
         # Read existing data
@@ -212,11 +236,14 @@ async def has_ohlcv_data(
     Returns:
         ``True`` if at least one year file exists.
     """
-    import datetime
+    sym = sanitize_symbol(symbol)
+    tf = sanitize_timeframe(timeframe)
+    if sym is None or tf is None:
+        return False
 
     now = datetime.datetime.now(datetime.timezone.utc)
     for year in range(now.year, now.year - 3, -1):
-        key = _ohlcv_key(symbol, timeframe, year)
+        key = _ohlcv_key(sym, tf, year)
         obj = await bucket.get(key)
         if _is_r2_hit(obj):
             return True

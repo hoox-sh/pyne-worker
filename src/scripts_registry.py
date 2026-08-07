@@ -18,28 +18,13 @@ import time
 from typing import Any
 
 from data_provider import _is_r2_hit
+from security import sanitize_symbol
+from security import sanitize_timeframe
+from security import validate_webhook_url
 
 _SCRIPT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _MAX_SCRIPT_LENGTH = 100_000
 _VALID_MODES = frozenset({"interpret", "compile", "auto"})
-_VALID_TIMEFRAMES = frozenset(
-    {
-        "1m",
-        "5m",
-        "15m",
-        "30m",
-        "1h",
-        "2h",
-        "4h",
-        "6h",
-        "8h",
-        "12h",
-        "1d",
-        "3d",
-        "1w",
-        "1M",
-    }
-)
 
 
 def _script_key(script_id: str) -> str:
@@ -128,12 +113,15 @@ async def put_script(bucket: Any, record: dict[str, Any]) -> dict[str, Any]:
     if mode not in _VALID_MODES:
         raise ValueError(f"Invalid mode {mode!r}; use interpret|compile|auto")
 
-    symbol = str(record.get("symbol") or "BTCUSDT").upper()
-    timeframe = str(record.get("timeframe") or "1m")
-    if timeframe not in _VALID_TIMEFRAMES:
+    symbol = sanitize_symbol(str(record.get("symbol") or "BTCUSDT"))
+    if symbol is None:
         raise ValueError(
-            f"Invalid timeframe {timeframe!r}; "
-            f"allowed: {', '.join(sorted(_VALID_TIMEFRAMES))}"
+            "Invalid symbol: use 1–32 chars of [A-Za-z0-9._:-], no path separators"
+        )
+    timeframe = sanitize_timeframe(str(record.get("timeframe") or "1m"))
+    if timeframe is None:
+        raise ValueError(
+            "Invalid timeframe; allowed: 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M"
         )
 
     max_bars = record.get("max_bars", 5000)
@@ -157,10 +145,16 @@ async def put_script(bucket: Any, record: dict[str, Any]) -> dict[str, Any]:
         "max_bars": max_bars_i,
         "updated_at": int(time.time() * 1000),
     }
-    # Optional HTTP destination for pine alert() / alertcondition() firings
+    # Optional HTTPS destination for pine alert() / alertcondition() firings
     wh = record.get("webhook_url")
     if isinstance(wh, str) and wh.strip():
-        stored["webhook_url"] = wh.strip()
+        safe_wh = validate_webhook_url(wh)
+        if safe_wh is None:
+            raise ValueError(
+                "Invalid webhook_url: must be https to a public host "
+                "(no localhost / private IP / credentials)"
+            )
+        stored["webhook_url"] = safe_wh
 
     await _put_json(bucket, _script_key(str(script_id)), stored)
     ids = await load_index(bucket)
@@ -271,23 +265,32 @@ async def put_cron_jobs(bucket: Any, jobs: list[dict[str, Any]]) -> list[dict[st
         err = validate_script_id(sid)
         if err:
             continue
-        tf = str(j.get("timeframe") or "1m")
+        tf = sanitize_timeframe(str(j.get("timeframe") or "1m")) or "1m"
         mode = str(j.get("mode") or "auto").strip().lower()
         if mode not in _VALID_MODES:
             mode = "auto"
+        sym = sanitize_symbol(str(j.get("symbol") or "BTCUSDT")) or "BTCUSDT"
+        try:
+            max_bars_i = int(j.get("max_bars") or 5000)
+        except (TypeError, ValueError):
+            max_bars_i = 5000
+        max_bars_i = max(50, min(max_bars_i, 100_000))
         entry: dict[str, Any] = {
             "script_id": sid,
-            "symbol": str(j.get("symbol") or "BTCUSDT").upper(),
-            "timeframe": tf if tf in _VALID_TIMEFRAMES else "1m",
+            "symbol": sym,
+            "timeframe": tf,
             "mode": mode,
             "enabled": bool(j.get("enabled", True)),
-            "max_bars": int(j.get("max_bars") or 5000),
+            "max_bars": max_bars_i,
             "forward_events": bool(j.get("forward_events", True)),
             "forward_alerts": bool(j.get("forward_alerts", True)),
         }
         wh = j.get("webhook_url")
         if isinstance(wh, str) and wh.strip():
-            entry["webhook_url"] = wh.strip()
+            safe_wh = validate_webhook_url(wh)
+            if safe_wh is not None:
+                entry["webhook_url"] = safe_wh
+            # Invalid webhook silently dropped (fail-closed for SSRF)
         cleaned.append(entry)
     await _put_json(bucket, _cron_jobs_key(), {"jobs": cleaned})
     return cleaned

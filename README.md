@@ -271,7 +271,19 @@ All authenticated routes (`/run`, `/ingest`, `/scripts`, `/cron/*`, `/feed/*`) m
 X-API-Key: your-secret-here
 ```
 
-When `API_KEY` is unset (dev mode), auth is disabled.
+When `API_KEY` is unset (dev mode), auth is disabled. **Production must set `API_KEY`** — without it every management route is open.
+
+Auth comparison is constant-time (`hmac.compare_digest`). Rate limit: 100 req / 60s per key (in-memory per isolate).
+
+### Webhook / SSRF notes
+
+`webhook_url` (per-script / per-job / request body) and `ALERT_WEBHOOK_URL` are validated before delivery:
+
+- **HTTPS only** (public hosts)
+- Blocks `localhost`, `*.local` / `*.internal`, private / loopback / link-local / metadata IPs
+- Blocks embedded credentials (`https://user:pass@…`)
+
+R2 keys for OHLCV use sanitized `symbol` + `timeframe` only (`data/{SYMBOL}/{TF}/{YYYY}.jsonl`) to prevent path traversal.
 
 ## Data pipeline
 

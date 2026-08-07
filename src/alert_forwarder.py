@@ -21,6 +21,8 @@ from typing import Any
 from typing import Awaitable
 from typing import Callable
 
+from security import validate_webhook_url
+
 HttpPostJson = Callable[[str, dict[str, Any]], Awaitable[int]]
 
 
@@ -119,14 +121,20 @@ async def forward_alerts(
     Returns:
         ``{forwarded, failed, errors, url}`` summary.
     """
+    safe_url = validate_webhook_url(webhook_url)
     result: dict[str, Any] = {
         "forwarded": 0,
         "failed": 0,
         "errors": [],
-        "url": webhook_url,
+        # Never echo full untrusted URL if rejected — only safe URL
+        "url": safe_url or "",
         "batch": batch,
     }
-    if not webhook_url or not alerts:
+    if not alerts:
+        return result
+    if safe_url is None:
+        result["failed"] = len([a for a in alerts if isinstance(a, dict)])
+        result["errors"].append("webhook_url rejected (https public host required)")
         return result
 
     post = http_post_json or default_http_post_json
@@ -145,7 +153,7 @@ async def forward_alerts(
             # Convenience single-message for Discord if only one alert
             if len(payloads) == 1 and payloads[0].get("content"):
                 body["content"] = payloads[0]["content"]
-            status = await post(webhook_url, body)
+            status = await post(safe_url, body)
             if 200 <= int(status) < 300:
                 result["forwarded"] = len(payloads)
             else:
@@ -154,7 +162,7 @@ async def forward_alerts(
         else:
             for p in payloads:
                 try:
-                    status = await post(webhook_url, p)
+                    status = await post(safe_url, p)
                     if 200 <= int(status) < 300:
                         result["forwarded"] += 1
                     else:
@@ -181,15 +189,23 @@ def group_alerts_by_webhook(
     Skips entries with ``forward_alerts: false``.
     """
     by_url: dict[str, list[dict[str, Any]]] = {}
+    default_safe = validate_webhook_url(default_url) if default_url else None
     for a in alerts or []:
         if not isinstance(a, dict):
             continue
         if a.get("forward_alerts") is False:
             continue
-        url = a.get("webhook_url") or default_url
-        if not url:
+        raw = a.get("webhook_url") or default_url
+        if not raw:
             continue
-        url_s = str(url).strip()
+        # Per-alert URL preferred; fall back to validated default
+        url_s = validate_webhook_url(str(raw).strip() if raw else None)
+        if url_s is None and a.get("webhook_url"):
+            # Explicit bad per-alert URL — skip (do not fall through to default
+            # if the job intentionally set a private URL)
+            continue
+        if url_s is None:
+            url_s = default_safe
         if not url_s:
             continue
         by_url.setdefault(url_s, []).append(a)

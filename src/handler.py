@@ -32,6 +32,9 @@ from middleware import LogHelper
 from middleware import RateLimiter
 from middleware import validate_api_key
 from pynescript_backend import Runtime
+from security import safe_error_message
+from security import sanitize_symbol
+from security import sanitize_timeframe
 
 # ---------------------------------------------------------------------------
 # Limits
@@ -379,12 +382,32 @@ async def handle_run(
         )
 
     ohlcv = _normalize_ohlcv(data)
-    symbol: str = data.get("symbol", "BTCUSDT")
-    timeframe: str = data.get("timeframe", "1d")
-    if not isinstance(symbol, str):
-        symbol = "BTCUSDT"
-    if not isinstance(timeframe, str):
-        timeframe = "1d"
+    raw_symbol = data.get("symbol", "BTCUSDT")
+    raw_timeframe = data.get("timeframe", "1d")
+    if not isinstance(raw_symbol, str):
+        raw_symbol = "BTCUSDT"
+    if not isinstance(raw_timeframe, str):
+        raw_timeframe = "1d"
+    symbol = sanitize_symbol(raw_symbol)
+    timeframe = sanitize_timeframe(raw_timeframe)
+    if symbol is None:
+        return _json_response(
+            {"error": "Invalid symbol (use alphanumeric / . _ : - only, max 32)"},
+            400,
+        )
+    if timeframe is None:
+        # Allow non-registry timeframes only when OHLCV is inline (no R2 key)
+        if ohlcv is None and (
+            "symbol" in data or "timeframe" in data or deployed_id is not None
+        ):
+            return _json_response(
+                {
+                    "error": "Invalid timeframe; allowed: "
+                    "1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M",
+                },
+                400,
+            )
+        timeframe = raw_timeframe.strip() or "1d"
 
     # Auto-fetch from R2 when symbol/timeframe explicit, or when script_id was used
     has_explicit_symbol = "symbol" in data and isinstance(data["symbol"], str)
@@ -394,13 +417,24 @@ async def handle_run(
     )
 
     if should_fetch_r2:
+        if sanitize_timeframe(timeframe) is None:
+            return _json_response(
+                {
+                    "error": "Invalid timeframe for R2 load; allowed: "
+                    "1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M",
+                },
+                400,
+            )
         if r2_bucket is not None:
             try:
                 from data_provider import fetch_ohlcv_from_r2
 
                 ohlcv = await fetch_ohlcv_from_r2(r2_bucket, symbol, timeframe)
             except Exception as e:
-                return _json_response({"error": f"Failed to read R2: {e!s}"}, 502)
+                return _json_response(
+                    {"error": safe_error_message(e, prefix="Failed to read R2")},
+                    502,
+                )
         else:
             return _json_response(
                 {
@@ -674,14 +708,20 @@ async def handle_feed_refresh(
             return err
         if data is not None:
             if data.get("symbol"):
-                symbol = str(data["symbol"]).upper()
+                symbol = sanitize_symbol(str(data["symbol"]))
+                if symbol is None:
+                    return _json_response({"error": "Invalid symbol"}, 400)
             if data.get("timeframe"):
-                timeframe = str(data["timeframe"])
+                timeframe_s = sanitize_timeframe(str(data["timeframe"]))
+                if timeframe_s is None:
+                    return _json_response({"error": "Invalid timeframe"}, 400)
+                timeframe = timeframe_s
             if data.get("limit") is not None:
                 try:
                     limit = int(data["limit"])
                 except (TypeError, ValueError):
                     return _json_response({"error": "'limit' must be an integer"}, 400)
+                limit = max(1, min(limit, 1000))
 
     try:
         from market_feed import refresh_pair_to_r2
@@ -705,7 +745,10 @@ async def handle_feed_refresh(
         feed = await refresh_pairs_for_jobs(r2_bucket, jobs, limit=limit)
         return _json_response({"status": "ok", "feed": feed})
     except Exception as e:
-        return _json_response({"error": f"Feed refresh failed: {e!s}"}, 502)
+        return _json_response(
+            {"error": safe_error_message(e, prefix="Feed refresh failed")},
+            502,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -734,12 +777,14 @@ async def handle_ingest(
     if data is None:
         return _json_response({"error": "Failed to parse request body"}, 400)
 
-    symbol = data.get("symbol")
-    if not symbol or not isinstance(symbol, str):
+    symbol = sanitize_symbol(data.get("symbol") if isinstance(data.get("symbol"), str) else None)
+    if symbol is None:
         return _json_response({"error": "Missing or invalid 'symbol'"}, 400)
 
-    timeframe = data.get("timeframe")
-    if not timeframe or not isinstance(timeframe, str):
+    timeframe = sanitize_timeframe(
+        data.get("timeframe") if isinstance(data.get("timeframe"), str) else None
+    )
+    if timeframe is None:
         return _json_response({"error": "Missing or invalid 'timeframe'"}, 400)
 
     bars = data.get("bars")
@@ -755,12 +800,15 @@ async def handle_ingest(
 
         ingested = await ingest_ohlcv_to_r2(r2_bucket, symbol, timeframe, bars)
     except Exception as e:
-        return _json_response({"error": f"Failed to ingest data: {e!s}"}, 500)
+        return _json_response(
+            {"error": safe_error_message(e, prefix="Failed to ingest data")},
+            500,
+        )
 
     return _json_response(
         {
             "ingested": ingested,
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "timeframe": timeframe,
         }
     )
