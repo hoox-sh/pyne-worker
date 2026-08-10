@@ -46,6 +46,31 @@ from workers import WorkerEntrypoint
 from handler import handle_request
 from middleware import LogHelper
 from trade_forwarder import forward_events
+from trade_forwarder import normalize_exchange
+
+
+def _resolve_internal_auth_key(env: object) -> str | None:
+    """Mesh key for trade-worker ``X-Internal-Auth-Key``.
+
+    Preference order matches trade-worker execute auth fallbacks:
+    ``INTERNAL_KEY_BINDING`` → ``TRADE_EXECUTE_KEY_BINDING`` → ``TRADE_INTERNAL_KEY``.
+    """
+    for name in (
+        "INTERNAL_KEY_BINDING",
+        "TRADE_EXECUTE_KEY_BINDING",
+        "TRADE_INTERNAL_KEY",
+    ):
+        raw = getattr(env, name, None)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+
+def _resolve_default_exchange(env: object) -> str:
+    raw = getattr(env, "DEFAULT_EXCHANGE", None)
+    if isinstance(raw, str) and raw.strip():
+        return normalize_exchange(raw)
+    return "binance"
 
 
 class Default(WorkerEntrypoint):
@@ -59,12 +84,21 @@ class Default(WorkerEntrypoint):
       When unset, auth is disabled (dev mode).
     - ``ALERT_WEBHOOK_URL`` (var/secret) — Default HTTPS endpoint for
       pine ``alert()`` / ``alertcondition()`` firings (cron + optional /run).
+    - ``INTERNAL_KEY_BINDING`` (secret) — Mesh key for trade-worker
+      ``/webhook`` (must match trade-worker). Fallbacks:
+      ``TRADE_EXECUTE_KEY_BINDING``, ``TRADE_INTERNAL_KEY``.
+    - ``DEFAULT_EXCHANGE`` (var) — Default exchange id for trade forward
+      (default ``binance``; per-script / per-event override).
     """
 
     TRADE_SERVICE: object  # service binding, set by the runtime
     OHLCV_DATA: object  # R2 bucket binding, set by the runtime
     API_KEY: str | None = None  # secret, set by the runtime
     ALERT_WEBHOOK_URL: str | None = None  # optional default alert webhook
+    INTERNAL_KEY_BINDING: str | None = None  # mesh auth for trade-worker
+    TRADE_EXECUTE_KEY_BINDING: str | None = None  # optional execute-scoped key
+    TRADE_INTERNAL_KEY: str | None = None  # legacy alias
+    DEFAULT_EXCHANGE: str | None = None  # optional default exchange
 
     async def fetch(self, request):
         start = time.time()
@@ -108,6 +142,7 @@ class Default(WorkerEntrypoint):
         _forward_flag: bool = True
         _forward_alerts: bool = True
         _req_webhook: str | None = None
+        _req_exchange: str | None = None
         if body:
             try:
                 _parsed = json.loads(body)
@@ -119,6 +154,9 @@ class Default(WorkerEntrypoint):
                         from security import validate_webhook_url
 
                         _req_webhook = validate_webhook_url(wh)
+                    exch = _parsed.get("exchange")
+                    if isinstance(exch, str) and exch.strip():
+                        _req_exchange = normalize_exchange(exch)
             except json.JSONDecodeError:
                 pass
         if events and hasattr(self.env, "TRADE_SERVICE") and _forward_flag:
@@ -128,6 +166,8 @@ class Default(WorkerEntrypoint):
                     events,
                     self.env.TRADE_SERVICE,
                     symbol=symbol,
+                    internal_auth_key=_resolve_internal_auth_key(self.env),
+                    exchange=_req_exchange or _resolve_default_exchange(self.env),
                 )
                 if fwd.get("failed", 0) > 0:
                     payload["forward_errors"] = fwd.get("errors", [])
@@ -223,7 +263,9 @@ class Default(WorkerEntrypoint):
         # Forward strategy events to trade-worker
         events = summary.get("events") or []
         if events and hasattr(self.env, "TRADE_SERVICE"):
-            # Group by symbol when present
+            internal_key = _resolve_internal_auth_key(self.env)
+            default_exchange = _resolve_default_exchange(self.env)
+            # Group by symbol when present; event.exchange overrides default
             by_symbol: dict[str, list] = {}
             for ev in events:
                 if not isinstance(ev, dict):
@@ -232,8 +274,20 @@ class Default(WorkerEntrypoint):
                 by_symbol.setdefault(sym, []).append(ev)
             forward_meta: dict[str, object] = {}
             for sym, evs in by_symbol.items():
+                # Prefer first event-level exchange when set (scheduler tags jobs)
+                job_exchange = default_exchange
+                for ev in evs:
+                    if isinstance(ev, dict) and ev.get("exchange"):
+                        job_exchange = normalize_exchange(str(ev["exchange"]), default_exchange)
+                        break
                 try:
-                    fwd = await forward_events(evs, self.env.TRADE_SERVICE, symbol=sym)
+                    fwd = await forward_events(
+                        evs,
+                        self.env.TRADE_SERVICE,
+                        symbol=sym,
+                        internal_auth_key=internal_key,
+                        exchange=job_exchange,
+                    )
                     forward_meta[sym] = fwd
                 except Exception as e:
                     forward_meta[sym] = {"error": str(e)}

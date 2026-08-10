@@ -27,6 +27,9 @@
   // Production secrets (set via `wrangler secret put`):
   //   API_KEY — shared secret for HTTP auth (X-API-Key header)
   //   ALERT_WEBHOOK_URL — default HTTPS destination for alert()/alertcondition()
+  //   INTERNAL_KEY_BINDING — must match trade-worker mesh key for /webhook forward
+  // Optional vars:
+  //   DEFAULT_EXCHANGE — default trade exchange id (default: binance)
   "services": [
     {
       "binding": "TRADE_SERVICE",

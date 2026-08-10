@@ -278,6 +278,18 @@ When `API_KEY` is unset (dev mode), auth is disabled. **Production must set `API
 
 Auth comparison is constant-time (`hmac.compare_digest`). Rate limit: 100 req / 60s per key (in-memory per isolate).
 
+### Trade forwarding (mesh auth)
+
+Strategy events are POSTed to trade-worker `/webhook` via the `TRADE_SERVICE` binding. That route requires mesh auth (`requireTradeExecuteAuth`), so pyne-worker must set a matching internal key:
+
+```bash
+echo "same-as-trade-worker" | wrangler secret put INTERNAL_KEY_BINDING
+```
+
+Fallback secret names (same value as trade-worker execute key): `TRADE_EXECUTE_KEY_BINDING`, `TRADE_INTERNAL_KEY`.
+
+Without an internal key, actionable events are **not** POSTed — they fail with a clear error instead of a silent 401. Optional var `DEFAULT_EXCHANGE` (default `binance`) and per-script / request-body `exchange` select the exchange field on payloads.
+
 ### Webhook / SSRF notes
 
 `webhook_url` (per-script / per-job / request body) and `ALERT_WEBHOOK_URL` are validated before delivery:

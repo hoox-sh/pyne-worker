@@ -23,8 +23,22 @@ from security import sanitize_timeframe
 from security import validate_webhook_url
 
 _SCRIPT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+_EXCHANGE_RE = re.compile(r"^[a-zA-Z0-9_]+$")
 _MAX_SCRIPT_LENGTH = 100_000
 _VALID_MODES = frozenset({"interpret", "compile", "auto"})
+
+
+def sanitize_exchange(value: str | None) -> str | None:
+    """Sanitize exchange id to alphanumeric + underscore (lowercase).
+
+    Returns None if empty/invalid after stripping non-matching chars.
+    """
+    if value is None or not isinstance(value, str):
+        return None
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "", value.strip()).lower()
+    if not cleaned or not _EXCHANGE_RE.match(cleaned):
+        return None
+    return cleaned
 
 
 def _script_key(script_id: str) -> str:
@@ -155,6 +169,10 @@ async def put_script(bucket: Any, record: dict[str, Any]) -> dict[str, Any]:
                 "(no localhost / private IP / credentials)"
             )
         stored["webhook_url"] = safe_wh
+    # Optional exchange for trade-forward (alphanumeric + underscore)
+    exch = sanitize_exchange(str(record["exchange"]) if record.get("exchange") is not None else None)
+    if exch is not None:
+        stored["exchange"] = exch
 
     await _put_json(bucket, _script_key(str(script_id)), stored)
     ids = await load_index(bucket)
@@ -215,6 +233,8 @@ async def list_scripts(bucket: Any) -> list[dict[str, Any]]:
             }
             if rec.get("webhook_url"):
                 item["webhook_url"] = rec.get("webhook_url")
+            if rec.get("exchange"):
+                item["exchange"] = rec.get("exchange")
             out.append(item)
     return out
 
@@ -250,6 +270,8 @@ async def load_cron_jobs(bucket: Any) -> list[dict[str, Any]]:
         }
         if rec.get("webhook_url"):
             job["webhook_url"] = rec.get("webhook_url")
+        if rec.get("exchange"):
+            job["exchange"] = rec.get("exchange")
         derived.append(job)
     return derived
 
@@ -291,6 +313,9 @@ async def put_cron_jobs(bucket: Any, jobs: list[dict[str, Any]]) -> list[dict[st
             if safe_wh is not None:
                 entry["webhook_url"] = safe_wh
             # Invalid webhook silently dropped (fail-closed for SSRF)
+        exch = sanitize_exchange(str(j["exchange"]) if j.get("exchange") is not None else None)
+        if exch is not None:
+            entry["exchange"] = exch
         cleaned.append(entry)
     await _put_json(bucket, _cron_jobs_key(), {"jobs": cleaned})
     return cleaned

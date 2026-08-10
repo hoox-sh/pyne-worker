@@ -25,6 +25,7 @@ from scripts_registry import get_cron_state
 from scripts_registry import get_script
 from scripts_registry import load_cron_jobs
 from scripts_registry import put_cron_state
+from scripts_registry import sanitize_exchange
 from security import sanitize_symbol
 from security import sanitize_timeframe
 from security import validate_webhook_url
@@ -134,6 +135,12 @@ async def run_scheduled_jobs(
             webhook_url = validate_webhook_url(webhook_url)
         else:
             webhook_url = None
+        # Optional exchange for trade-forward (job overrides script record)
+        exchange = sanitize_exchange(
+            str(job["exchange"])
+            if job.get("exchange") is not None
+            else (str(rec["exchange"]) if rec.get("exchange") is not None else None)
+        )
 
         try:
             ohlcv = await fetch_ohlcv_from_r2(r2_bucket, symbol, timeframe)
@@ -199,6 +206,8 @@ async def run_scheduled_jobs(
                     ev.setdefault("symbol", symbol)
                     ev.setdefault("timeframe", timeframe)
                     ev.setdefault("deployed_script_id", script_id)
+                    if exchange:
+                        ev.setdefault("exchange", exchange)
             all_events.extend(ev for ev in events if isinstance(ev, dict))
 
         # Alert engine: last closed-bar firings for cron consumers
