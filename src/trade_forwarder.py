@@ -337,8 +337,12 @@ async def forward_events(
                     body=body,
                 )
 
-                if response.status == 200:
+                # 200 = executed; 409 = entry-level idempotency duplicate (OK)
+                if response.status in (200, 409):
                     result["forwarded"] += 1
+                    if response.status == 409:
+                        result.setdefault("deduplicated", 0)
+                        result["deduplicated"] = int(result["deduplicated"]) + 1
                 else:
                     result["failed"] += 1
                     action = payload.get("action", "?")

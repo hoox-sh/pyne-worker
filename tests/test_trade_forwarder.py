@@ -203,6 +203,21 @@ class TestForwardEvents:
         assert svc.calls == []
         assert any("missing internal auth key" in e for e in meta["errors"])
 
+    def test_409_duplicate_counts_as_forwarded(self) -> None:
+        """trade-worker entry idempotency returns 409 — not a hard failure."""
+        svc = FakeTradeService(status=409)
+        meta = asyncio.run(
+            forward_events(
+                [_ev(qty=0.01)],
+                svc,
+                symbol="BTCUSDT",
+                internal_auth_key="mesh-secret",
+            )
+        )
+        assert meta["forwarded"] == 1
+        assert meta["failed"] == 0
+        assert meta.get("deduplicated") == 1
+
     def test_missing_qty_not_forwarded(self) -> None:
         svc = FakeTradeService()
         meta = asyncio.run(
