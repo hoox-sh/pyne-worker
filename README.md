@@ -122,7 +122,7 @@ After pulling new PYNE APIs, always re-run `./scripts/sync_vendor.sh`.
 
 ```json
 {
-  "script": "//@version=5\nindicator('test')\nplot(close)",
+  "script": "//@version=6\nindicator('test')\nplot(close)",
   "ohlcv": [
     {"open": 100, "high": 105, "low": 95, "close": 102, "time": 1000, "volume": 1000},
     {"open": 102, "high": 108, "low": 101, "close": 106, "time": 2000, "volume": 1200}
@@ -159,7 +159,7 @@ curl -sS -X POST "$WORKER/scripts" \
   -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
   -d '{
     "id": "btc-sma",
-    "script": "//@version=5\nstrategy(\"s\")\nplot(close)",
+    "script": "//@version=6\nstrategy(\"s\")\nplot(close)",
     "symbol": "BTCUSDT",
     "timeframe": "1m",
     "mode": "auto",
@@ -206,7 +206,7 @@ curl -sS -X POST "$WORKER/scripts" \
   -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
   -d '{
     "id":"btc-alerts",
-    "script":"//@version=5\nindicator(\"a\")\nalertcondition(ta.crossover(close, ta.sma(close,20)), \"X\", \"cross\")\nplot(close)",
+    "script":"//@version=6\nindicator(\"a\")\nalertcondition(ta.crossover(close, ta.sma(close,20)), \"X\", \"cross\")\nplot(close)",
     "symbol":"BTCUSDT","timeframe":"1m",
     "webhook_url":"https://hooks.example.com/btc",
     "forward_alerts":true
