@@ -17,6 +17,21 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+"""Pine ``strategy.*`` execution builtins and per-run broker state.
+
+Models orders, open/closed trades, position size/direction, equity series, and
+fill logic used by ``strategy.entry``, ``strategy.close``, ``strategy.exit``,
+and related accessors. Constant sentinels (``strategy.long``, OCA types, …)
+live in :mod:`strategy_constants` to keep this module focused on runtime
+state.
+
+Mixin composition
+-----------------
+:class:`StrategyBuiltinsMixin` contributes ``_strategy_builtin_map`` into
+:class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`. Each evaluator
+owns an isolated :class:`StrategyState` (not class-level shared state).
+"""
+
 from __future__ import annotations
 
 import math
@@ -57,10 +72,90 @@ def _soft_int_decl(value: Any, default: int = 0) -> int:
         return default
 
 
+def _norm_avg_price_model(value: Any, default: str = "stock") -> str:
+    """Normalize ``strategy(..., avg_price_model=...)`` to a canonical token.
+
+    pynescript extension (not official Pine):
+
+    - ``stock`` / ``pine`` / ``average`` — multi-leg reweight on partial close (reference-like)
+    - ``futures`` / ``future`` / ``perp`` / ``net`` — sticky net AEP until flat
+    - ``inverse`` / ``coin`` / ``harmonic`` — accepted; reduce sticky like futures;
+      harmonic add blend is phase-2 (add path still arithmetic until then)
+
+    Unknown / non-string values soft-fallback to *default* (never crash corpus).
+    """
+    if value is None:
+        return default
+    raw = str(value).replace("strategy.", "").replace("avg_price_", "").strip().lower()
+    if not raw or raw in {"nan", "na", "none"}:
+        return default
+    if raw in {"stock", "pine", "average", "avg", "lot", "fifo"}:
+        return "stock"
+    if raw in {"futures", "future", "perp", "perpetual", "net", "linear"}:
+        return "futures"
+    if raw in {"inverse", "coin", "coin_m", "harmonic"}:
+        return "inverse"
+    return default
+
+
+def _blend_arithmetic_avg(old_avg: float, old_qty: float, fill_px: float, add_qty: float) -> float:
+    """Quantity-weighted arithmetic mean of entry fills (stock / linear futures)."""
+    oq = abs(float(old_qty))
+    aq = abs(float(add_qty))
+    total = oq + aq
+    if total <= 0:
+        return float(fill_px)
+    return (float(old_avg) * oq + float(fill_px) * aq) / total
+
+
+def _soft_float_decl(value: Any, default: float = 0.0) -> float:
+    """Coerce strategy() float kwargs; non-numeric / na → *default*."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    if isinstance(value, str):
+        try:
+            f = float(value)
+            if math.isnan(f) or math.isinf(f):
+                return default
+            return f
+        except ValueError:
+            return default
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm_leverage(value: Any, default: float = 1.0) -> float:
+    """Normalize ``strategy(..., leverage=...)`` to a positive multiplier ≥ 1.
+
+    Simpler futures UI alternative to reference Pine ``margin_long`` / ``margin_short``
+    percentages: ``leverage=10`` ≈ 10× buying power and margin = notional / 10.
+    Values in (0, 1) are treated as fractions of 1× and clamped up to 1.
+    """
+    lev = _soft_float_decl(value, default=default)
+    if lev <= 0:
+        return default
+    if lev < 1.0:
+        # Accidental "0.1 for 10%" style → treat as 1× (full margin)
+        return 1.0
+    return lev
+
+
 class StrategyCashAmount(float):
     """Free cash series value that also tags ``default_qty_type=strategy.cash``.
 
-    TradingView uses one name for both the free-capital series and the
+    Reference Pine uses one name for both the free-capital series and the
     ``default_qty_type`` sentinel. At runtime the series is a float; the
     strategy() declaration inspects ``_pine_qty_type`` (or the string
     ``\"cash\"``) so both call sites work.
@@ -92,10 +187,20 @@ class Order:
     max_fill_per_bar: float = 0.0
     oca_name: str | None = None
     oca_type: str = "none"  # none | cancel | reduce
+    # When set (strategy.exit from_entry), reduce only matching open-trade legs
+    from_entry: str | None = None
+    # Trailing stop state (strategy.exit trail_*). Distances are price units.
+    trail_offset: float | None = None
+    trail_activation: float | None = None
+    trail_active: bool = False
 
     @property
     def remaining_qty(self) -> float:
         return max(0.0, float(self.quantity) - float(self.filled_qty))
+
+    @property
+    def is_trail(self) -> bool:
+        return self.trail_offset is not None and self.trail_offset > 0
 
 
 @dataclass
@@ -172,6 +277,16 @@ class StrategyState:
         # default_qty_type: fixed | percent_of_equity | cash (strategy() declaration)
         self.default_qty_type: str = "fixed"
         self.default_qty_value: float = 1.0
+        # avg_price_model: stock | futures | inverse (pynescript extension)
+        # stock = multi-leg reweight on partial close; futures/inverse = sticky AEP
+        self.avg_price_model: str = "stock"
+        # Leverage multiplier for futures-style margin / buying power (default 1×).
+        # Prefer this over margin_long/short percentages for simple perp UIs.
+        self.leverage: float = 1.0
+        # reference-style margin % of position (100 = no leverage). Derived from leverage
+        # when only leverage is set: margin_pct = 100 / leverage.
+        self.margin_long: float = 100.0
+        self.margin_short: float = 100.0
         self.mintick: float = 0.01
         self.closedtrades_first_index: int = 0
         self.max_contracts_held_all: float = 0.0
@@ -377,7 +492,14 @@ class StrategyState:
         return self.grossloss() / n if n else 0.0
 
     def capital_held(self) -> float:
-        return float(sum(abs(t.entry_price * t.size) for t in self.open_trades))
+        """Margin locked in open positions (notional / leverage).
+
+        At leverage=1 this equals full position notional (stock / cash account).
+        At leverage=10, only 10% of notional is held as margin.
+        """
+        notional = float(sum(abs(t.entry_price * t.size) for t in self.open_trades))
+        lev = float(self.leverage) if self.leverage and self.leverage > 0 else 1.0
+        return notional / lev
 
     def cash(self, mark_price: float) -> float:
         """Approximate free cash: equity minus capital locked in open positions."""
@@ -395,7 +517,13 @@ class StrategyState:
 
 
 class StrategyBuiltinsMixin(BuiltinDispatchMixin):
-    """Strategy execution functions for entry, exit, and trade management."""
+    """``strategy.entry`` / ``exit`` / ``close`` and performance series accessors.
+
+    Maintains :attr:`_strategy_state` for fills, positions, and trade history.
+    Declaration kwargs from ``strategy()`` are applied via
+    ``_apply_strategy_declaration`` when :class:`BuiltinEvaluator` wraps the
+    declaration handler.
+    """
 
     def _record_strategy_event(self, event: StrategyEvent) -> None:
         """Append a captured event to the current run's event buffer.
@@ -480,6 +608,7 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             "strategy.position_size": self._handle_strategy_position_size,
             "strategy.position_avg_price": self._handle_strategy_position_avg_price,
             "strategy.position_entry_name": self._handle_strategy_position_entry_name,
+            "strategy.leverage": self._handle_strategy_leverage,
             "strategy.opentrades": self._handle_strategy_opentrades_count,
             "strategy.closedtrades": self._handle_strategy_closedtrades_count,
             "strategy.closedtrades.first_index": self._handle_strategy_closedtrades_first_index,
@@ -675,9 +804,12 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
     def _resolve_default_entry_qty(self, fill_price: float) -> float:
         """Resolve entry size from strategy() ``default_qty_type`` / ``default_qty_value``.
 
-        - ``fixed``: contracts = default_qty_value (Pine default 1)
-        - ``percent_of_equity``: contracts = equity * (pct/100) / price
-        - ``cash``: contracts = cash_amount / price
+        - ``fixed``: contracts = default_qty_value (Pine default 1); leverage ignored
+        - ``percent_of_equity``: margin = equity * (pct/100); qty = margin * leverage / price
+        - ``cash``: margin = cash amount; qty = margin * leverage / price
+
+        Leverage defaults to 1× (no effect). Futures UIs set ``leverage=N`` so
+        percent/cash sizing uses buying power instead of 1:1 cash notional.
         """
         st = self._strategy_state
         dqt = (st.default_qty_type or "fixed").replace("strategy.", "").lower()
@@ -685,11 +817,13 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
         price = float(fill_price) if fill_price and fill_price > 0 else self._mark_price()
         if price <= 0:
             price = 1.0
+        lev = float(st.leverage) if getattr(st, "leverage", 1.0) and st.leverage > 0 else 1.0
         if dqt in {"percent_of_equity", "percent", "percentage"}:
             equity = float(st.equity(price)) if hasattr(st, "equity") else float(st.risk_free_capital)
-            return max(0.0, (equity * (val / 100.0)) / price)
+            margin = equity * (val / 100.0)
+            return max(0.0, (margin * lev) / price)
         if dqt == "cash":
-            return max(0.0, val / price)
+            return max(0.0, (val * lev) / price)
         # fixed (default)
         return max(0.0, val if val > 0 else 1.0)
 
@@ -759,6 +893,10 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
                 "currency",
                 "default_qty_value",
                 "default_qty_type",
+                "avg_price_model",
+                "leverage",
+                "margin_long",
+                "margin_short",
             ):
                 if hasattr(decl, key):
                     mapping[key] = getattr(decl, key)
@@ -803,6 +941,33 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             except (TypeError, ValueError):
                 # Unresolved identifier (e.g. cash_given_per_lot) → keep default.
                 pass
+        if "avg_price_model" in src and src["avg_price_model"] is not None:
+            st.avg_price_model = _norm_avg_price_model(src["avg_price_model"], default="stock")
+        # Leverage / margin: leverage is the simple futures UI; margin_* is reference-style %.
+        # Priority: explicit leverage wins; else derive leverage from margin_long/short.
+        has_lev = "leverage" in src and src["leverage"] is not None
+        has_ml = "margin_long" in src and src["margin_long"] is not None
+        has_ms = "margin_short" in src and src["margin_short"] is not None
+        if has_lev:
+            st.leverage = _norm_leverage(src["leverage"], default=1.0)
+            # Keep margin % in sync for anything that reads reference-style fields
+            st.margin_long = 100.0 / st.leverage
+            st.margin_short = 100.0 / st.leverage
+        if has_ml:
+            ml = _soft_float_decl(src["margin_long"], default=100.0)
+            if ml > 0:
+                st.margin_long = ml
+                if not has_lev:
+                    st.leverage = max(1.0, 100.0 / ml)
+        if has_ms:
+            ms = _soft_float_decl(src["margin_short"], default=100.0)
+            if ms > 0:
+                st.margin_short = ms
+                if not has_lev and not has_ml:
+                    st.leverage = max(1.0, 100.0 / ms)
+                elif not has_lev and has_ml:
+                    # Use the more conservative (higher margin / lower leverage) side
+                    st.leverage = max(1.0, 100.0 / max(st.margin_long, st.margin_short))
 
     def _bar_index(self) -> int:
         ctx = getattr(self, "context", {}) or {}
@@ -983,7 +1148,7 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             )
 
         # Same-direction market entry while already in a position:
-        # - same entry id → replace (TV cancels+re-places that id)
+        # - same entry id → replace (reference Pine cancels+re-places that id)
         # - different id + pyramiding room → add
         # - different id + no pyramiding room → ignore
         if st.position_direction == direction and st.position_size > 0:
@@ -1073,82 +1238,206 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
         _ = equity
         return True
 
+    def _entry_open_size(self, from_entry: str | None) -> float:
+        """Open size for ``from_entry`` legs, or whole position when unset.
+
+        When the position is open but ``open_trades`` was never materialised
+        (tests / thin hosts), treat the whole ``position_size`` as eligible so
+        ``from_entry`` still reduces the net lot.
+        """
+        st = self._strategy_state
+        if not from_entry:
+            return float(st.position_size)
+        if not st.open_trades and st.position_size > 0:
+            return float(st.position_size)
+        return float(sum(t.size for t in st.open_trades if t.entry_id == from_entry))
+
+    def _resolve_exit_qty(
+        self,
+        *,
+        target_size: float,
+        raw_qty: Any,
+        raw_qty_percent: Any,
+    ) -> tuple[str, float]:
+        """Resolve strategy.exit size from ``qty`` / ``qty_percent``.
+
+        Returns ``(status, qty)`` where *status* is ``ok`` | ``invalid``.
+
+        Edge cases (aligned with common Pine usage):
+
+        - ``qty_percent`` wins when both ``qty`` and ``qty_percent`` are set
+          (and percent is not na).
+        - ``qty_percent`` is a percent of *target_size* (whole position, or
+          ``from_entry`` open size when set): ``qty = target * pct / 100``.
+        - ``pct <= 0`` → qty 0 (soft no-op after placement event).
+        - ``pct`` na / missing → ignore percent; use ``qty`` or full target.
+        - ``pct > 100`` → capped at 100% of target.
+        - Absolute ``qty`` is capped to target_size.
+        """
+        target = max(0.0, float(target_size))
+        pct = self._coerce_optional_price(raw_qty_percent)
+        if pct is not None:
+            if pct <= 0:
+                return ("ok", 0.0)
+            pct = min(float(pct), 100.0)
+            return ("ok", target * (pct / 100.0))
+
+        if raw_qty is None:
+            return ("ok", target)
+        status, parsed = self._parse_order_qty(raw_qty)
+        if status == "invalid":
+            return ("invalid", 0.0)
+        if status == "missing":
+            return ("ok", target)
+        return ("ok", min(float(parsed), target))
+
+    def _resolve_trail_params(
+        self,
+        kw: dict[str, Any],
+        args: list[Any],
+    ) -> tuple[float | None, float | None]:
+        """Parse trail_price / trail_offset / trail_points → (activation, offset_price).
+
+        Distances are in **ticks** (× :meth:`_mintick`) per Pine. Prefer
+        ``trail_points`` when both offset and points are set (TV reference).
+        Returns ``(None, None)`` when trail is not configured or offset is na/≤0.
+        """
+        # Pine: … stop, trail_price, trail_points, trail_offset (indices 8–10 full form)
+        trail_price = self._coerce_optional_price(
+            kw.get("trail_price", args[8] if len(args) > 8 else None)
+        )
+        trail_points = self._coerce_optional_price(
+            kw.get("trail_points", args[9] if len(args) > 9 else None)
+        )
+        trail_offset = self._coerce_optional_price(
+            kw.get("trail_offset", args[10] if len(args) > 10 else None)
+        )
+        ticks = trail_points if trail_points is not None else trail_offset
+        if ticks is None or ticks <= 0:
+            return (None, None)
+        offset_price = float(ticks) * self._mintick()
+        if offset_price <= 0:
+            return (None, None)
+        return (trail_price, offset_price)
+
     def _handle_strategy_exit(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
         """
-        strategy.exit(id, from_entry, qty, limit, stop, comment, alert, ...)
+        strategy.exit(id, from_entry, qty, qty_percent, profit, limit, loss, stop,
+        trail_price, trail_points, trail_offset, ...)
 
-        Create exit order closing a specific entry.
+        Place a bracket exit against the open position.
 
-        Parameters:
-            id: Order identifier (str)
-            from_entry: Entry order to close (str)
-            qty: Quantity to close (float or None for all)
-            limit: Limit price (float or None)
-            stop: Stop price (float or None)
-            comment: Order comment (str)
+        * No ``limit``/``stop``/trail → market close now (with slippage).
+        * With ``limit`` and/or ``stop`` → pending order(s) filled by
+          :meth:`process_pending_orders` when bar OHLC touches the level.
+          Both legs share an OCA cancel group so one fill cancels the other.
+        * ``qty_percent`` (kwargs or Pine positional) sizes the exit as a
+          percent of the open target (whole position or ``from_entry`` size);
+          wins over absolute ``qty`` when both are set.
+        * Trail: ``trail_points`` / ``trail_offset`` (ticks × mintick) with
+          optional ``trail_price`` activation. Pending stop ratchets with
+          favorable extremes after arming.
+        * When ``from_entry`` is set, only that entry id's open qty is reduced;
+          other open trades (pyramiding) are left intact. Unknown from_entry is
+          a soft no-op after the placement event (no crash).
 
-        Returns None. Closes position or partial position.
+        Always records a ``kind=exit`` event for host bookkeeping (placement).
         """
         kw = kwargs or {}
+        exit_id = str(kw.get("id", args[0] if args else "exit"))
+        # Positional Pine: id, from_entry, qty, qty_percent, profit, limit, loss, stop, …
+        # Simplified legacy (still supported for limit/stop): id, from_entry, qty, limit, stop
+        raw_from = kw.get("from_entry", args[1] if len(args) > 1 else None)
+        from_entry: str | None
+        if raw_from is None or raw_from == "":
+            from_entry = None
+        else:
+            from_entry = str(raw_from)
+
+        target_size = self._entry_open_size(from_entry)
         raw_qty = kw.get("qty", args[2] if len(args) > 2 else None)
-        if raw_qty is None:
-            qty = float(self._strategy_state.position_size)
-        else:
-            status, parsed = self._parse_order_qty(raw_qty)
-            if status == "invalid":
-                self._emit_rejected_order(
-                    order_id=str(kw.get("id", args[0] if args else "exit")),
-                    direction=None,
-                    reason="invalid_qty",
+        # qty_percent: kwargs first; positional args[3] when not using simplified limit form
+        raw_qty_percent = kw.get("qty_percent")
+        if raw_qty_percent is None and len(args) > 3:
+            if "qty_percent" in kw:
+                pass
+            elif any(
+                k in kw
+                for k in (
+                    "limit",
+                    "stop",
+                    "profit",
+                    "loss",
+                    "trail_price",
+                    "trail_points",
+                    "trail_offset",
                 )
-                return
-            qty = float(self._strategy_state.position_size) if status == "missing" else parsed
+            ):
+                # Named levels → args[3] is free for Pine qty_percent
+                raw_qty_percent = args[3]
+            elif len(args) == 4:
+                # exit(id, from_entry, qty, pct) market partial
+                raw_qty_percent = args[3]
+            elif len(args) > 5:
+                # Full Pine positional list
+                raw_qty_percent = args[3]
 
-        # v6: evaluate both (limit/profit) and (stop/loss) pairs; choose the one market price would activate first
-        limit_p = self._coerce_optional_price(kw.get("limit") or kw.get("profit"))
-        stop_p = self._coerce_optional_price(kw.get("stop") or kw.get("loss"))
-        current_p = self._mark_price()
+        qty_status, qty = self._resolve_exit_qty(
+            target_size=target_size,
+            raw_qty=raw_qty,
+            raw_qty_percent=raw_qty_percent,
+        )
+        if qty_status == "invalid":
+            self._emit_rejected_order(
+                order_id=exit_id,
+                direction=None,
+                reason="invalid_qty",
+            )
+            return
+
+        # Prefer kwargs; simplified positional limit/stop at args[3]/[4];
+        # full Pine uses profit/limit/loss/stop at 4–7.
+        limit_raw = kw.get("limit", kw.get("profit"))
+        stop_raw = kw.get("stop", kw.get("loss"))
+        if limit_raw is None:
+            if len(args) > 5:
+                limit_raw = args[5] if args[5] is not None else args[4]
+            elif len(args) > 3 and raw_qty_percent is None:
+                # Simplified: args[3] = limit (only when not consumed as percent)
+                limit_raw = args[3]
+            elif len(args) > 4 and raw_qty_percent is not None:
+                # Pine profit (ticks-as-price residual) when percent took args[3]
+                limit_raw = args[4]
+        if stop_raw is None:
+            if len(args) > 7:
+                stop_raw = args[7] if args[7] is not None else args[6]
+            elif len(args) > 4 and raw_qty_percent is None:
+                stop_raw = args[4]
+            elif len(args) > 6 and raw_qty_percent is not None:
+                stop_raw = args[6]
+        limit_p = self._coerce_optional_price(limit_raw)
+        stop_p = self._coerce_optional_price(stop_raw)
+        trail_activation, trail_offset_px = self._resolve_trail_params(kw, args)
+        has_trail = trail_offset_px is not None
+        comment = kw.get("comment", None)
         is_long = self._strategy_state.position_direction == "long"
+        is_flat = self._strategy_state.position_direction == "flat"
+        action = "sell" if is_long else "buy"  # close direction
 
-        if limit_p is not None and stop_p is not None:
-            # Choose the trigger that would hit first based on current price direction
-            if is_long:
-                # Closing long: stop (lower) or limit (higher)
-                if current_p <= stop_p:
-                    exit_price = stop_p
-                elif current_p >= limit_p:
-                    exit_price = limit_p
-                else:
-                    exit_price = min(limit_p, stop_p) if limit_p < stop_p else limit_p
-            else:
-                # Closing short: stop (higher) or limit (lower)
-                if current_p >= stop_p:
-                    exit_price = stop_p
-                elif current_p <= limit_p:
-                    exit_price = limit_p
-                else:
-                    exit_price = max(limit_p, stop_p) if limit_p > stop_p else limit_p
-        else:
-            exit_price = float(limit_p if limit_p is not None else stop_p if stop_p is not None else current_p)
-
-        if self._strategy_state.position_direction != "flat":
-            # Market exit (no limit/stop) gets slippage; triggered prices already fixed.
-            if limit_p is None and stop_p is None:
-                exit_action = "sell" if is_long else "buy"
-                exit_price = self._apply_slippage(exit_price, exit_action)
-            self._close_position(exit_price, qty, self._bar_time())
-
+        # Placement/intent event. from_entry is applied to fill targeting;
+        # closed trades retain entry_id for host verification (event schema
+        # has no dedicated from_entry field — keep comment unchanged for parity).
         self._record_strategy_event(
             StrategyEvent(
                 kind="exit",
-                id=kw.get("id", args[0] if args else None),
+                id=exit_id,
                 direction=None,
                 qty=qty,
                 order_type=None,
                 limit=limit_p,
-                stop=stop_p,
+                stop=stop_p if stop_p is not None else (trail_activation if has_trail else None),
                 oca_name=None,
-                comment=kw.get("comment", None),
+                comment=comment,
                 bar_index=self._bar_index(),
                 bar_time=self._bar_time(),
                 ohlc=(0.0, 0.0, 0.0, 0.0),
@@ -1156,6 +1445,141 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
                 run_id="",
             )
         )
+
+        # Soft no-op: flat, zero qty, or from_entry with no matching open leg
+        if is_flat or qty <= 0:
+            return
+        if from_entry is not None and target_size <= 0:
+            return
+
+        # Market exit — fill immediately (only matching from_entry legs)
+        if limit_p is None and stop_p is None and not has_trail:
+            exit_price = self._apply_slippage(self._mark_price(), action)
+            self._close_position(exit_price, qty, self._bar_time(), from_entry=from_entry)
+            return
+
+        # Pending bracket: replace any prior exit legs with the same base id
+        for oid in list(self._strategy_state.pending_orders.keys()):
+            if oid == exit_id or oid.startswith(exit_id + ":"):
+                del self._strategy_state.pending_orders[oid]
+
+        oca_name = exit_id
+        cmt = str(comment) if comment is not None else ""
+
+        if limit_p is not None and stop_p is not None:
+            # Two OCA-cancel legs (TP + SL); trail replaces fixed stop when set
+            lim_id = f"{exit_id}:limit"
+            stop_id = f"{exit_id}:stop"
+            self._strategy_state.pending_orders[lim_id] = Order(
+                lim_id,
+                "limit",
+                action,
+                qty,
+                limit_p,
+                None,
+                cmt,
+                oca_name=oca_name,
+                oca_type="cancel",
+                from_entry=from_entry,
+            )
+            if has_trail:
+                self._strategy_state.pending_orders[stop_id] = Order(
+                    stop_id,
+                    "stop",
+                    action,
+                    qty,
+                    None,
+                    stop_p,
+                    cmt,
+                    oca_name=oca_name,
+                    oca_type="cancel",
+                    from_entry=from_entry,
+                    trail_offset=trail_offset_px,
+                    trail_activation=trail_activation,
+                    trail_active=trail_activation is None,
+                )
+            else:
+                self._strategy_state.pending_orders[stop_id] = Order(
+                    stop_id,
+                    "stop",
+                    action,
+                    qty,
+                    None,
+                    stop_p,
+                    cmt,
+                    oca_name=oca_name,
+                    oca_type="cancel",
+                    from_entry=from_entry,
+                )
+        elif limit_p is not None and has_trail:
+            lim_id = f"{exit_id}:limit"
+            self._strategy_state.pending_orders[lim_id] = Order(
+                lim_id,
+                "limit",
+                action,
+                qty,
+                limit_p,
+                None,
+                cmt,
+                oca_name=oca_name,
+                oca_type="cancel",
+                from_entry=from_entry,
+            )
+            self._strategy_state.pending_orders[f"{exit_id}:trail"] = Order(
+                f"{exit_id}:trail",
+                "stop",
+                action,
+                qty,
+                None,
+                stop_p,  # optional floor; may be None until trail arms
+                cmt,
+                oca_name=oca_name,
+                oca_type="cancel",
+                from_entry=from_entry,
+                trail_offset=trail_offset_px,
+                trail_activation=trail_activation,
+                trail_active=trail_activation is None,
+            )
+        elif limit_p is not None:
+            self._strategy_state.pending_orders[exit_id] = Order(
+                exit_id,
+                "limit",
+                action,
+                qty,
+                limit_p,
+                None,
+                cmt,
+                from_entry=from_entry,
+            )
+        elif has_trail:
+            # Trail-only (optionally with fixed stop as initial floor)
+            self._strategy_state.pending_orders[exit_id] = Order(
+                exit_id,
+                "stop",
+                action,
+                qty,
+                None,
+                stop_p,
+                cmt,
+                from_entry=from_entry,
+                trail_offset=trail_offset_px,
+                trail_activation=trail_activation,
+                trail_active=trail_activation is None,
+            )
+        else:
+            self._strategy_state.pending_orders[exit_id] = Order(
+                exit_id,
+                "stop",
+                action,
+                qty,
+                None,
+                stop_p,
+                cmt,
+                from_entry=from_entry,
+            )
+
+        # Same-bar fill when OHLC already touches the level (also arms trails)
+        self.process_pending_orders()
 
     def _handle_strategy_close(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
         """
@@ -1319,7 +1743,7 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
         """
         strategy.order(id, direction, qty, limit, stop, oca_name, oca_type, comment, ...)
 
-        Official positional order (TV reference). Pending orders fill via
+        Official positional order (reference Pine). Pending orders fill via
         :meth:`process_pending_orders`. Supports OCA groups and partial fills
         (``max_fill_per_bar`` kwarg).
         """
@@ -1353,7 +1777,7 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             qty = 1.0
         limit_price = self._coerce_optional_price(kw.get("limit", args[3] if len(args) > 3 else None))
         stop_price = self._coerce_optional_price(kw.get("stop", args[4] if len(args) > 4 else None))
-        # TV: oca_name, oca_type, comment — also tolerate comment before oca
+        # reference Pine: oca_name, oca_type, comment — also tolerate comment before oca
         oca_name = kw.get("oca_name", args[5] if len(args) > 5 else None)
         oca_type_raw = kw.get("oca_type", args[6] if len(args) > 6 else "none")
         comment = kw.get("comment", args[7] if len(args) > 7 else "")
@@ -1422,6 +1846,39 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             )
         )
 
+    def _update_trail_stop(self, order: Order, high: float, low: float) -> None:
+        """Ratchet a trailing stop from bar extremes once armed.
+
+        Long exit (sell stop): after activation, ``stop = high - offset``, only
+        rising. Short exit (buy stop): ``stop = low + offset``, only falling.
+        Fixed ``stop_price`` set at placement acts as a floor/ceiling that the
+        trail may improve but not worsen beyond on first arm.
+        """
+        if not order.is_trail:
+            return
+        offset = float(order.trail_offset or 0.0)
+        if offset <= 0:
+            return
+        action = order.direction  # buy covers short; sell closes long
+        act = order.trail_activation
+        if not order.trail_active:
+            if act is None:
+                order.trail_active = True
+            elif action in {"sell", "short"} and high >= float(act):
+                order.trail_active = True
+            elif action in {"buy", "long"} and low <= float(act):
+                order.trail_active = True
+            else:
+                return
+        if action in {"sell", "short"}:
+            candidate = float(high) - offset
+            if order.stop_price is None or candidate > float(order.stop_price):
+                order.stop_price = candidate
+        elif action in {"buy", "long"}:
+            candidate = float(low) + offset
+            if order.stop_price is None or candidate < float(order.stop_price):
+                order.stop_price = candidate
+
     def process_pending_orders(
         self,
         *,
@@ -1434,6 +1891,7 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
 
         Returns list of order ids that fully filled this call.
         Called by Runtime each bar (before script visit) when bar mode.
+        Trail stops are ratcheted from bar extremes before the fill check.
         """
         if not hasattr(self, "_strategy_state"):
             return []
@@ -1456,6 +1914,9 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
                 self._strategy_state.pending_orders.pop(order_id, None)
                 fully_filled.append(order_id)
                 continue
+            # Trail: update stop from favorable extreme, then test fill
+            if order.is_trail:
+                self._update_trail_stop(order, h, l)
             fill_price = self._order_fill_price(order, o, h, l, c)
             if fill_price is None:
                 continue
@@ -1527,10 +1988,16 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
         commission = self._calc_commission(fill_qty, fill_price)
         self._strategy_state.commission = commission
 
+        order_from_entry = getattr(order, "from_entry", None) or None
         if action in {"buy", "long"}:
             if self._strategy_state.position_direction == "short":
-                cover = min(fill_qty, self._strategy_state.position_size)
-                self._close_position(fill_price, cover, bar_time)
+                max_cover = (
+                    self._entry_open_size(order_from_entry)
+                    if order_from_entry
+                    else self._strategy_state.position_size
+                )
+                cover = min(fill_qty, max_cover)
+                self._close_position(fill_price, cover, bar_time, from_entry=order_from_entry)
                 leftover = fill_qty - cover
                 if leftover > 1e-12 and self._risk_allows_entry("long", fill_price):
                     self._open_position_qty(
@@ -1543,8 +2010,13 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
                     )
         else:  # sell / short
             if self._strategy_state.position_direction == "long":
-                cover = min(fill_qty, self._strategy_state.position_size)
-                self._close_position(fill_price, cover, bar_time)
+                max_cover = (
+                    self._entry_open_size(order_from_entry)
+                    if order_from_entry
+                    else self._strategy_state.position_size
+                )
+                cover = min(fill_qty, max_cover)
+                self._close_position(fill_price, cover, bar_time, from_entry=order_from_entry)
                 leftover = fill_qty - cover
                 if leftover > 1e-12 and self._risk_allows_entry("short", fill_price):
                     self._open_position_qty(
@@ -1664,7 +2136,8 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
                 new_size = old_size + q
                 if new_size <= 0:
                     return
-                st.entry_price = (float(st.entry_price) * old_size + px * q) / new_size
+                # stock / futures: arithmetic VWAP; inverse harmonic is phase-2
+                st.entry_price = _blend_arithmetic_avg(float(st.entry_price), old_size, px, q)
                 st.position_size = new_size
                 st.position_entry_name = entry_id
                 if st.open_trades:
@@ -1701,7 +2174,9 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             else:
                 # pyramiding > 0 with room: append a new open-trade leg
                 total = float(st.position_size) + q
-                st.entry_price = (float(st.entry_price) * float(st.position_size) + px * q) / total
+                st.entry_price = _blend_arithmetic_avg(
+                    float(st.entry_price), float(st.position_size), px, q
+                )
                 st.position_size = total
                 st.position_entry_name = entry_id
                 st.open_trades.append(
@@ -1756,16 +2231,38 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             )
         )
 
-    def _close_position(self, exit_price: float, qty: float, exit_time: int) -> None:
-        """Helper to close (or partially close) the open position and record trades."""
+    def _close_position(
+        self,
+        exit_price: float,
+        qty: float,
+        exit_time: int,
+        *,
+        from_entry: str | None = None,
+    ) -> None:
+        """Helper to close (or partially close) the open position and record trades.
+
+        Average-price models (``strategy(..., avg_price_model=...)``):
+
+        - ``stock`` (default): FIFO over open legs; remaining position avg is the
+          size-weighted mean of leftover leg entry prices (multi-trade style).
+        - ``futures`` / ``inverse``: sticky net AEP until flat (exchange-like).
+          Realized PnL and closed-trade entry use the sticky average, not FIFO
+          leg prices. Legs still shrink FIFO so ``opentrades`` counts stay sane.
+
+        When ``from_entry`` is set, only open trades with that ``entry_id`` are
+        reduced (FIFO within that subset). Unknown ids soft-no-op.
+        """
         if self._strategy_state.position_direction == "flat" or qty <= 0:
             return
 
+        fe = str(from_entry) if from_entry else None
+
         # Tests / callers may seed position_* without open_trades; synthesize one.
+        # Prefer from_entry as the synthetic leg id so filtered exits still apply.
         if not self._strategy_state.open_trades and self._strategy_state.position_size > 0:
             self._strategy_state.open_trades = [
                 OpenTrade(
-                    entry_id="",
+                    entry_id=fe or self._strategy_state.position_entry_name or "",
                     entry_bar=self._strategy_state.entry_bar,
                     entry_time=self._strategy_state.entry_time,
                     entry_price=self._strategy_state.entry_price,
@@ -1775,35 +2272,54 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
                 )
             ]
 
+        if fe is not None:
+            if not any(t.entry_id == fe for t in self._strategy_state.open_trades):
+                return  # soft no-op: no matching open entry
+
         remaining = float(qty)
         exit_bar = self._bar_index()
         exit_price = float(exit_price)
         exit_time = int(exit_time)
-        # TV-style: commission on entry (already on OpenTrade) **and** on exit fill.
+        model = getattr(self._strategy_state, "avg_price_model", "stock") or "stock"
+        sticky_avg = float(self._strategy_state.entry_price)
+        use_sticky = model in {"futures", "inverse"}
+        # reference-style: commission on entry (already on OpenTrade) **and** on exit fill.
         # Pro-rate exit commission across legs closed in this call.
-        total_close = min(remaining, float(sum(t.size for t in self._strategy_state.open_trades)))
+        eligible = (
+            [t for t in self._strategy_state.open_trades if t.entry_id == fe]
+            if fe is not None
+            else list(self._strategy_state.open_trades)
+        )
+        total_close = min(remaining, float(sum(t.size for t in eligible)))
+        if total_close <= 0:
+            return
         exit_comm_total = self._calc_commission(total_close, exit_price) if total_close > 0 else 0.0
         self._strategy_state.commission = exit_comm_total
 
         new_open: list[OpenTrade] = []
         for ot in self._strategy_state.open_trades:
+            if fe is not None and ot.entry_id != fe:
+                new_open.append(ot)
+                continue
             if remaining <= 0:
                 new_open.append(ot)
                 continue
             close_qty = min(ot.size, remaining)
             entry_comm = ot.commission * (close_qty / ot.size) if ot.size else 0.0
             exit_comm = exit_comm_total * (close_qty / total_close) if total_close > 0 else 0.0
+            # Futures: realize vs sticky net AEP; stock: per-leg entry prices.
+            basis = sticky_avg if use_sticky else float(ot.entry_price)
             if ot.direction == "long":
-                profit = (exit_price - ot.entry_price) * close_qty - entry_comm - exit_comm
+                profit = (exit_price - basis) * close_qty - entry_comm - exit_comm
             else:
-                profit = (ot.entry_price - exit_price) * close_qty - entry_comm - exit_comm
+                profit = (basis - exit_price) * close_qty - entry_comm - exit_comm
 
             commission = entry_comm + exit_comm
             self._strategy_state.closed_trades.append(
                 Trade(
                     entry_bar=ot.entry_bar,
                     entry_time=ot.entry_time,
-                    entry_price=ot.entry_price,
+                    entry_price=basis,
                     exit_bar=exit_bar,
                     exit_time=exit_time,
                     exit_price=exit_price,
@@ -1842,9 +2358,15 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
             self._strategy_state.entry_price = 0.0
             self._strategy_state.position_entry_name = ""
         else:
-            # Weighted average entry of remaining opens
-            total = sum(t.size for t in new_open)
-            self._strategy_state.entry_price = sum(t.entry_price * t.size for t in new_open) / total
+            if use_sticky:
+                # Exchange-like: net AEP unchanged until position is fully flat.
+                self._strategy_state.entry_price = sticky_avg
+            else:
+                # Weighted average entry of remaining opens (stock / Pine multi-leg)
+                total = sum(t.size for t in new_open)
+                self._strategy_state.entry_price = (
+                    sum(t.entry_price * t.size for t in new_open) / total
+                )
             self._strategy_state.position_direction = new_open[0].direction
             self._strategy_state.entry_bar = new_open[0].entry_bar
             self._strategy_state.entry_time = new_open[0].entry_time
@@ -1863,6 +2385,10 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
 
     def _handle_strategy_position_entry_name(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> str:
         return str(self._strategy_state.position_entry_name or "")
+
+    def _handle_strategy_leverage(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> float:
+        """Configured leverage multiplier from ``strategy(..., leverage=N)``."""
+        return float(getattr(self._strategy_state, "leverage", 1.0) or 1.0)
 
     def _handle_strategy_opentrades_count(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> int:
         return len(self._strategy_state.open_trades)
@@ -1965,9 +2491,29 @@ class StrategyBuiltinsMixin(BuiltinDispatchMixin):
     def _handle_strategy_opentrades_capital_held(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> float:
         return self._strategy_state.capital_held()
 
-    def _handle_strategy_margin_liquidation_price(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
-        # Not modeled without margin sim; Pine returns na when unknown.
-        return None
+    def _handle_strategy_margin_liquidation_price(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> float:
+        """Approximate isolated liquidation price from entry + leverage.
+
+        Simple linear model (no fees / maintenance margin):
+        - long:  entry * (1 - 1/leverage)
+        - short: entry * (1 + 1/leverage)
+
+        Returns ``na`` when flat or leverage ≤ 1 (full-margin cash book).
+        """
+        st = self._strategy_state
+        if st.position_direction == "flat" or st.position_size <= 0:
+            return float("nan")
+        lev = float(st.leverage) if st.leverage and st.leverage > 0 else 1.0
+        if lev <= 1.0:
+            return float("nan")
+        entry = float(st.entry_price)
+        if entry <= 0 or entry != entry:
+            return float("nan")
+        if st.position_direction == "long":
+            return entry * (1.0 - 1.0 / lev)
+        if st.position_direction == "short":
+            return entry * (1.0 + 1.0 / lev)
+        return float("nan")
 
     # RISK MANAGEMENT
 

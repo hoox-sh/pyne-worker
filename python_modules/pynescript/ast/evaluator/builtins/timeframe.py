@@ -17,7 +17,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Timeframe functions for PineScript v6 evaluator."""
+"""Pine ``timeframe.*`` conversion and chart-period helpers.
+
+Provides ``timeframe.in_seconds``, ``timeframe.from_seconds``,
+``timeframe.change``, and period-flag resolution for the current chart.
+Hosts may inject chart period via evaluator context; defaults assume the
+loaded series period.
+
+Registration
+------------
+:func:`register_timeframe_functions` injects handlers into the evaluator
+dispatch map from :class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`.
+"""
 
 from __future__ import annotations
 
@@ -147,7 +158,7 @@ def timeframes_equivalent(a: str | None, b: str | None) -> bool:
     if not sa and not sb:
         return True
     if not sa or not sb:
-        # Empty request TF → treat as chart TF (TV defaults to chart)
+        # Empty request TF → treat as chart TF (reference defaults to chart)
         return True
     if sa.upper() == sb.upper():
         return True
@@ -184,15 +195,15 @@ def _period_flags(period: str) -> dict[str, bool | int | str]:
     elif p in {"1W", "W", "WEEK", "WEEKS"}:
         p_norm = "W"
     elif p in {"1M", "M", "MO", "MONTH", "MONTHS"}:
-        # "1M" is monthly on TV charts; bare "M" is also monthly in period form
-        # (minute charts use numeric "1"/"5"/"15" without M suffix in TV period).
+        # "1M" is monthly on reference charts; bare "M" is also monthly in period form
+        # (minute charts use numeric "1"/"5"/"15" without M suffix in reference period).
         p_norm = "M"
     else:
         p_norm = p
 
     is_seconds = p_norm.endswith("S") and p_norm[:-1].isdigit()
     is_minutes = p_norm.isdigit() or (p_norm.endswith("M") and p_norm[:-1].isdigit() and p_norm not in {"M", "1M"})
-    # TV period for minutes is "1","5","15","60"; hours "120","240" or "1H","4H"
+    # reference period for minutes is "1","5","15","60"; hours "120","240" or "1H","4H"
     is_hours = p_norm.endswith("H") or (p_norm.isdigit() and int(p_norm) >= 60 and int(p_norm) % 60 == 0 and int(p_norm) < 1440)
     is_daily = p_norm in {"D", "1D"} or (p_norm.endswith("D") and p_norm[:-1].isdigit())
     is_weekly = p_norm in {"W", "1W"} or (p_norm.endswith("W") and p_norm[:-1].isdigit())

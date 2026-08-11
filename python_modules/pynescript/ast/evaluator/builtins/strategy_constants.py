@@ -32,7 +32,13 @@ from .base import BuiltinHandler
 
 
 class StrategyConstantsMixin(BuiltinDispatchMixin):
-    """Zero-arg ``strategy.*`` constants and OCA/commission enums."""
+    """Zero-arg ``strategy.*`` direction, OCA, commission, and qty-type sentinels.
+
+    Contributes ``_strategy_constants_builtin_map`` into
+    :class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`. Note
+    ``strategy.cash`` is intentionally not registered here (collides with the
+    free-cash series on :class:`~.strategy.StrategyBuiltinsMixin`).
+    """
 
     def _strategy_constants_builtin_map(self) -> dict[str, BuiltinHandler]:
         return {
@@ -57,6 +63,10 @@ class StrategyConstantsMixin(BuiltinDispatchMixin):
             # so ``default_qty_type=strategy.cash`` still resolves correctly.
             "strategy.fixed": self._handle_qty_fixed,
             "strategy.percent_of_equity": self._handle_qty_percent_of_equity,
+            # avg_price_model tokens (pynescript extension; strategy(..., avg_price_model=...))
+            "strategy.avg_price_stock": self._handle_avg_price_stock,
+            "strategy.avg_price_futures": self._handle_avg_price_futures,
+            "strategy.avg_price_inverse": self._handle_avg_price_inverse,
         }
 
     def _handle_strategy_long(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> str:
@@ -94,3 +104,12 @@ class StrategyConstantsMixin(BuiltinDispatchMixin):
 
     def _handle_qty_cash(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> str:
         return "cash"
+
+    def _handle_avg_price_stock(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> str:
+        return "stock"
+
+    def _handle_avg_price_futures(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> str:
+        return "futures"
+
+    def _handle_avg_price_inverse(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> str:
+        return "inverse"

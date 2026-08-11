@@ -86,9 +86,8 @@ def numba_ema(arr, period, i):
     nested EMA of a warm-up series, TR with bar-0 na) no longer poison the
     seed forever. Once seeded, NaN inputs propagate NaN through the recursion.
 
-    Dual-host note: Runtime bar-mode interpret uses ``_ema_inc_update`` with the
-    same SMA seed (na until ``period`` samples). Full-list ``_ema`` still seeds
-    with the first valid sample for non-incremental callers; prefer the SMA-seed
+    Dual-host note: Runtime interpret (full ``_ema`` and ``_ema_inc_update``)
+    use the same SMA seed (na until ``period`` finite samples). Prefer this
     path when comparing interpret vs compile plots.
     """
     period = int(period)
@@ -161,7 +160,7 @@ def numba_rma(arr, period, i):
 def numba_rsi(arr, period, i):
     """Wilder RSI: SMA seed of first ``period`` deltas, then RMA of gain/loss.
 
-    Matches interpret ``_rsi`` / ``_rsi_inc_update`` and TradingView ``ta.rsi``.
+    Matches interpret ``_rsi`` / ``_rsi_inc_update`` and reference Pine ``ta.rsi``.
     First valid bar is ``i == period`` (``period`` deltas need ``period+1`` prices).
     """
     period = int(period)
@@ -254,40 +253,40 @@ def numba_stdev(arr, period, i):
 
 @numba.njit(cache=True)
 def numba_atr(high, low, close, period, i):
-    """ATR matching interpret path: mean(TR) while warming; else EMA-of-TR.
+    """ATR = Wilder RMA of true range (reference ``ta.rma(ta.tr, length)``).
 
-    EMA seeds with the first TR value (same as interpret ``_ema``), not SMA.
+    Dual-host aligned with interpret ``_atr`` / ``_atr_inc_update`` (Wave B).
+    First valid bar requires ``period`` TR samples → ``i >= period``.
     """
     period = int(period)
     if period <= 0 or i < 1:
         return np.nan
-    n_tr = i  # TR samples for bars 1..i
-    if n_tr < period:
-        s = 0.0
-        for j in range(1, i + 1):
-            tr = max(
-                high[j] - low[j],
-                abs(high[j] - close[j - 1]),
-                abs(low[j] - close[j - 1]),
-            )
-            s += tr
-        return s / n_tr
-    # EMA of TR from bar 1..i, seed = first TR
-    tr0 = max(high[1] - low[1], abs(high[1] - close[0]), abs(low[1] - close[0]))
-    ema = tr0
-    alpha = 2.0 / (period + 1.0)
-    for j in range(2, i + 1):
+    # Need period TR samples from bars 1..i → i >= period
+    if i < period:
+        return np.nan
+    # SMA seed of first ``period`` TRs (bars 1..period)
+    ssum = 0.0
+    for j in range(1, period + 1):
+        ssum += max(
+            high[j] - low[j],
+            abs(high[j] - close[j - 1]),
+            abs(low[j] - close[j - 1]),
+        )
+    rma = ssum / period
+    alpha = 1.0 / period
+    for j in range(period + 1, i + 1):
         tr = max(
             high[j] - low[j],
             abs(high[j] - close[j - 1]),
             abs(low[j] - close[j - 1]),
         )
-        ema = alpha * tr + (1.0 - alpha) * ema
-    return ema
+        rma = alpha * tr + (1.0 - alpha) * rma
+    return rma
 
 
 @numba.njit(cache=True)
 def numba_change(arr, length, i):
+    """Difference ``arr[i] - arr[i - length]``; na when history is short."""
     length = int(length)
     if length <= 0 or i < length:
         return np.nan
@@ -349,6 +348,25 @@ def numba_bb(arr, period, mult, i):
     if np.isnan(mid) or np.isnan(sd):
         return np.nan, np.nan, np.nan
     return mid + mult * sd, mid, mid - mult * sd
+
+
+@numba.njit(cache=True)
+def numba_kc(src, high, low, close, period, mult, i):
+    """Keltner Channels: ``(middle, upper, lower)`` at bar ``i``.
+
+    Reference / interpret: middle = EMA(src, period), bands = mid ± mult * ATR.
+    ATR is Wilder RMA of TR (Wave B). Dual-host with ``_kc_inc_update``:
+    while ATR is still warming (``na``/None), band width is 0 so upper=lower=mid.
+    """
+    period = int(period)
+    mid = numba_ema(src, period, i)
+    atr = numba_atr(high, low, close, period, i)
+    if np.isnan(mid):
+        return np.nan, np.nan, np.nan
+    # Interpret inc: atr None → width 0 (bands collapse to mid until ATR seeds)
+    atr_f = 0.0 if np.isnan(atr) else atr
+    width = float(mult) * atr_f
+    return mid, mid + width, mid - width
 
 
 @numba.njit(cache=True)
@@ -423,7 +441,7 @@ def numba_safe_mod(a, b):
 def numba_accdist_inc(high, low, close, vol, i, st):
     """Cumulative Chaikin Accumulation/Distribution. ``st``: [sum, last_i].
 
-    Matches interpret ``_accdist`` / TV ``ta.accdist``: CLV * volume accumulated.
+    Matches interpret ``_accdist`` / reference ``ta.accdist``: CLV * volume accumulated.
     """
     if i < 0:
         return np.nan
@@ -512,6 +530,7 @@ def numba_store_src(dst, val, i):
 
 @numba.njit(cache=True)
 def numba_abs(val):
+    """Absolute value of a scalar (nopython ``math.abs``)."""
     if val < 0.0:
         return -val
     return val
@@ -519,6 +538,7 @@ def numba_abs(val):
 
 @numba.njit(cache=True)
 def numba_max(a, b):
+    """Scalar maximum of two values (nopython ``math.max``)."""
     if a > b:
         return a
     return b
@@ -526,6 +546,7 @@ def numba_max(a, b):
 
 @numba.njit(cache=True)
 def numba_min(a, b):
+    """Scalar minimum of two values (nopython ``math.min``)."""
     if a < b:
         return a
     return b
@@ -608,8 +629,8 @@ def numba_cum_expr(state_arr, val, i):
 
 @numba.njit(cache=True)
 def numba_valuewhen(cond_arr, src_arr, occ, i):
-    occ = int(occ)
     """Return source at the ``occ``-th most recent true condition (0 = latest)."""
+    occ = int(occ)
     if occ < 0:
         return np.nan
     left = occ
@@ -625,9 +646,9 @@ def numba_valuewhen(cond_arr, src_arr, occ, i):
 
 @numba.njit(cache=True)
 def numba_pivothigh(arr, left, right, i):
+    """Pivot high confirmed at bar ``i`` (center = i - right)."""
     left = int(left)
     right = int(right)
-    """Pivot high confirmed at bar ``i`` (center = i - right)."""
     if left < 0 or right < 0:
         return np.nan
     c = i - right
@@ -646,9 +667,9 @@ def numba_pivothigh(arr, left, right, i):
 
 @numba.njit(cache=True)
 def numba_pivotlow(arr, left, right, i):
+    """Pivot low confirmed at bar ``i`` (center = i - right)."""
     left = int(left)
     right = int(right)
-    """Pivot low confirmed at bar ``i`` (center = i - right)."""
     if left < 0 or right < 0:
         return np.nan
     c = i - right
@@ -667,8 +688,8 @@ def numba_pivotlow(arr, left, right, i):
 
 @numba.njit(cache=True)
 def numba_stoch(source, high, low, length, i):
-    length = int(length)
     """Stochastic %K: (src - lowest(low)) / (highest(high) - lowest(low)) * 100."""
+    length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     hh = high[i]
@@ -689,8 +710,8 @@ def numba_stoch(source, high, low, length, i):
 
 @numba.njit(cache=True)
 def numba_cci(arr, length, i):
-    length = int(length)
     """CCI on a single source series (typical price or explicit source)."""
+    length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     mean = 0.0
@@ -774,8 +795,8 @@ def numba_sar(high, low, start, increment, maximum, i):
 
 @numba.njit(cache=True)
 def numba_percentile_nearest_rank(arr, length, percentage, i):
-    length = int(length)
     """Nearest-rank percentile over last ``length`` bars ending at ``i``."""
+    length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     # Copy window and insertion-sort (numba-friendly)
@@ -818,13 +839,13 @@ def numba_barssince(cond_arr, i):
 
 @numba.njit(cache=True)
 def numba_linreg(arr, length, offset, i):
-    length = int(length)
-    offset = int(offset)
     """Least-squares linear regression of ``arr`` over ``length``, value at offset.
 
     x runs 0..length-1 (oldest->newest). Result is the fitted value at
     ``x = length - 1 - offset`` (offset=0 -> current bar on the regression line).
     """
+    length = int(length)
+    offset = int(offset)
     if length < 2 or i < length - 1:
         return np.nan
     n = float(length)
@@ -851,8 +872,8 @@ def numba_linreg(arr, length, offset, i):
 
 @numba.njit(cache=True)
 def numba_vwma(src, vol, length, i):
-    length = int(length)
     """Volume-weighted MA: sum(src*vol) / sum(vol) over last ``length`` bars."""
+    length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     sum_pv = 0.0
@@ -871,11 +892,11 @@ def numba_vwma(src, vol, length, i):
 
 @numba.njit(cache=True)
 def numba_mfi(high, low, close, vol, length, i):
-    length = int(length)
     """Money Flow Index over ``length`` money-flow samples ending at ``i``.
 
     Needs ``length + 1`` typical-price samples (direction vs previous bar).
     """
+    length = int(length)
     if length <= 0 or i < length:
         return np.nan
     pos = 0.0
@@ -891,7 +912,7 @@ def numba_mfi(high, low, close, vol, length, i):
             pos += mf
         elif tp < tp_prev:
             neg += mf
-        # tp == tp_prev -> neither (TV convention)
+        # tp == tp_prev -> neither (reference convention)
     if neg == 0.0:
         if pos == 0.0:
             return 50.0
@@ -936,8 +957,8 @@ def numba_rci(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_rising(arr, length, i):
-    length = int(length)
     """True if ``arr`` rose strictly for ``length`` consecutive bars."""
+    length = int(length)
     if length <= 0 or i < length:
         return False
     for j in range(length):
@@ -950,8 +971,8 @@ def numba_rising(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_falling(arr, length, i):
-    length = int(length)
     """True if ``arr`` fell strictly for ``length`` consecutive bars."""
+    length = int(length)
     if length <= 0 or i < length:
         return False
     for j in range(length):
@@ -964,7 +985,7 @@ def numba_falling(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_highestbars(arr, length, i):
-    """Offset to highest value in window (TradingView / interpret parity).
+    """Offset to highest value in window (reference Pine / interpret parity).
 
     Returns ``0`` if the current bar is highest, ``-1`` if one bar ago, …,
     down to ``-(length-1)``.  Short history (``i+1 < length``), invalid
@@ -996,7 +1017,7 @@ def numba_highestbars(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_lowestbars(arr, length, i):
-    """Offset to lowest value in window (TradingView / interpret parity).
+    """Offset to lowest value in window (reference Pine / interpret parity).
 
     Same contract as :func:`numba_highestbars`: negative bars-back offset,
     ``-1.0`` when short / invalid / all-NaN; oldest extreme on ties.
@@ -1064,8 +1085,8 @@ def numba_obv(close, vol, i):
 
 @numba.njit(cache=True)
 def numba_wma(arr, length, i):
-    length = int(length)
     """Linear weighted MA: newest bar weight = length, oldest weight = 1."""
+    length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     weighted = 0.0
@@ -1084,8 +1105,8 @@ def numba_wma(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_roc(arr, length, i):
-    length = int(length)
     """Rate of Change: 100 * (arr[i] - arr[i-length]) / arr[i-length]."""
+    length = int(length)
     if length <= 0 or i < length:
         return np.nan
     baseline = arr[i - length]
@@ -1096,8 +1117,8 @@ def numba_roc(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_sum(arr, period, i):
-    period = int(period)
     """Rolling sum of last ``period`` bars ending at ``i``."""
+    period = int(period)
     if period <= 0 or i < period - 1:
         return np.nan
     s = 0.0
@@ -1111,8 +1132,8 @@ def numba_sum(arr, period, i):
 
 @numba.njit(cache=True)
 def numba_variance(arr, period, i):
-    period = int(period)
     """Sample variance (n-1) over last ``period`` bars — ``stdev**2``."""
+    period = int(period)
     if period <= 1 or i < period - 1:
         return np.nan
     mean = 0.0
@@ -1131,8 +1152,8 @@ def numba_variance(arr, period, i):
 
 @numba.njit(cache=True)
 def numba_dev(arr, period, i):
-    period = int(period)
     """Mean absolute deviation from SMA over last ``period`` bars."""
+    period = int(period)
     if period <= 0 or i < period - 1:
         return np.nan
     mean = 0.0
@@ -1150,8 +1171,8 @@ def numba_dev(arr, period, i):
 
 @numba.njit(cache=True)
 def numba_correlation(a, b, period, i):
-    period = int(period)
     """Pearson correlation of series ``a`` and ``b`` over last ``period`` bars."""
+    period = int(period)
     if period < 2 or i < period - 1:
         return np.nan
     mean_a = 0.0
@@ -1181,13 +1202,13 @@ def numba_correlation(a, b, period, i):
 
 @numba.njit(cache=True)
 def numba_alma(arr, length, offset, sigma, i):
-    length = int(length)
     """Arnaud Legoux Moving Average over last ``length`` bars ending at ``i``.
 
     Weights: Gaussian centered at ``m = offset * (length - 1)`` with
-    ``s = length / sigma`` (TV defaults offset=0.85, sigma=6).
+    ``s = length / sigma`` (reference defaults offset=0.85, sigma=6).
     Index 0 in the weight loop is the oldest bar in the window.
     """
+    length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     if sigma == 0.0:
@@ -1233,8 +1254,8 @@ def _numba_wma_at(arr, end_idx, period):
 
 @numba.njit(cache=True)
 def numba_hma(arr, length, i):
-    length = int(length)
     """Hull Moving Average: WMA(2*WMA(n/2) - WMA(n), sqrt(n)) at bar ``i``."""
+    length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     half = length // 2
@@ -1398,14 +1419,14 @@ def numba_hma_inc(arr, length, i, st, raw):
 
 @numba.njit(cache=True)
 def numba_tsi(arr, short_len, long_len, i):
-    short_len = int(short_len)
-    long_len = int(long_len)
     """True Strength Index: double-smoothed momentum / double-smoothed |mom|.
 
-    TV: ``ta.tsi(source, short_length, long_length)`` —
+    Reference Pine: ``ta.tsi(source, short_length, long_length)`` —
     ``100 * EMA(EMA(mom, long), short) / EMA(EMA(|mom|, long), short)``.
     EMAs use SMA seed (same as ``numba_ema``).
     """
+    short_len = int(short_len)
+    long_len = int(long_len)
     if short_len <= 0 or long_len <= 0:
         return np.nan
     need = long_len + short_len - 1
@@ -1930,7 +1951,7 @@ def array_fill(arr, value, index_from=None, index_to=None):
 def array_mode(arr):
     """Pine ``array.mode(id)`` — most frequent value; na if empty or all unique.
 
-    Matches TV-ish behaviour used by corpus tests (mode of multimodal → first
+    Matches reference-ish behaviour used by corpus tests (mode of multimodal → first
     max-frequency element; all-distinct → na).
     """
     if arr is None:
@@ -1946,7 +1967,7 @@ def array_mode(arr):
     counts = Counter(seq)
     best_n = max(counts.values())
     if best_n <= 1 and len(counts) == len(seq):
-        # All values unique → na (TV returns na when no mode)
+        # All values unique → na (reference returns na when no mode)
         return np.nan
     # First element among those with max frequency (stable)
     for v in seq:
@@ -2370,10 +2391,9 @@ def numba_rma_inc(arr, period, i, st):
 
 @numba.njit(cache=True)
 def numba_atr_inc(high, low, close, period, i, st):
-    """Incremental ATR. ``st``: [acc, last_i] (warm sum or EMA).
+    """Incremental ATR (Wilder RMA of TR). ``st``: [rma_acc, last_i].
 
-    Matches ``numba_atr``: mean(TR) while ``i < period``, else EMA-of-TR
-    seeded with the first TR value.
+    Matches ``numba_atr``: na until ``i >= period``, then RMA with SMA seed.
     """
     period = int(period)
     if period <= 0 or i < 1:
@@ -2386,7 +2406,7 @@ def numba_atr_inc(high, low, close, period, i, st):
         last = 0
         st[0] = np.nan
 
-    alpha = 2.0 / (period + 1.0)
+    alpha = 1.0 / period
     acc = st[0]
     start = 1 if last < 1 else last + 1
 
@@ -2397,6 +2417,7 @@ def numba_atr_inc(high, low, close, period, i, st):
             abs(low[j] - close[j - 1]),
         )
         if j < period:
+            # Accumulate TR sum until seed window is full
             if j == 1 or np.isnan(acc) or last < 1:
                 s = 0.0
                 for k in range(1, j + 1):
@@ -2409,19 +2430,26 @@ def numba_atr_inc(high, low, close, period, i, st):
             else:
                 acc = acc + tr
         elif j == period:
-            # Switch to EMA seeded with first TR (not the warm mean).
-            acc = max(high[1] - low[1], abs(high[1] - close[0]), abs(low[1] - close[0]))
-            for k in range(2, j + 1):
-                trk = max(
+            # Seed = SMA of first ``period`` TRs
+            s = 0.0
+            for k in range(1, period + 1):
+                s += max(
                     high[k] - low[k],
                     abs(high[k] - close[k - 1]),
                     abs(low[k] - close[k - 1]),
                 )
-                acc = alpha * trk + (1.0 - alpha) * acc
+            acc = s / period
         else:
             if np.isnan(acc) or last < period:
-                acc = max(high[1] - low[1], abs(high[1] - close[0]), abs(low[1] - close[0]))
-                for k in range(2, j + 1):
+                s = 0.0
+                for k in range(1, period + 1):
+                    s += max(
+                        high[k] - low[k],
+                        abs(high[k] - close[k - 1]),
+                        abs(low[k] - close[k - 1]),
+                    )
+                acc = s / period
+                for k in range(period + 1, j + 1):
                     trk = max(
                         high[k] - low[k],
                         abs(high[k] - close[k - 1]),
@@ -2434,8 +2462,10 @@ def numba_atr_inc(high, low, close, period, i, st):
     st[0] = acc
     st[1] = float(i)
     if i < period:
-        return acc / i
+        return np.nan
     return acc
+
+
 @numba.njit(cache=True)
 def numba_macd_inc(arr, fast, slow, signal, i, st):
     """Incremental MACD. ``st``: [ema_f, ema_s, sig, last_i].
@@ -2574,7 +2604,7 @@ def numba_vwap_anchor_inc(src, vol, anchor, i, st):
     """Incremental VWAP with anchor reset. ``st``: [cum_pv, cum_v, last_i].
 
     When ``anchor[j]`` is non-zero / true, the cumulative window restarts at
-    bar ``j`` (includes bar ``j`` in the new window) — TV ``ta.vwap(src, anchor)``.
+    bar ``j`` (includes bar ``j`` in the new window) — reference ``ta.vwap(src, anchor)``.
     """
     if i < 0:
         return np.nan
@@ -2891,6 +2921,35 @@ def numba_bb_inc(arr, period, mult, i, st):
     # st[0] is sum after stdev_inc
     mid = st[0] / period
     return mid + mult * sd, mid, mid - mult * sd
+
+
+@numba.njit(cache=True)
+def numba_kc_inc(src, high, low, close, period, mult, i, st):
+    """Incremental Keltner. ``st``: [ema, ema_last_i, atr_rma, atr_last_i].
+
+    Matches ``numba_kc`` / interpret ``_kc_inc_update`` (EMA mid ± mult * ATR).
+    """
+    period = int(period)
+    # Local EMA state slice
+    ema_st = np.empty(2, dtype=np.float64)
+    ema_st[0] = st[0]
+    ema_st[1] = st[1]
+    mid = numba_ema_inc(src, period, i, ema_st)
+    st[0] = ema_st[0]
+    st[1] = ema_st[1]
+    # Local ATR state slice
+    atr_st = np.empty(2, dtype=np.float64)
+    atr_st[0] = st[2]
+    atr_st[1] = st[3]
+    atr = numba_atr_inc(high, low, close, period, i, atr_st)
+    st[2] = atr_st[0]
+    st[3] = atr_st[1]
+    if np.isnan(mid):
+        return np.nan, np.nan, np.nan
+    # atr na during warmup → width 0 (same as interpret atr_val is None)
+    atr_f = 0.0 if np.isnan(atr) else atr
+    width = float(mult) * atr_f
+    return mid, mid + width, mid - width
 
 
 @numba.njit(cache=True)
@@ -4152,7 +4211,7 @@ def numba_running_min_inc(arr, i, st):
 
 @numba.njit(cache=True)
 def numba_swma(arr, i):
-    """Symmetric 4-period WMA: weights 1, 2, 2, 1 over 6 (TV ``ta.swma``).
+    """Symmetric 4-period WMA: weights 1, 2, 2, 1 over 6 (reference ``ta.swma``).
 
     O(1) per bar — no sliding state required. Needs ``i >= 3``.
     """
@@ -4874,7 +4933,7 @@ def numba_dmi_inc(high, low, close, di_len, adx_smooth, i, st):
 
 @numba.njit(cache=True)
 def numba_supertrend(high, low, close, factor, atr_period, i):
-    """Simplified Supertrend matching interpret BasicIndicators (not TV ratchet).
+    """Simplified Supertrend matching interpret BasicIndicators (not reference ratchet).
 
     Returns ``(supertrend, direction)`` with direction -1 (up) / +1 (down).
     ATR via ``numba_atr``; nan ATR treated as 0.0.
@@ -4999,7 +5058,7 @@ def numba_median(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_wpr(high, low, close, period, i):
-    """Williams %R at bar ``i`` (TV ``ta.wpr``).
+    """Williams %R at bar ``i`` (reference ``ta.wpr``).
 
     Matches interpret ``_wpr``: warm-up / non-positive period → 0.0;
     flat high/low range → 0.0; else ``-100 * (HH - close) / (HH - LL)``.
@@ -5094,7 +5153,7 @@ def array_range(arr):
 
 
 # ---------------------------------------------------------------------------
-# Calendar / timestamp (njit-safe; matches util.time_parts + TV overflow style)
+# Calendar / timestamp (njit-safe; matches util.time_parts + reference overflow style)
 # ---------------------------------------------------------------------------
 
 
@@ -5114,7 +5173,7 @@ def numba_days_from_civil(y, m, d):
 def numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):
     """Unix epoch ms from calendar components with month/day overflow.
 
-    Matches TradingView ``timestamp(year, month, day, hour, minute, second)``
+    Matches reference Pine ``timestamp(year, month, day, hour, minute, second)``
     enough for TTM windows (``dayofmonth + 27``, ``month=0``, …). Timezone is UTC.
     """
     yi = int(y) if y == y else 1970  # NaN → epoch

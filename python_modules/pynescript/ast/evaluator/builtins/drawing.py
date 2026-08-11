@@ -17,6 +17,21 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+"""Pine drawing builtins: ``line``, ``box``, ``label``, ``table``, ``polyline``.
+
+Provides object types, a process-wide :class:`DrawingRegistry` with reference Pine-
+style garbage-collection caps (``max_lines_count``, …), and
+:class:`DrawingBuiltinsMixin` handlers for ``*.new`` / ``*.set_*`` / ``*.get_*``
+and related APIs. Export helpers produce JSON-safe payloads for host UIs.
+
+Mixin composition
+-----------------
+:class:`DrawingBuiltinsMixin` contributes ``_drawing_builtin_map`` into
+:class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`. Caps are applied
+from ``indicator()`` / ``strategy()`` declarations via
+:meth:`DrawingRegistry.configure_from_declaration`.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -90,7 +105,7 @@ def _export_extend(e: Any) -> str:
     return "none"
 
 
-# Pine / TradingView defaults and hard caps for drawing garbage collection.
+# Pine / reference Pine defaults and hard caps for drawing garbage collection.
 # indicator()/strategy() kwargs: max_lines_count, max_labels_count,
 # max_boxes_count, max_polylines_count (defaults 50; lines/labels/boxes ≤500,
 # polylines ≤100).
@@ -121,7 +136,7 @@ def _clamp_drawing_limit(
 class DrawingRegistry:
     """Global registry for drawing objects.
 
-    Enforces TradingView-style **garbage collection**: when more drawings of a
+    Enforces reference Pine-style **garbage collection**: when more drawings of a
     type exist than the declaration cap (``max_lines_count``, …), the oldest
     active objects are marked ``deleted=True`` so they leave ``*.all`` and
     :meth:`export_for_api`.
@@ -134,7 +149,7 @@ class DrawingRegistry:
     polylines: ClassVar[list[Polyline]] = []
     linefills: ClassVar[list[LineFill]] = []
 
-    # Active caps (reset to TV defaults on each run)
+    # Active caps (reset to reference defaults on each run)
     max_lines_count: ClassVar[int] = _DEFAULT_DRAWING_LIMIT
     max_labels_count: ClassVar[int] = _DEFAULT_DRAWING_LIMIT
     max_boxes_count: ClassVar[int] = _DEFAULT_DRAWING_LIMIT
@@ -276,7 +291,7 @@ class DrawingRegistry:
 
     @classmethod
     def add_table(cls, table: Table) -> Table:
-        """Tables are not GC-capped by max_*_count (TV uses a separate limit)."""
+        """Tables are not GC-capped by max_*_count (reference uses a separate limit)."""
         cls.tables.append(table)
         return table
 
@@ -546,7 +561,7 @@ class DrawingRegistry:
 
 @dataclass
 class Line:
-    """Line drawing object."""
+    """Segment between two chart points (``line.new`` / ``line.set_*``)."""
 
     x1: int | float
     y1: float
@@ -563,7 +578,7 @@ class Line:
 
 @dataclass
 class Box:
-    """Box drawing object."""
+    """Axis-aligned rectangle on the chart (``box.new`` / ``box.set_*``)."""
 
     left: int | float
     top: float
@@ -590,7 +605,7 @@ class Box:
 
 @dataclass
 class Label:
-    """Label drawing object."""
+    """Text annotation anchored to a chart point (``label.new`` / ``label.set_*``)."""
 
     x: int | float
     y: float
@@ -616,7 +631,7 @@ class Label:
 
 @dataclass
 class Table:
-    """Table drawing object."""
+    """On-chart table grid with cell map (``table.new`` / ``table.cell``)."""
 
     position: str = "top_left"  # Position on screen
     rows: int = 0
@@ -633,7 +648,7 @@ class Table:
 
 @dataclass
 class TableCell:
-    """Table cell content."""
+    """Single ``table`` cell style and text payload."""
 
     text: str = ""
     text_color: str = "#000000"
@@ -652,7 +667,7 @@ class TableCell:
 
 @dataclass
 class LineFill:
-    """Fill between two lines."""
+    """Fill region between two :class:`Line` objects (``linefill.new``)."""
 
     line1: Line | None = None
     line2: Line | None = None
@@ -662,7 +677,7 @@ class LineFill:
 
 @dataclass
 class ChartPoint:
-    """Represents a point on the chart."""
+    """Chart coordinate for polyline vertices (time/index + price)."""
 
     time: int | float | None = None
     index: int | None = None
@@ -675,7 +690,7 @@ class ChartPoint:
 
 @dataclass
 class Polyline:
-    """Polyline drawing object."""
+    """Multi-point path (``polyline.new``); subject to polyline GC caps."""
 
     points: list[ChartPoint] = field(default_factory=list)
     closed: bool = False
@@ -690,12 +705,17 @@ class Polyline:
 
 
 class DrawingBuiltinsMixin(BuiltinDispatchMixin):
-    """Drawing functions for line, box, label, and table annotations."""
+    """``line.*``, ``box.*``, ``label.*``, ``table.*``, ``polyline.*`` builtins.
+
+    Objects are stored in :class:`DrawingRegistry`. Bare type casts
+    (``line(id)``, ``box(na)``, …) are identity/na-preserving handlers used by
+    typed Pine scripts.
+    """
 
     def _drawing_builtin_map(self) -> dict[str, BuiltinHandler]:
         return {
             # Line functions
-            # Bare type cast: line(na) / line(id) — identity cast used in TV scripts
+            # Bare type cast: line(na) / line(id) — identity cast used in reference scripts
             "line": self._handle_type_cast,
             "box": self._handle_type_cast,
             "label": self._handle_type_cast,
@@ -970,25 +990,33 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
             line.style = args[1] if len(args) > 1 else line.style
         return line
 
-    def _handle_line_get_x1(self, args: list[Any]) -> int | float:
-        """line.get_x1(line)"""
+    def _handle_line_get_x1(self, args: list[Any]) -> int | float | None:
+        """line.get_x1(line) — soft-na when id/endpoint is na; unwrap series."""
         line = args[0] if len(args) > 0 else None
-        return line.x1 if isinstance(line, Line) else 0
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.x1)
 
-    def _handle_line_get_y1(self, args: list[Any]) -> float:
-        """line.get_y1(line)"""
+    def _handle_line_get_y1(self, args: list[Any]) -> float | None:
+        """line.get_y1(line) — soft-na when id/endpoint is na; unwrap series."""
         line = args[0] if len(args) > 0 else None
-        return line.y1 if isinstance(line, Line) else 0.0
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.y1)
 
-    def _handle_line_get_x2(self, args: list[Any]) -> int | float:
-        """line.get_x2(line)"""
+    def _handle_line_get_x2(self, args: list[Any]) -> int | float | None:
+        """line.get_x2(line) — soft-na when id/endpoint is na; unwrap series."""
         line = args[0] if len(args) > 0 else None
-        return line.x2 if isinstance(line, Line) else 0
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.x2)
 
-    def _handle_line_get_y2(self, args: list[Any]) -> float:
-        """line.get_y2(line)"""
+    def _handle_line_get_y2(self, args: list[Any]) -> float | None:
+        """line.get_y2(line) — soft-na when id/endpoint is na; unwrap series."""
         line = args[0] if len(args) > 0 else None
-        return line.y2 if isinstance(line, Line) else 0.0
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.y2)
 
     # BOX HANDLERS
 
@@ -1485,12 +1513,12 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
     def _handle_table_cell(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> TableCell:
         """table.cell(table_id, column, row, text, ...).
 
-        TradingView order is **column then row** (not row, column).
+        reference Pine order is **column then row** (not row, column).
         Optional text and style kwargs update the cell in place.
         """
         kw = kwargs or {}
         table = kw.get("table_id", kw.get("table", args[0] if len(args) > 0 else None))
-        # TV: column, row — also accept swapped if named
+        # Reference Pine: column, row — also accept swapped if named
         column = kw.get("column", args[1] if len(args) > 1 else 0)
         row = kw.get("row", args[2] if len(args) > 2 else 0)
         text = kw.get("text", args[3] if len(args) > 3 else None)
@@ -1809,19 +1837,35 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         )
         return DrawingRegistry.add_polyline(clone)
 
-    # ========== MISSING TV SURFACE HANDLERS ==========
+    # ========== MISSING reference SURFACE HANDLERS ==========
 
     def _handle_line_get_price(self, args: list[Any]) -> float | None:
-        """line.get_price(id, x) — interpolate Y at X between endpoints."""
+        """line.get_price(id, x) — interpolate Y at X between endpoints.
+
+        reference soft-na: ``na`` line, ``na`` sample *x*, or any na endpoint → ``na``.
+        PineSeries / series-wrapper endpoints are coerced to their current
+        scalar (bar-mode ``high`` / ``hlc3`` often land unwrapped only later).
+        """
         line = args[0] if args else None
         x = args[1] if len(args) > 1 else None
-        if not isinstance(line, Line) or x is None:
+        if not isinstance(line, Line):
             return None
-        x1, x2 = float(line.x1), float(line.x2)
-        if x1 == x2:
-            return float(line.y1)
-        t = (float(x) - x1) / (x2 - x1)
-        return float(line.y1) + t * (float(line.y2) - float(line.y1))
+        xv = _export_num(x)
+        x1 = _export_num(line.x1)
+        x2 = _export_num(line.x2)
+        y1 = _export_num(line.y1)
+        y2 = _export_num(line.y2)
+        if xv is None or x1 is None or x2 is None or y1 is None or y2 is None:
+            return None
+        x1f = float(x1)
+        x2f = float(x2)
+        y1f = float(y1)
+        y2f = float(y2)
+        xvf = float(xv)
+        if x1f == x2f:
+            return y1f
+        t = (xvf - x1f) / (x2f - x1f)
+        return y1f + t * (y2f - y1f)
 
     def _handle_line_set_xy1(self, args: list[Any]) -> None:
         line = args[0] if args else None

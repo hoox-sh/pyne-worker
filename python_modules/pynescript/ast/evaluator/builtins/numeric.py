@@ -17,6 +17,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+"""Pine ``math.*`` and bare numeric builtins (abs, max, min, …).
+
+Exposes both the v5+ ``math.*`` namespace and v3/v4 global math names
+(``pow``, ``round``, ``sqrt``, …) so mixed-version scripts resolve. Also
+covers random helpers and aggregate functions that are not series TA.
+
+Mixin composition
+-----------------
+:class:`NumericBuiltinsMixin` contributes ``_numeric_builtin_map`` into
+:class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`.
+"""
+
 from __future__ import annotations
 
 import math
@@ -34,7 +46,11 @@ BINARY = 2
 
 
 class NumericBuiltinsMixin(BuiltinDispatchMixin):
-    """Numeric, math, and misc built-in functions."""
+    """``math.*`` and bare global numeric / trigonometry builtins.
+
+    Bare names (``max``, ``min``, ``abs``, …) remain registered for Pine v3/v4
+    scripts; ``math.*`` is the preferred v5+ form.
+    """
 
     def _numeric_builtin_map(self) -> dict[str, BuiltinHandler]:
         # Bare names (pow, max, …) are Pine v3/v4 global math; math.* is v5+.
@@ -277,7 +293,7 @@ class NumericBuiltinsMixin(BuiltinDispatchMixin):
         return 0
 
     def _builtin_math_sum(self, args: list[Any]) -> Any:
-        """Sum of array, or rolling sum ``math.sum(source, length)`` (TV)."""
+        """Sum of array, or rolling sum ``math.sum(source, length)`` (reference)."""
         if len(args) == BINARY:
             # Rolling sum over last `length` values of a series
             length = args[1]
@@ -326,7 +342,7 @@ class NumericBuiltinsMixin(BuiltinDispatchMixin):
             return None
 
     def _builtin_math_avg(self, args: list[Any]) -> Any:
-        """Average of array, or of multiple scalar/series args (TV ``math.avg(a,b,...)``)."""
+        """Average of array, or of multiple scalar/series args (reference ``math.avg(a,b,...)``)."""
         if not args:
             self._error("math.avg takes a non-empty array or multiple values")
         # Single list argument
@@ -336,7 +352,7 @@ class NumericBuiltinsMixin(BuiltinDispatchMixin):
                 self._error("math.avg takes a non-empty array")
             return statistics.mean(float(v) for v in series)
         # Multiple values (scalars or series current).
-        # TV: if any argument is ``na``, the result is ``na`` (do not skip).
+        # Reference Pine: if any argument is ``na``, the result is ``na`` (do not skip).
         values: list[float] = []
         for a in args:
             if hasattr(a, "current"):
@@ -370,7 +386,7 @@ class NumericBuiltinsMixin(BuiltinDispatchMixin):
 
         Forms:
         - ``math.random()`` → [0, 1)
-        - ``math.random(min, max)`` → [min, max] (TV docs; both inclusive floats)
+        - ``math.random(min, max)`` → [min, max] (reference docs; both inclusive floats)
         """
         if not args:
             return random.random()
@@ -456,7 +472,7 @@ class NumericBuiltinsMixin(BuiltinDispatchMixin):
     def _builtin_int(self, args: list[Any]) -> int | None:
         """Convert value to integer. ``int(na)`` / non-numeric → na (None).
 
-        TradingView soft-fails non-numeric strings (enum labels, unresolved
+        reference Pine soft-fails non-numeric strings (enum labels, unresolved
         name leaks such as ``\"pyramid_val\"``) to ``na`` rather than aborting
         the bar. Numeric strings accept a float step so ``int(\"2.01\")`` → 2.
         """

@@ -17,7 +17,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Volume-based Technical Indicators."""
+"""Volume-based ``ta.*`` indicators (OBV, MFI, CMF, WAD, WVAD, …).
+
+Handlers are composed into
+:class:`~pynescript.ast.evaluator.builtins.technical.TechnicalAnalysisMixin`.
+"""
 
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ from .core import TechnicalHelpers
 
 
 class VolumeIndicators(TechnicalHelpers):
-    """Volume-based technical indicators: OBV, MFI, CMF, WAD, WVAD, EMV, Klinger, APO, VPT."""
+    """Volume ``ta.*``: OBV, MFI, CMF, WAD/WVAD, and related volume flow series."""
 
     # -- Public API (builtin_ta_ prefix) ------------------------------------
 
@@ -124,7 +128,7 @@ class VolumeIndicators(TechnicalHelpers):
     def _builtin_ta_accdist(self, args: list[Any]) -> Any:
         """Accumulation/Distribution Index.
 
-        TV: ``ta.accdist`` / ``ta.accdist()`` with no args uses H/L/C/V context.
+        Reference Pine: ``ta.accdist`` / ``ta.accdist()`` with no args uses H/L/C/V context.
         """
         if len(args) == 0:
             if self._use_incremental_ta():
@@ -601,7 +605,7 @@ class VolumeIndicators(TechnicalHelpers):
         volumes: list[float],
         period: int,
     ) -> float:
-        """Calculate Money Flow Index (TradingView / numba_mfi parity).
+        """Calculate Money Flow Index (reference Pine / numba_mfi parity).
 
         Needs ``period + 1`` typical-price samples (direction vs previous bar).
         Returns na until ready; 100 when only positive MF, 0 when only negative.

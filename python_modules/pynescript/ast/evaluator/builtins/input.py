@@ -45,7 +45,7 @@ def _infer_type(defval: Any) -> str:
     return "float"
 
 
-# Standard ``input.source`` dropdown (TradingView® parity).
+# Standard ``input.source`` dropdown (reference Pine parity).
 DEFAULT_SOURCE_OPTIONS: tuple[str, ...] = (
     "open",
     "high",
@@ -63,7 +63,12 @@ _BUILTIN_SOURCE_NAMES: frozenset[str] = frozenset(
 
 
 class InputBuiltinsMixin(BuiltinDispatchMixin):
-    """Input/parameter configuration for Pine Script indicators and strategies."""
+    """``input`` / ``input.*`` parameter builtins with metadata side channel.
+
+    Each call returns the resolved default (or host override) and records
+    declaration metadata on ``_input_declarations`` for UI/LSP hosts, unless
+    ``_pine_defs_locked`` or light-plot mode suppresses recording.
+    """
 
     def _input_builtin_map(self) -> dict[str, BuiltinHandler]:
         return {
@@ -409,7 +414,7 @@ class InputBuiltinsMixin(BuiltinDispatchMixin):
         """input.source(...) → series source (string name or series value).
 
         Hosts (AXIS settings, etc.) need the standard OHLC enum list when no
-        custom options are provided — mirror TradingView® source dropdown:
+        custom options are provided — mirror reference Pine source dropdown:
         open, high, low, close, hl2, hlc3, ohlc4.
 
         Hosts may also pass a full series list (other indicator plot) as the
@@ -528,7 +533,7 @@ class InputBuiltinsMixin(BuiltinDispatchMixin):
 
             input.enum(defval, title, options, tooltip, inline, group, confirm, display, active)
 
-        ``options`` is optional. When omitted, TradingView populates the dropdown
+        ``options`` is optional. When omitted, reference Pine populates the dropdown
         from the enum type of ``defval``. Keyword-only calls like
         ``input.enum(Easing.linear, title="…", group="…")`` leave a sparse
         kwargs merge hole at the ``options`` slot (``None``), which must not be

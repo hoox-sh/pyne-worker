@@ -17,9 +17,9 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""TradingView Pine Script Facade - Download Built-in Scripts.
+"""Pine Script Facade - Download Built-in Scripts.
 
-Provides utilities to fetch Pine Script code and documentation from TradingView.
+Provides utilities to fetch Pine Script code and documentation from reference Pine.
 Includes thread-safe HTTP session management and progress tracking.
 """
 

@@ -345,7 +345,7 @@ locally or pass inline `"ohlcv"` / `"data"`.
 ## Architecture
 
 1. **[hoox-sh/pyne](https://github.com/hoox-sh/pyne)** (`pynescript`) — Parser, AST, evaluator + compile path  
-2. **`pynescript_backend`** — Bar-loop Runtime port of `pyne/backend` (`interpret|compile|auto`)  
+2. **`pynescript_backend`** — Thin edge wrap over package `pynescript.runtime` (strict bars; shared SoT bar-loop)  
 3. **`entry.py`** — HTTP + `scheduled()` cron entrypoint, trade + alert forwarding  
 4. **`handler.py`** — Routing, middleware, `/run` / scripts / cron  
 5. **`scripts_registry.py`** — Deployed scripts + cron job config in R2  

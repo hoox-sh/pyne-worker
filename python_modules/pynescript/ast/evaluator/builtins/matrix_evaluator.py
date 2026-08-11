@@ -17,7 +17,16 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Matrix collection evaluator for Pine Script v6."""
+"""Pine ``matrix.*`` builtins dispatching onto :class:`~.matrix.Matrix`.
+
+Covers construction, element access, row/column ops, statistics, and linear-
+algebra helpers exposed under the ``matrix`` namespace.
+
+Mixin composition
+-----------------
+:class:`MatrixBuiltinsMixin` contributes ``_matrix_builtin_map`` into
+:class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`.
+"""
 
 from __future__ import annotations
 
@@ -35,7 +44,11 @@ QUATERNARY = 4
 
 
 class MatrixBuiltinsMixin(BuiltinDispatchMixin):
-    """Matrix collection built-in functions and methods."""
+    """``matrix.new`` / ``get`` / ``set`` / row-column and math builtin handlers.
+
+    Validates operands as :class:`~.matrix.Matrix` and forwards to instance
+    methods on the collection type.
+    """
 
     def _matrix_builtin_map(self) -> dict[str, BuiltinHandler]:
         """Build dispatch map for matrix operations."""
@@ -83,7 +96,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             "matrix.reshape": self._builtin_matrix_reshape,
             "matrix.concat": self._builtin_matrix_concat,
             "matrix.copy": self._builtin_matrix_copy,
-            # Official TV v6 names (aliases + linear algebra)
+            # Official reference v6 names (aliases + linear algebra)
             "matrix.row": self._builtin_matrix_row,
             "matrix.col": self._builtin_matrix_col,
             "matrix.submatrix": self._builtin_matrix_submatrix,
@@ -179,7 +192,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             return None
 
     # _expect_int: inherited from BuiltinDispatchMixin (pine_expect_int).
-    # Note: floors fractional floats (TV length semantics) rather than rejecting.
+    # Note: floors fractional floats (reference length semantics) rather than rejecting.
 
     def _expect_list(self, value: Any, message: str) -> list[Any]:
         """Validate that value is a list."""
@@ -195,7 +208,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
     def _builtin_matrix_new(self, args: list[Any]) -> Matrix[Any]:
         """matrix.new() | matrix.new(rows, cols, default_value?) -> Matrix.
 
-        Zero-arg form creates an empty 0×0 matrix (TV ``matrix.new<T>()``).
+        Zero-arg form creates an empty 0×0 matrix (reference ``matrix.new<T>()``).
         Soft: ``na`` rows/cols → empty 0×0 (unresolved size inputs).
         """
         if not args:
@@ -294,7 +307,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
     def _builtin_matrix_add_row(self, args: list[Any]) -> None:
         """matrix.add_row(id) | matrix.add_row(id, array) | matrix.add_row(id, row, array).
 
-        TV: omitting the array appends a row of ``na`` (None) values. Instance
+        Reference Pine: omitting the array appends a row of ``na`` (None) values. Instance
         form ``m.add_row()`` is common in scripts such as seasonality.
         Three-arg form inserts at *row* index (not always append).
         """
@@ -580,7 +593,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
     def _builtin_matrix_fill(self, args: list[Any]) -> None:
         """matrix.fill(id, value[, from_row, to_row, from_column, to_column]) -> void.
 
-        TV region form uses half-open ``[from_row, to_row)`` × ``[from_col, to_col)``.
+        reference region form uses half-open ``[from_row, to_row)`` × ``[from_col, to_col)``.
         ``na`` matrix → no-op; ``na`` region bound → full extent for that edge.
         """
         n = len(args)
@@ -671,7 +684,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
         matrix = self._expect_matrix(args[0], "matrix.copy: arg must be matrix")
         return matrix.copy()
 
-    # ========== OFFICIAL TV v6 SURFACE ==========
+    # ========== OFFICIAL reference v6 SURFACE ==========
 
     def _builtin_matrix_row(self, args: list[Any]) -> list[Any]:
         if len(args) != BINARY:

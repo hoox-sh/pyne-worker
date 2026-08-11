@@ -119,7 +119,10 @@ class PlotStyle:
 
 
 class PlotRegistry:
-    """Registry for plot objects created during script evaluation."""
+    """Process-level list of :class:`Plot` instances for the current run.
+
+    Reset between evaluations; :meth:`active` filters deleted entries.
+    """
 
     plots: ClassVar[list[Plot]] = []
 
@@ -447,7 +450,11 @@ def _fill_plot(
 
 
 class PlottingFunctionsMixin(BuiltinDispatchMixin):
-    """Plotting functions with registry side effects for non-UI evaluation."""
+    """``plot``, ``hline``, ``bgcolor``, ``fill``, ``plotshape``/``char``/… builtins.
+
+    Each call registers a :class:`Plot` on :class:`PlotRegistry` (or reuses a
+    call-site slot in bar mode) so hosts can inspect visual series without a UI.
+    """
 
     def _plotting_builtin_map(self) -> dict[str, BuiltinHandler]:
         return {
@@ -464,6 +471,18 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
             "plot.linestyle_solid": self._builtin_plot_linestyle_solid,
             "plot.linestyle_dashed": self._builtin_plot_linestyle_dashed,
             "plot.linestyle_dotted": self._builtin_plot_linestyle_dotted,
+            # plot.style_* constants (non-callable → dispatch tag 0)
+            "plot.style_line": "style_line",
+            "plot.style_linebr": "style_linebr",
+            "plot.style_stepline": "style_stepline",
+            "plot.style_steplinebr": "style_steplinebr",
+            "plot.style_stepline_diamond": "style_stepline_diamond",
+            "plot.style_histogram": "style_histogram",
+            "plot.style_columns": "style_columns",
+            "plot.style_cross": "style_cross",
+            "plot.style_area": "style_area",
+            "plot.style_areabr": "style_areabr",
+            "plot.style_circles": "style_circles",
         }
 
     def _plot_upsert(self, **fields: Any) -> Plot:

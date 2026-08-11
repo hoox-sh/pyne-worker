@@ -19,7 +19,7 @@
 
 """In-process Pine Script library registry for export/import resolution.
 
-TradingView libraries are published as ``username/LibraryName/version``.
+reference Pine libraries are published as ``username/LibraryName/version``.
 pynescript resolves them from an in-process registry populated by:
 
 1. Evaluating a ``library("Title")`` script (auto-registers by title via
@@ -164,6 +164,7 @@ class LibraryRegistry:
     """
 
     def __init__(self) -> None:
+        """Create empty path, title, and source maps."""
         self._by_path: dict[tuple[str, str, int], LibraryModule] = {}
         self._by_title: dict[str, LibraryModule] = {}
         self._sources: dict[tuple[str, str, int], str] = {}

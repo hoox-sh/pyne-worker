@@ -17,7 +17,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Volatility indicators module - ATR, Bollinger Bands, Keltner, StochRSI, etc."""
+"""Volatility ``ta.*`` family (ATR, BB/BBW, KC/KCW, stdev, linreg, …).
+
+Handlers are composed into
+:class:`~pynescript.ast.evaluator.builtins.technical.TechnicalAnalysisMixin`.
+"""
 
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ from .core import TechnicalHelpers
 
 
 class VolatilityIndicators(TechnicalHelpers):
-    """Volatility and price action indicators."""
+    """Volatility bands and dispersion: ATR, Bollinger, Keltner, stdev, linreg."""
 
     def _builtin_ta_stdev(self, args: list[Any]) -> float | None:
         """Standard Deviation."""
@@ -45,7 +49,7 @@ class VolatilityIndicators(TechnicalHelpers):
     def _builtin_ta_atr(self, args: list[Any]) -> Any:
         """Average True Range.
 
-        TradingView: ``ta.atr(length)``. Also accepts legacy
+        Reference Pine: ``ta.atr(length)``. Also accepts legacy
         ``ta.atr(high, low, close, length)`` for unit tests.
         """
         if len(args) == 1 and self._is_period_like(args[0]):
@@ -68,7 +72,7 @@ class VolatilityIndicators(TechnicalHelpers):
         return self._finalize_series(self._atr(highs, lows, closes, length))
 
     def _builtin_ta_tr(self, args: list[Any]) -> Any:
-        """True Range — TV form ``ta.tr(handle_na?)`` or legacy 3-arg."""
+        """True Range — reference Pine form ``ta.tr(handle_na?)`` or legacy 3-arg."""
         if len(args) <= 1:
             highs = self._context_series("high")
             lows = self._context_series("low")
@@ -238,14 +242,14 @@ class VolatilityIndicators(TechnicalHelpers):
     def _builtin_ta_kc(self, args: list[Any]) -> tuple[float, float, float]:
         """Keltner Channels.
 
-        TradingView: ``ta.kc(series, length, mult) → [middle, upper, lower]``
+        Reference Pine: ``ta.kc(series, length, mult) → [middle, upper, lower]``
         using ATR of chart H/L/C. Legacy 4-arg ``(high, low, close, length)``
         still accepted (mult defaults to 1).
         """
         mult = 1.0
         use_inc = self._use_incremental_ta()
         if len(args) == TERNARY and self._is_period_like(args[1]):
-            # TV form: source, length, mult
+            # reference Pine form: source, length, mult
             length = self._expect_int(args[1], "ta.kc length must be integer")
             m = args[2]
             current = getattr(m, "current", None)
@@ -297,11 +301,14 @@ class VolatilityIndicators(TechnicalHelpers):
 
         ema_vals = self._ema(closes, length)
         middle = ema_vals[-1] if ema_vals else math.nan
+        # Align with ``_kc_inc_update`` / Pine na: missing middle → all-nan tuple
+        if middle is None or (isinstance(middle, float) and math.isnan(middle)):
+            return math.nan, math.nan, math.nan
         atr_series = self._atr(highs, lows, closes, length)
         atr_val = atr_series[-1] if atr_series else 0
         channel_width = (atr_val or 0) * mult
-        upper = middle + channel_width if middle is not None and middle == middle else math.nan
-        lower = middle - channel_width if middle is not None and middle == middle else math.nan
+        upper = middle + channel_width if middle == middle else math.nan
+        lower = middle - channel_width if middle == middle else math.nan
         return middle, upper, lower
 
     def _builtin_ta_kcw(self, args: list[Any]) -> float:
@@ -319,7 +326,7 @@ class VolatilityIndicators(TechnicalHelpers):
     def _builtin_ta_linreg(self, args: list[Any]) -> float:
         """Linear Regression value.
 
-        Length < 2 soft-returns na (matches TV / BasicIndicators path).
+        Length < 2 soft-returns na (matches reference / BasicIndicators path).
         """
         series, length = self._expect_series(args, length=BINARY)
 
@@ -346,7 +353,7 @@ class VolatilityIndicators(TechnicalHelpers):
             return mean_y
 
         slope = numerator / denominator
-        # TV endpoint at x = n-1 (offset=0): mean_y + slope * ((n-1) - mean_x)
+        # reference Pine endpoint at x = n-1 (offset=0): mean_y + slope * ((n-1) - mean_x)
         return mean_y + slope * ((n - 1) - mean_x)
 
     def _builtin_ta_rci(self, args: list[Any]) -> float:
@@ -644,7 +651,12 @@ class VolatilityIndicators(TechnicalHelpers):
         closes: list[float],
         period: int,
     ) -> list[float | None]:
-        """ATR calculation."""
+        """ATR = Wilder RMA of true range (reference Pine ``ta.rma(ta.tr, length)``).
+
+        Dual-host aligned with ``numba_atr`` (audit Wave B). Returns a series
+        aligned to the TR samples (length ``len(closes)-1``); leading values
+        before the RMA seed are ``None``.
+        """
         if period <= 0:
             return []
         tr_values: list[float] = []
@@ -652,19 +664,32 @@ class VolatilityIndicators(TechnicalHelpers):
             high = highs[idx]
             low = lows[idx]
             prev_close = closes[idx - 1]
-            tr_values.append(
-                max(
-                    high - low,
-                    abs(high - prev_close),
-                    abs(low - prev_close),
+            try:
+                tr_values.append(
+                    max(
+                        float(high) - float(low),
+                        abs(float(high) - float(prev_close)),
+                        abs(float(low) - float(prev_close)),
+                    )
                 )
-            )
+            except (TypeError, ValueError):
+                # Soft-fail individual bars: skip non-numeric OHLC
+                continue
         if not tr_values:
             return []
-        if len(tr_values) < period:
-            average = statistics.mean(tr_values)
-            return [average]
-        return self._ema(tr_values, period)
+        # Wilder RMA of TR — same formula as ``_rma`` / ``numba_rma``
+        rma_series = self._rma(tr_values, period)
+        out: list[float | None] = []
+        for v in rma_series:
+            if v is None:
+                out.append(None)
+            else:
+                try:
+                    fv = float(v)
+                    out.append(None if fv != fv else fv)  # nan → None
+                except (TypeError, ValueError):
+                    out.append(None)
+        return out
 
     def _bollinger_bands(
         self,

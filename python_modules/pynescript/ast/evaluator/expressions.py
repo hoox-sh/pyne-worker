@@ -41,6 +41,7 @@ from collections.abc import Callable
 from typing import Any
 
 from pynescript.ast import node as ast
+from pynescript.ast.evaluator.builtins.request import match_htf_simple_ta_ast
 from pynescript.ast.evaluator.names import _BARE_SERIES_BUILTINS
 from pynescript.ast.evaluator.names import ast_qualified_name
 from pynescript.ast.evaluator.types import EvaluatorProtocol
@@ -153,7 +154,7 @@ def _as_scalar_operand(value):
 
 
 def _pine_soft_str(value: Any) -> str:
-    """Stringify a non-str operand for soft ``+`` concat (corpus / TV demos).
+    """Stringify a non-str operand for soft ``+`` concat (corpus / reference demos).
 
     Pine-like rules for the soft path (not full ``str.tostring``):
 
@@ -654,6 +655,7 @@ class ExpressionEvaluator:
         # Dominant multi-TA path: check first.
         if kind == _SITE_QB:
             args, kwargs = self._eval_arg_plan(site[4])
+            args = self._maybe_attach_security_simple_ta(site[3], node, args)
             if kwargs is not _EMPTY_KW and kwargs:
                 return self._call_builtin(site[3], args, kwargs=kwargs)  # type: ignore[attr-defined]
             tag, handler = site[1], site[2]
@@ -668,7 +670,11 @@ class ExpressionEvaluator:
         if kind == _SITE_BB:
             name, tag, handler, plan = site[1], site[2], site[3], site[4]
             args, kwargs = self._eval_arg_plan(plan)
-            user = self.context.get(name)  # type: ignore[attr-defined]
+            args = self._maybe_attach_security_simple_ta(name, node, args)
+            # Dual namespace: user ``method dmi`` / UDF stays callable after a
+            # series local reuses the bare name (``float dmi = dmi(...)``).
+            # Prefer ``_user_functions`` over context and bare ta.* aliases.
+            user = self._lookup_user_callable(name)
             if callable(user):
                 prev_site = getattr(self, "_pine_udf_site", None)
                 self._pine_udf_site = id(node)  # type: ignore[attr-defined]
@@ -707,6 +713,7 @@ class ExpressionEvaluator:
         if kind == _SITE_Q:
             name, plan = site[1], site[2]
             args, kwargs = self._eval_arg_plan(plan)
+            args = self._maybe_attach_security_simple_ta(name, node, args)
             result = self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
             if (
                 name in _PURE_CONST_FOLD_BUILTINS
@@ -721,13 +728,16 @@ class ExpressionEvaluator:
             return result
 
         # Fast path: bare Name builtins (plot, na, year, …).
-        # User callables in context still shadow each bar (cheap dict.get).
+        # Dual-namespace UDF/method + context callables shadow bare ta.* aliases.
         # site = (_SITE_B, name, arg_plan)
         if kind == _SITE_B:
             name, plan = site[1], site[2]
             args, kwargs = self._eval_arg_plan(plan)
-            user = self.context.get(name)  # type: ignore[attr-defined]
+            args = self._maybe_attach_security_simple_ta(name, node, args)
+            user = self._lookup_user_callable(name)
             if callable(user):
+                prev_site = getattr(self, "_pine_udf_site", None)
+                self._pine_udf_site = id(node)  # type: ignore[attr-defined]
                 try:
                     return user(*args, **kwargs)
                 except TypeError as e:
@@ -739,6 +749,8 @@ class ExpressionEvaluator:
                         if _type_error_from_callee(e2):
                             raise
                         return None
+                finally:
+                    self._pine_udf_site = prev_site  # type: ignore[attr-defined]
             result = self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
             # Fold pure literal builtins on first eval (same bar nested loops).
             if (
@@ -762,16 +774,14 @@ class ExpressionEvaluator:
             args, kwargs = self._eval_arg_plan(plan)
             # Dual namespace: prefer UDF table so series locals can reuse the name
             # (``ma = ta.sma(...); ma(src, n) => …`` — CCI smoothing pattern).
-            ufuncs = getattr(self, "_user_functions", None)
-            func = ufuncs.get(name) if ufuncs else None
-            if func is None:
-                func = self.context.get(name)  # type: ignore[attr-defined]
+            func = self._lookup_user_callable(name)
             if not callable(func):
                 # Context may hold a lazy string / non-callable; Attribute / UDT
                 # recovery still goes through the general path when needed.
                 # Bare missing UDF names (``f_priorBarsSatisfied``, helpers
                 # dropped by scrapes) must not hit ``_call_builtin`` → ValueError.
-                if isinstance(func, str) or func is None:
+                ctx_val = self.context.get(name)  # type: ignore[attr-defined]
+                if isinstance(ctx_val, str) or ctx_val is None:
                     # Re-check registry once (map may have been built after site resolve).
                     if self._is_registered_builtin(name):
                         return self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
@@ -797,12 +807,61 @@ class ExpressionEvaluator:
         # site = (_SITE_G, arg_plan)
         return self._visit_Call_general(node, site[1] if len(site) > 1 else None)
 
+    def _maybe_attach_security_simple_ta(
+        self: EvaluatorProtocol,
+        name: str,
+        node: ast.Call,
+        args: list[Any],
+    ) -> list[Any]:
+        """Replace security expression with allowlisted ``HtfSimpleTaExpr`` when AST matches.
+
+        ``request.security`` / bare ``security`` normally receive a *chart*
+        pre-evaluated third arg. For allowlisted simple ``ta.sma/ema/rsi/atr``
+        calls we preserve the form so the HTF path can run TA on resampled
+        bars instead of inventing structure from chart-TF results.
+        """
+        if name not in ("request.security", "security"):
+            return args
+        arg_nodes = getattr(node, "args", None) or ()
+        if len(arg_nodes) < 3 or len(args) < 3:
+            return args
+        expr_ast = getattr(arg_nodes[2], "value", None)
+        if expr_ast is None:
+            return args
+        matched = match_htf_simple_ta_ast(expr_ast)
+        if matched is None:
+            return args
+        out = list(args)
+        out[2] = matched
+        return out
+
     def _lookup_bound_builtin(self: EvaluatorProtocol, name: str) -> tuple[int, Any] | None:
         """Return ``(tag, handler)`` from the resolved-builtin cache, if present."""
         resolved = self.__dict__.get("_builtin_resolved")
         if not resolved:
             return None
         return resolved.get(name)
+
+    def _lookup_user_callable(self: EvaluatorProtocol, name: str) -> Any:
+        """Resolve a bare-name UDF / ``method`` for dual-namespace dispatch.
+
+        Pine allows a series local to reuse a function name
+        (``method dmi(...); float dmi = dmi(High, Low, Close, Period)``).
+        After the assignment, ``context[name]`` is the series (not callable)
+        while ``_user_functions[name]`` still holds the multi-dispatch
+        entry. Prefer that table, then a callable still in ``context``.
+
+        Bare ta.* aliases (``dmi`` → ``ta.dmi``) must **not** win over a
+        user method of the same name — that mis-route caused corpus RUN_FAIL
+        ``ta.dmi takes high, low, close series and length (got na)``.
+        """
+        ufuncs = self.__dict__.get("_user_functions")
+        if ufuncs is not None:
+            fn = ufuncs.get(name)
+            if callable(fn):
+                return fn
+        user = self.context.get(name)  # type: ignore[attr-defined]
+        return user if callable(user) else None
 
     def _resolve_call_site(self: EvaluatorProtocol, node: ast.Call) -> tuple:
         """Classify a Call node once for the bar-loop site cache.

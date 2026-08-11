@@ -17,7 +17,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Oscillator indicators module - RSI, STOCH, MACD, CCI, ROC, WPR, TSI."""
+"""Oscillator ``ta.*`` family (RSI, Stoch, MACD, CCI, ROC, WPR, TSI, …).
+
+Handlers are composed into
+:class:`~pynescript.ast.evaluator.builtins.technical.TechnicalAnalysisMixin`.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ from .core import TechnicalHelpers
 
 
 class OscillatorIndicators(TechnicalHelpers):
-    """Momentum and oscillator indicators."""
+    """Momentum oscillators: RSI, Stochastic, MACD, CCI, ROC, Williams %R, TSI."""
 
     def _builtin_ta_rsi(self, args: list[Any]) -> float | None:
         """Relative Strength Index."""
@@ -57,7 +61,7 @@ class OscillatorIndicators(TechnicalHelpers):
             highs = self._context_series("high")
             lows = self._context_series("low")
             return self._stoch_k(source, highs, lows, length)
-        # TV form: source, high, low, length
+        # reference Pine form: source, high, low, length
         if len(args) == QUATERNARY:
             length = self._expect_int(args[3], "ta.stoch length must be an integer")
             # Inc %K only needs last samples; full path needs chrono windows.
@@ -122,7 +126,7 @@ class OscillatorIndicators(TechnicalHelpers):
     def _builtin_ta_macd(self, args: list[Any]) -> tuple[float, float, float]:
         """MACD (Moving Average Convergence Divergence).
 
-        TradingView: ``ta.macd(source, fastlen, slowlen, siglen)`` →
+        Reference Pine: ``ta.macd(source, fastlen, slowlen, siglen)`` →
         ``[macdLine, signalLine, histLine]``.
 
         Accepts:
@@ -133,7 +137,7 @@ class OscillatorIndicators(TechnicalHelpers):
         msg = "ta.macd expects series and three lengths"
         if not args:
             self._error(msg)
-        # Defaults match TradingView when lengths are omitted
+        # Defaults match reference Pine when lengths are omitted
         fast = self._expect_int(args[1], msg) if len(args) > 1 else 12
         slow = self._expect_int(args[2], msg) if len(args) > 2 else 26
         signal = self._expect_int(args[3], msg) if len(args) > 3 else 9
@@ -188,7 +192,7 @@ class OscillatorIndicators(TechnicalHelpers):
         return self._roc(series, period)
 
     def _builtin_ta_wpr(self, args: list[Any]) -> float | None:
-        """Williams %R. TV: ``ta.wpr(length)`` or legacy 4-arg form."""
+        """Williams %R. reference Pine: ``ta.wpr(length)`` or legacy 4-arg form."""
         if len(args) == UNARY and self._is_period_like(args[0]):
             length = self._expect_int(args[0], "ta.wpr length must be int")
             highs = self._context_series("high")
@@ -209,7 +213,7 @@ class OscillatorIndicators(TechnicalHelpers):
         return self._wpr(highs, lows, closes, length)
 
     def _builtin_ta_ao(self, args: list[Any]) -> float | None:
-        """Awesome Oscillator: ``sma(hl2, 5) - sma(hl2, 34)`` (TV ``ta.ao``).
+        """Awesome Oscillator: ``sma(hl2, 5) - sma(hl2, 34)`` (reference Pine ``ta.ao``).
 
         Optional args override fast/slow periods (default 5 / 34).
         """
@@ -242,7 +246,7 @@ class OscillatorIndicators(TechnicalHelpers):
             return None
 
     def _builtin_ta_aroon(self, args: list[Any]) -> tuple[float, float] | None:
-        """Aroon oscillator pair: ``[aroonDown, aroonUp]`` (TV ``ta.aroon(length)``).
+        """Aroon oscillator pair: ``[aroonDown, aroonUp]`` (reference Pine ``ta.aroon(length)``).
 
         ``aroonUp = 100 * (length - bars_since_hh) / length``
         ``aroonDown = 100 * (length - bars_since_ll) / length``
@@ -278,7 +282,7 @@ class OscillatorIndicators(TechnicalHelpers):
 
         Forms:
         - ``ta.tsi(short, long)`` — source defaults to close
-        - ``ta.tsi(source, short, long)`` — TV order (short then long)
+        - ``ta.tsi(source, short, long)`` — reference order (short then long)
         - Also accepts legacy ``(source, long, short)`` when 3 period-like after series
         """
         msg = "ta.tsi expects series and two lengths"
@@ -293,7 +297,7 @@ class OscillatorIndicators(TechnicalHelpers):
             return self._tsi(series, long_period, short_period)
         if len(args) != TERNARY:
             self._error(msg)
-        # TV docs: ta.tsi(source, short_length, long_length)
+        # reference Pine docs: ta.tsi(source, short_length, long_length)
         short_period = self._expect_int(args[1], msg)
         long_period = self._expect_int(args[2], msg)
         series = self._as_series_or_raw(args[0], last_sample_ok=True)
@@ -302,7 +306,7 @@ class OscillatorIndicators(TechnicalHelpers):
         return self._tsi(series, long_period, short_period)
 
     def _builtin_ta_valuewhen(self, args: list[Any]) -> Any:
-        """Get value when condition was true. TV: ``ta.valuewhen(cond, source, occurrence=0)``."""
+        """Get value when condition was true. reference Pine: ``ta.valuewhen(cond, source, occurrence=0)``."""
         msg = "ta.valuewhen expects condition, source, and optional occurrence"
         if len(args) not in {BINARY, TERNARY}:
             self._error(msg)
@@ -725,11 +729,11 @@ class OscillatorIndicators(TechnicalHelpers):
         return (last_tp - last_sma) / (0.015 * last_mean_dev)
 
     def _roc(self, series: list[float], period: int) -> float | None:
-        """Rate of Change: ``100 * (src - src[period]) / src[period]`` (TV ``ta.roc``).
+        """Rate of Change: ``100 * (src - src[period]) / src[period]`` (reference Pine ``ta.roc``).
 
         Returns ``None`` (``na``) when history is shorter than ``period`` bars of
         lookback, baseline is missing/zero, or the current value is missing —
-        matching compile ``numba_roc`` and TradingView.
+        matching compile ``numba_roc`` and reference Pine.
         """
         if period <= 0 or len(series) <= period:
             return None
@@ -797,7 +801,7 @@ class OscillatorIndicators(TechnicalHelpers):
         return source[indices[-(occurrence + 1)]]
 
 
-# TV parameter names for kwargs → positional merge in BuiltinDispatchMixin
+# reference Pine parameter names for kwargs → positional merge in BuiltinDispatchMixin
 OscillatorIndicators._builtin_ta_macd._KWARG_ORDER = [  # type: ignore[attr-defined]
     "source",
     "fastlen",

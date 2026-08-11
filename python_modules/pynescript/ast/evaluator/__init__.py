@@ -29,8 +29,9 @@ pyne-worker, tests) typically:
 
 There is **no** separate ``NodeEvaluator`` class. The public composed type is
 :class:`NodeLiteralEvaluator` (also used by :func:`pynescript.ast.helper.literal_eval`
-and full-script execution). Hosts may subclass it (e.g. backend
-``CustomEvaluator``) for plot capture or series injection.
+and full-script execution). Hosts may subclass it (e.g.
+:class:`~pynescript.runtime.evaluator.CustomEvaluator`) for plot capture or
+series injection.
 
 Mixin composition (MRO left-to-right; first matching ``visit_*`` wins)::
 
@@ -50,6 +51,10 @@ Cross-cutting semantics:
   ``history`` most-recent-first — see :mod:`.names`.
 - **``var`` / ``varip``** initialize on first *execution* of the declaration
   (tracked in ``_var_declarations``), not strictly on ``bar_index == 0``.
+  When the host sets ``barstate.isrealtime`` (e.g. ``Runtime.run`` with
+  ``realtime_last_bar`` / ``realtime_ticks`` / ``realtime_bars`` /
+  ``realtime_from_bar``), ``varip`` re-evaluates its RHS each visit;
+  ``var`` stays init-once.
 - **UDF / method params** rebind keys on the live ``context`` dict and restore
   on return so hosts can keep mutating ``bar_index`` / OHLCV in place.
 - **Strategy events** are captured on ``_strategy_state`` (:class:`~.events.StrategyEvent`).
@@ -102,6 +107,10 @@ class NodeLiteralEvaluator(
     """
 
     def __init__(self, context=None, data_feed=None, data_provider=None):
+        """Initialize mixins, strategy event buffer, and ``var`` tracking.
+
+        See the class docstring for *context*, *data_feed*, and *data_provider*.
+        """
         super().__init__(context=context, data_feed=data_feed, data_provider=data_provider)
         # Support for strategy events (from plan branch integration)
         if not hasattr(self, "_strategy_state"):

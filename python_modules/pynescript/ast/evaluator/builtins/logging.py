@@ -17,7 +17,17 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Logging functions for PineScript v6 evaluator."""
+"""Pine ``log.*`` and ``runtime.error`` builtins for the evaluator.
+
+Buffers log records on a process-local :class:`Logger` for hosts and tests
+to inspect after a run. ``runtime.error`` raises so bar evaluation aborts
+with a clear message.
+
+Registration
+------------
+:func:`register_logging_functions` injects handlers into the evaluator
+dispatch map from :class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`.
+"""
 
 from __future__ import annotations
 
@@ -25,7 +35,7 @@ from typing import Any
 
 
 class Logger:
-    """Simple logger for PineScript logging functions."""
+    """In-memory log buffer for ``log.*`` builtins (ERROR / INFO / WARNING)."""
 
     def __init__(self):
         """Initialize logger."""
@@ -82,7 +92,7 @@ def format_log_message(*parts: Any) -> str:
         return str(parts[0] if parts[0] is not None else "na")
     fmt = str(parts[0] if parts[0] is not None else "")
     args = [_pine_log_arg(p) for p in parts[1:]]
-    # TV primary path: str.format placeholders
+    # reference primary path: str.format placeholders
     if "{" in fmt:
         try:
             return fmt.format(*args)

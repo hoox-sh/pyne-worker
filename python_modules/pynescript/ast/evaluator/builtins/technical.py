@@ -17,6 +17,22 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+"""Pine ``ta.*`` technical-analysis builtins and dispatch map.
+
+Handlers live in :mod:`technical_submodules` (moving averages, oscillators,
+volatility, volume, patterns, …). This module only composes those mixins and
+registers the fully qualified ``ta.<name>`` dispatch keys used by the
+evaluator.
+
+Mixin composition
+-----------------
+:class:`TechnicalAnalysisMixin` multiple-inherits all indicator submodules
+plus :class:`BuiltinDispatchMixin`, and contributes ``_technical_builtin_map``
+into :class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`. Shared
+series/period validation is provided by
+:class:`~pynescript.ast.evaluator.builtins.technical_submodules.core.TechnicalHelpers`.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -50,7 +66,12 @@ class TechnicalAnalysisMixin(
     VolumeIndicators,
     BuiltinDispatchMixin,
 ):
-    """Technical analysis built-ins and supporting utilities."""
+    """Aggregate ``ta.*`` handlers from technical submodules into one mixin.
+
+    Implementations (``_builtin_ta_*``) are defined on the submodule bases;
+    this class only builds the name→handler dispatch table for
+    :class:`BuiltinEvaluator`.
+    """
 
     def _technical_builtin_map(self) -> dict[str, BuiltinHandler]:
         m: dict[str, BuiltinHandler] = {
@@ -74,7 +95,7 @@ class TechnicalAnalysisMixin(
             "ta.cci": self._builtin_ta_cci,
             "ta.roc": self._builtin_ta_roc,
             "ta.wpr": self._builtin_ta_wpr,
-            # Official TV alias for Williams %R
+            # Official reference alias for Williams %R
             "ta.willr": self._builtin_ta_wpr,
             "ta.obv": self._builtin_ta_obv,
             "ta.mfi": self._builtin_ta_mfi,
@@ -125,7 +146,7 @@ class TechnicalAnalysisMixin(
             "ta.nvi": self._builtin_ta_nvi,
             "ta.pvi": self._builtin_ta_pvi,
             "ta.accdist": self._builtin_ta_accdist,
-            # Official TV name for Accumulation/Distribution
+            # Official reference name for Accumulation/Distribution
             "ta.ad": self._builtin_ta_accdist,
             "ta.wad": self._builtin_ta_wad,
             "ta.wvad": self._builtin_ta_wvad,
@@ -148,9 +169,9 @@ class TechnicalAnalysisMixin(
             "ta.uo": self._builtin_ta_uo,
             "ta.bb_pct": self._builtin_ta_bb_pct,
             "ta.vpt": self._builtin_ta_vpt,
-            # Official TV name (Price Volume Trend)
+            # Official reference name (Price Volume Trend)
             "ta.pvt": self._builtin_ta_vpt,
-            # Official TV gaps filled this round
+            # Official reference gaps filled this round
             "ta.ao": self._builtin_ta_ao,
             "ta.aroon": self._builtin_ta_aroon,
             "ta.beta": self._builtin_ta_beta,
@@ -250,7 +271,7 @@ class TechnicalAnalysisMixin(
     def _builtin_ta_sum(self, args: list[Any]) -> Any:
         """Rolling sum ``ta.sum(source, length)`` — alias of ``math.sum(source, length)``.
 
-        Community scripts often use ``ta.sum``; TV documents ``math.sum`` for the
+        Community scripts often use ``ta.sum``; reference documents ``math.sum`` for the
         same rolling window sum over a series.
         """
         if hasattr(self, "_builtin_math_sum"):

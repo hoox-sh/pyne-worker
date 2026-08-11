@@ -7,13 +7,13 @@ Python Cloudflare Worker that evaluates Pine Script strategies on the edge using
 | Layer | Choice | Notes |
 |---|---|---|
 | Runtime | Python (Cloudflare Workers Python) | `workers-py` SDK |
-| Pine Script engine | `pynescript` (editable install) | Python parser/evaluator from sibling repo |
+| Pine Script engine | `pynescript` (editable install) | Package SoT bar-loop (`pynescript.runtime`) |
 | Package mgr | uv / pip | `pyproject.toml` with Hatch-style `[project]` config |
 | Deploy | wrangler | Cloudflare Workers Python runtime |
 
 ## Architecture
 
-`pyne-worker` depends on `pynescript` (sibling repo at `/home/jango/Git/pynescript`, editable install). It runs Pine Script evaluation, R2 data ingestion, and trade event forwarding on Cloudflare Workers using the Python Workers runtime.
+`pyne-worker` depends on `pynescript` (sibling repo at `/home/jango/Git/pynescript`, editable install). **H1:** the bar-loop is the package Runtime (`pynescript.runtime`); `src/pynescript_backend/` is a thin edge wrap (strict OHLCV validation + re-exports). Deploy still vendors the package tree via `./scripts/sync_vendor.sh` into `python_modules/`.
 
 ## Sister Repos
 
@@ -61,6 +61,7 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 | `src/alert_engine.py` | Last-bar alert filter + summary helpers |
 | `src/alert_forwarder.py` | L2 HTTP webhook delivery for alerts |
 | `wrangler.jsonc` | Worker config + cron `* * * * *` |
+| `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars) |
 | `pyproject.toml` | Package config (editable dep on `pynescript`) |
 
 ### Alerts (L2)

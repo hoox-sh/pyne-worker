@@ -17,7 +17,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Ticker functions for PineScript v6 evaluator."""
+"""Pine ``ticker.*`` helpers for symbol ids and synthetic chart types.
+
+Builds :class:`TickerInfo` for standard symbols and non-standard charts
+(Heikin Ashi, Renko, Kagi, line break, point & figure). Also provides
+symbol-splitting utilities used by ``syminfo``-adjacent call sites.
+
+Registration
+------------
+:func:`register_ticker_functions` injects handlers into the evaluator dispatch
+map from :class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator` (function
+registration, not a mixin).
+"""
 
 from __future__ import annotations
 
@@ -25,7 +36,10 @@ from typing import Any
 
 
 class TickerInfo:
-    """Represents a ticker symbol with optional modifications."""
+    """Symbol id with optional session/adjust and non-standard chart flags.
+
+    Stringifies to the symbol text for concat/logging parity with reference Pine.
+    """
 
     def __init__(
         self,
@@ -60,15 +74,15 @@ class TickerInfo:
         return f"ticker({', '.join(parts)})"
 
     def __str__(self) -> str:
-        """Return the ticker id string (TV stringify for concat / logs)."""
+        """Return the ticker id string (reference stringify for concat / logs)."""
         return self.symbol
 
     def __add__(self, other: object) -> str:
-        """Allow ``ticker.standard() + \" /\"`` string concatenation (TV)."""
+        """Allow ``ticker.standard() + \" /\"`` string concatenation (reference)."""
         return self.symbol + str(other)
 
     def __radd__(self, other: object) -> str:
-        """Allow ``\"x\" + ticker.standard()`` string concatenation (TV)."""
+        """Allow ``\"x\" + ticker.standard()`` string concatenation (reference)."""
         return str(other) + self.symbol
 
 
@@ -82,7 +96,7 @@ def ticker_new(
     """Create a new ticker object.
 
     Creates a ticker symbol with optional session and adjustment parameters.
-    Extra positional/keyword args (TV has more overloads) are ignored.
+    Extra positional/keyword args (reference has more overloads) are ignored.
 
     Args:
         symbol: The ticker symbol (e.g., "AAPL", "EURUSD")
@@ -112,7 +126,7 @@ def ticker_modify(
 
     Creates a copy of the ticker with modified parameters.
 
-    TradingView forms::
+    reference Pine forms::
 
         ticker.modify(tickerid, session, adjustment)
         ticker.modify(syminfo.tickerid, adjustment=adjustment.dividends)
@@ -134,7 +148,7 @@ def ticker_modify(
             symbol = str(kwargs["symbol"])  # type: ignore[assignment]
         if session is None and kwargs.get("session") is not None:
             session = str(kwargs["session"])  # type: ignore[assignment]
-        # TV docs name the parameter ``adjustment``; keep ``adjust`` as alias.
+        # reference docs name the parameter ``adjustment``; keep ``adjust`` as alias.
         adj_kw = kwargs.get("adjustment", kwargs.get("adjust"))
         if adj_kw is not None:
             adjust = str(adj_kw)  # type: ignore[assignment]
@@ -243,7 +257,7 @@ def ticker_pointfigure(
 ) -> TickerInfo:
     """Create a Point and Figure chart ticker from a symbol.
 
-    TradingView forms:
+    reference Pine forms:
 
     - ``ticker.pointfigure(symbol, boxsize)`` / ``(..., boxsize, style)``
       (legacy short form)
@@ -258,7 +272,7 @@ def ticker_pointfigure(
     style_s: str | None = str(style) if style is not None else None
     rev = _as_int_or_none(reversal)
 
-    # Named kwargs (TV-style) override positionals when present
+    # Named kwargs (reference-style) override positionals when present
     if kwargs.get("source") is not None:
         source = str(kwargs["source"])
     if kwargs.get("style") is not None:
@@ -346,7 +360,7 @@ def ticker_inherit(
     Pine forms:
     - ``ticker.inherit(symbol)`` — inherit chart session/adjust for *symbol*
     - ``ticker.inherit(from, symbol)`` — inherit from *from* ticker for *symbol*
-      (used by TradingView sample scripts such as Performance)
+      (used by reference Pine sample scripts such as Performance)
     """
     # Two-arg form: first is source (often chart tickerid), second is target symbol
     if symbol is not None:
@@ -375,7 +389,7 @@ def ticker_inherit(
 def ticker_standard(ticker_str: str | None = None, *extra: object, **kwargs: object) -> TickerInfo:
     """Create a standard OHLC ticker from a symbol.
 
-    Ensures standard candlestick format. TV also allows the zero-arg form
+    Ensures standard candlestick format. reference also allows the zero-arg form
     ``ticker.standard()`` which means "standard OHLC of the chart symbol"
     (host fills chart ticker via kwargs / empty → host default later).
 

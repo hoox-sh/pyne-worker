@@ -17,7 +17,19 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Core technical analysis helpers and validation utilities."""
+"""Shared helpers for all ``ta.*`` indicator submodules.
+
+Provides arity constants, series/period coercion (via
+:func:`~pynescript.ast.evaluator.builtins.base.pine_expect_int` /
+:func:`~pynescript.ast.evaluator.builtins.base.pine_period_or_none`),
+incremental-TA toggles, and :class:`TechnicalHelpers` — the base class for
+every indicator mixin under this package.
+
+Composition
+-----------
+Indicator modules inherit :class:`TechnicalHelpers` and are aggregated by
+:class:`~pynescript.ast.evaluator.builtins.technical.TechnicalAnalysisMixin`.
+"""
 
 from __future__ import annotations
 
@@ -46,7 +58,12 @@ _MISSING: Any = object()
 
 
 class TechnicalHelpers:
-    """Shared technical analysis helpers and validation methods."""
+    """Base utilities for ``ta.*`` handlers (series expect, SMA helpers, state).
+
+    Subclasses implement ``_builtin_ta_*`` methods. Expects evaluator attributes
+    such as ``current_series``, ``context``, and ``_error`` when composed into
+    the full evaluator via :class:`TechnicalAnalysisMixin`.
+    """
 
     current_series: dict[str, list[Any]]
 
@@ -171,7 +188,7 @@ class TechnicalHelpers:
             except (TypeError, ValueError):
                 # Treat non-numeric as na: replace with None in window
                 window[-1] = None
-        # Strict window (match compile numba_sma / TV): any na in the length
+        # Strict window (match compile numba_sma / reference Pine): any na in the length
         # window → na. Require count == period (every slot finite).
         if len(window) < period or st["count"] != period:
             st["value"] = None
@@ -180,7 +197,7 @@ class TechnicalHelpers:
         return st.get("value")
 
     def _sum_inc_update(self, series: Any, period: int) -> float | None:
-        """Incremental rolling sum matching ``numba_sum_inc`` / TV ``math.sum``.
+        """Incremental rolling sum matching ``numba_sum_inc`` / reference Pine ``math.sum``.
 
         Full window required; any na/NaN in the window → na (poison). Works from
         scalar samples via call-site state (same pattern as ``_sma_inc_update``),
@@ -226,7 +243,7 @@ class TechnicalHelpers:
         return st.get("value")
 
     def _ema_inc_update(self, series: list[Any], period: int) -> float | None:
-        """Incremental EMA with SMA seed (matches ``numba_ema_inc`` / TV).
+        """Incremental EMA with SMA seed (matches ``numba_ema_inc`` / reference Pine).
 
         Seed = mean of first ``period`` finite samples; na until the window is
         full. Prior first-value seed diverged from compile on Chaikin Osc etc.
@@ -394,20 +411,26 @@ class TechnicalHelpers:
 
     @staticmethod
     def _ema_state_new() -> dict[str, Any]:
-        return {"ema": None, "seeded": False}
+        return {"ema": None, "seeded": False, "seed_buf": []}
 
     @staticmethod
     def _ema_state_step(st: dict[str, Any], x: Any, period: int) -> float | None:
-        """One EMA sample step matching full ``_ema`` (no call-site slot)."""
+        """One EMA sample step matching full ``_ema`` / ``_ema_inc_update`` (SMA seed)."""
         if period <= 0:
             return None
         alpha = 2.0 / (period + 1)
         if not st["seeded"]:
             if x is None:
                 return None
-            st["ema"] = float(x)
+            buf = st.setdefault("seed_buf", [])
+            buf.append(float(x))
+            if len(buf) < period:
+                return None
+            seed = sum(buf[:period]) / period
+            st["ema"] = seed
             st["seeded"] = True
-            return st["ema"]
+            st["seed_buf"] = []
+            return seed
         if x is None:
             return st.get("ema")
         prev = st["ema"]
@@ -467,10 +490,10 @@ class TechnicalHelpers:
         closes: list[Any],
         period: int,
     ) -> float | None:
-        """Incremental ATR matching full ``_atr`` (EMA of TR after warm-up).
+        """Incremental ATR matching full ``_atr`` (Wilder RMA of TR).
 
-        Full path: while ``len(tr) < period`` return mean(tr); once
-        ``len(tr) >= period`` return ``_ema(tr, period)[-1]``.
+        Reference Pine: ``ta.atr(length)`` ≡ ``ta.rma(ta.tr, length)``. Dual-host aligned
+        with ``numba_atr`` / ``numba_atr_inc`` (audit Wave B).
         """
         if period <= 0:
             return None
@@ -481,9 +504,7 @@ class TechnicalHelpers:
         if st is None:
             st = {
                 "prev_close": None,
-                "trs": [],
-                "ema": self._ema_state_new(),
-                "ema_mode": False,
+                "rma": self._rma_state_new(),
                 "value": None,
             }
             bucket[key] = st
@@ -507,25 +528,13 @@ class TechnicalHelpers:
         except (TypeError, ValueError):
             st["value"] = None
             return None
-        if not st["ema_mode"]:
-            st["trs"].append(tr)
-            if len(st["trs"]) < period:
-                st["value"] = statistics.mean(st["trs"])
-                return st["value"]
-            # Bootstrap EMA over all TR samples so far (matches full _ema(tr, period))
-            for t in st["trs"]:
-                self._ema_state_step(st["ema"], t, period)
-            st["ema_mode"] = True
-            st["trs"] = []
-            st["value"] = st["ema"].get("ema")
-            return st.get("value")
-        st["value"] = self._ema_state_step(st["ema"], tr, period)
+        st["value"] = self._rma_state_step(st["rma"], tr, period)
         return st.get("value")
 
     def _stdev_inc_update(self, series: list[Any], period: int) -> float | None:
         """Incremental sample stdev matching full ``_stdev`` (last value).
 
-        Strict window (match compile ``numba_stdev`` / TV / ``_sma``): any ``na``
+        Strict window (match compile ``numba_stdev`` / reference / ``_sma``): any ``na``
         in the length window yields ``na``. Sample variance uses ddof=1 over the
         full ``period`` finite samples (requires ``period >= 2``).
         """
@@ -644,7 +653,7 @@ class TechnicalHelpers:
         """Incremental WMA matching full ``_wma`` / compile ``numba_wma``.
 
         Weights positions 1..period within the window (oldest weight 1).
-        Requires a full window of non-``na`` samples (TV / compile parity);
+        Requires a full window of non-``na`` samples (reference / compile parity);
         any ``None`` in the window → ``na``.
         """
         if period <= 0:
@@ -808,7 +817,7 @@ class TechnicalHelpers:
     def _cum_inc_update(self, series: list[Any]) -> float | None:
         """Incremental cumulative sum matching bar-mode ``ta.cum`` (last value).
 
-        TradingView treats ``na`` as 0 (same as compile ``numba_cum_expr``), so a
+        reference Pine treats ``na`` as 0 (same as compile ``numba_cum_expr``), so a
         pure-na source (e.g. foreign ``request.security`` without data) yields
         0 rather than lingering ``na``.
         """
@@ -820,7 +829,7 @@ class TechnicalHelpers:
             st = {"total": 0.0, "value": 0.0}
             bucket[key] = st
         x = self._series_last(series)
-        # TV: na / IEEE NaN → 0 contribution (compile ``numba_cum_expr`` same).
+        # reference Pine: na / IEEE NaN → 0 contribution (compile ``numba_cum_expr`` same).
         add = 0.0
         if x is not None:
             try:
@@ -1039,7 +1048,7 @@ class TechnicalHelpers:
         return st.get("value")
 
     def _roc_inc_update(self, series: list[Any], period: int) -> float | None:
-        """Incremental Rate of Change matching full ``_roc`` / TV ``ta.roc``.
+        """Incremental Rate of Change matching full ``_roc`` / reference Pine ``ta.roc``.
 
         ``100 * (src - src[period]) / src[period]``. Returns ``None`` when
         lookback is insufficient or baseline/current is missing/zero (parity
@@ -1131,7 +1140,7 @@ class TechnicalHelpers:
     def _dev_inc_update(self, series: list[Any], period: int) -> float | None:
         """Incremental mean absolute deviation matching full ``_dev``.
 
-        Strict window (match compile ``numba_dev`` / TV): any ``na`` → ``na``.
+        Strict window (match compile ``numba_dev`` / reference): any ``na`` → ``na``.
         Running sum for the mean; MAD over the full period window.
         """
         if period <= 0:
@@ -1597,7 +1606,7 @@ class TechnicalHelpers:
         """Incremental linear-regression endpoint matching full ``ta.linreg``.
 
         Maintains a rolling window; recomputes slope/intercept on non-None
-        samples with x re-indexed 0..m-1 (same as full path / TV / numba).
+        samples with x re-indexed 0..m-1 (same as full path / reference / numba).
         Result is the fitted value at ``x = n - 1 - offset``.
         """
         if length < 2:
@@ -1636,7 +1645,7 @@ class TechnicalHelpers:
             st["value"] = mean_y
             return mean_y
         slope = numerator / denominator
-        # TV: intercept + slope * (n - 1 - offset); intercept = mean_y - slope * mean_x
+        # reference Pine: intercept + slope * (n - 1 - offset); intercept = mean_y - slope * mean_x
         st["value"] = mean_y + slope * ((n - 1 - int(offset)) - mean_x)
         return float(st["value"])
 
@@ -2168,7 +2177,7 @@ class TechnicalHelpers:
         """Incremental Money Flow Index matching full ``_mfi`` / ``numba_mfi``.
 
         Needs ``period + 1`` typical-price samples; returns na until ready.
-        Equal TP bars contribute to neither side (TV convention).
+        Equal TP bars contribute to neither side (reference convention).
         """
         if period < 1:
             return math.nan
@@ -2997,7 +3006,7 @@ class TechnicalHelpers:
         return False
 
     def _expect_period(self, value: Any, message: str) -> int:
-        """Coerce TA length/period; ``na`` → ``0`` so kernels return na (TV-like).
+        """Coerce TA length/period; ``na`` → ``0`` so kernels return na (reference-like).
 
         Non-na invalid types still raise via :func:`pine_period_or_none`.
         Period ``<= 0`` is treated as invalid length by SMA/EMA/… kernels.
@@ -3018,7 +3027,7 @@ class TechnicalHelpers:
     ) -> tuple[Any, int]:
         """Validate and extract series and period arguments.
 
-        TradingView allows ``ta.sma(close, 14)`` and, for some functions,
+        reference Pine allows ``ta.sma(close, 14)`` and, for some functions,
         ``ta.highest(14)`` (period-only, source defaults to high/low/close).
 
         When ``allow_period_only`` is True and a single period-like arg is
@@ -3171,7 +3180,7 @@ class TechnicalHelpers:
     def _sma(self, series: list[Any], period: int) -> list[float | None]:
         """Simple Moving Average.
 
-        Strict window (match compile ``numba_sma`` / TradingView): any ``na`` in
+        Strict window (match compile ``numba_sma`` / reference Pine): any ``na`` in
         the last ``period`` samples yields ``na``; average divides by ``period``.
         """
         result: list[float | None] = []
@@ -3192,28 +3201,46 @@ class TechnicalHelpers:
         return result
 
     def _ema(self, series: list[Any], period: int) -> list[float | None]:
-        """Exponential Moving Average."""
+        """Exponential Moving Average (SMA seed).
+
+        Dual-host aligned with ``_ema_inc_update`` / ``numba_ema`` / reference Pine:
+        seed = mean of the first ``period`` finite samples (``na`` until the
+        window is full), then ``alpha * x + (1-alpha) * ema`` with
+        ``alpha = 2/(period+1)``. Missing samples after seed hold the previous
+        EMA (interpret convention).
+        """
         if not series or period <= 0:
             return [None] * len(series)
-        alpha = 2 / (period + 1)
+        alpha = 2.0 / (period + 1)
         ema_values: list[float | None] = []
-        first_valid = next(
-            (i for i, value in enumerate(series) if value is not None),
-            -1,
-        )
-        if first_valid == -1:
-            return [None] * len(series)
-        ema_values.extend([None] * first_valid)
-        ema_values.append(series[first_valid])
-        for idx in range(first_valid + 1, len(series)):
-            value = series[idx]
-            if value is None:
-                ema_values.append(ema_values[-1])
+        seed_buf: list[float] = []
+        seeded = False
+        ema: float | None = None
+        for raw in series:
+            x: Any = raw
+            if x is not None and type(x) is not float and type(x) is not int:
+                try:
+                    x = float(x)
+                except (TypeError, ValueError):
+                    x = None
+            if not seeded:
+                if x is None:
+                    ema_values.append(None)
+                    continue
+                seed_buf.append(float(x))
+                if len(seed_buf) < period:
+                    ema_values.append(None)
+                    continue
+                ema = sum(seed_buf[:period]) / period
+                seeded = True
+                seed_buf = []
+                ema_values.append(ema)
                 continue
-            previous = ema_values[-1]
-            if previous is None:
-                self._error("EMA requires a previous value")
-            ema_values.append(alpha * value + (1 - alpha) * previous)
+            if x is None:
+                ema_values.append(ema)
+                continue
+            ema = alpha * float(x) + (1.0 - alpha) * float(ema)
+            ema_values.append(ema)
         return ema_values
 
     def _rma(self, series: list[Any], period: int) -> list[float]:
@@ -3248,7 +3275,7 @@ class TechnicalHelpers:
         return rma_values[: len(formatted)]
 
     def _wma(self, series: list[float], period: int) -> float | None:
-        """Weighted Moving Average — full window of non-``na`` required (TV / compile)."""
+        """Weighted Moving Average — full window of non-``na`` required (reference Pine / compile)."""
         if period <= 0 or len(series) < period:
             return None
         window = series[-period:]
@@ -3272,7 +3299,7 @@ class TechnicalHelpers:
         return min(window) if window else None
 
     def _stdev(self, series: list[float], period: int) -> float | None:
-        """Standard deviation over period (strict window, match compile/TV).
+        """Standard deviation over period (strict window, match compile/reference Pine).
 
         Any ``na`` in the last ``period`` samples yields ``na``; sample stdev
         (ddof=1) divides by ``period - 1`` over the full window.
@@ -3361,7 +3388,7 @@ class TechnicalHelpers:
     def _crossover(self, series1: list[float], series2: list[float]) -> bool:
         """Check if series1 crosses above series2 (na-safe).
 
-        TV / numba / bar-mode stateful: previous bar was ``s1 <= s2`` and
+        reference / numba / bar-mode stateful: previous bar was ``s1 <= s2`` and
         current is strictly ``s1 > s2``. Any na operand → False (no cross).
         """
         if len(series1) < MIN_SERIES_LENGTH or len(series2) < MIN_SERIES_LENGTH:

@@ -17,25 +17,22 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Sanitize scraped Pine corpus sources before parse.
+"""Sanitize messy Pine sources before parse.
 
-Many set01–set05 files include TradingView / FMZ / markdown / docs chrome that is
-not valid Pine:
+Useful when user-supplied text still contains page chrome that is not valid Pine:
 
 - Markdown fences (``` / ```pine / ```pinescript)
-- Blockquote chrome (`> Name`, `> Detail`, `> Source (PineScript)`, …)
-- ``Expand (N lines)`` UI stubs from community pages
+- Blockquote chrome (`> Name`, `> Detail`, …)
+- ``Expand (N lines)`` UI stubs
 - Horizontal rules, bare URLs, publication footers
-- Leading bilingual strategy write-ups before the real script
-- Mis-collected shell / Python / pytest / HTML / PR-template files
-- TradingView docs chrome (``Pine Script®``, ``Copied``, bare ``image``)
+- Leading write-ups before the real script
+- Mis-collected shell / Python / HTML fragments
 
-TradingView Markdown for //@function hover annotations lives only inside //
-comments and is left alone. This module strips *page* chrome, not annotation
-Markdown.
+Markdown for ``//@function`` hover annotations lives only inside ``//`` comments
+and is left alone. This module strips *page* chrome, not annotation Markdown.
 
-When a file is entirely non-Pine (or yields no usable Pine after chrome strip),
-a minimal parseable stub is returned so corpus compile coverage can proceed.
+When a file yields no usable Pine after chrome strip, a minimal parseable stub
+is returned so callers can fail softly instead of crashing on empty input.
 """
 
 from __future__ import annotations
@@ -45,7 +42,7 @@ import re
 # Minimal script used when scrape content is foreign / empty of real Pine.
 _MINIMAL_STUB = '//@version=5\nindicator("x")\nplot(close)\n'
 
-# TV community "Expand (N lines)" UI stub — often at EOF; closing ``)`` may be cut.
+# reference community "Expand (N lines)" UI stub — often at EOF; closing ``)`` may be cut.
 _EXPAND_RE = re.compile(r"^\s*Expand\s*\(\s*\d+\s*lines?\s*\)?\s*$", re.I)
 _HR_RE = re.compile(r"^\s*([-*_])\1{2,}\s*$")  # --- *** ___
 _URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$", re.I)
@@ -55,7 +52,7 @@ _IMG_MD_RE = re.compile(r"^\s*!\[.*?\]\(.*?\)\s*$")
 _MD_LINK_LINE_RE = re.compile(r"^\s*\[.*?\]\(https?://.*?\)\s*$")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _HTML_COMMENT_OPEN_RE = re.compile(r"^\s*<!--")
-# TradingView docs UI chrome
+# reference Pine docs UI chrome
 _TV_PINE_LABEL_RE = re.compile(r"^\s*Pine\s+Script\s*®?\s*$", re.I)
 _COPIED_RE = re.compile(r"^\s*Copied\s*$", re.I)
 _IMAGE_ONLY_RE = re.compile(r"^\s*image\s*$", re.I)
@@ -83,10 +80,10 @@ _PROSE_LABEL_RE = re.compile(
     re.I,
 )
 
-# Apostrophe class: ASCII + curly quotes common in TV docs scrapes (U+2019 / U+2018).
+# Apostrophe class: ASCII + curly quotes common in reference docs scrapes (U+2019 / U+2018).
 _APOS = r"['\u2019\u2018]"
 
-# English / docs prose that appears after a real script on scraped TV pages.
+# English / docs prose that appears after a real script on scraped reference pages.
 _PROSE_CONTINUE_RE = re.compile(
     r"^\s*("
     r"Note that:?|"
@@ -116,7 +113,7 @@ _PROSE_CONTINUE_RE = re.compile(
     re.I,
 )
 
-# TV / GitHub UI chrome lines that often appear between a truncated preview and
+# reference / GitHub UI chrome lines that often appear between a truncated preview and
 # the full script copy (set05 hasnocool scrapes).
 _UI_CHROME_LINE_RE = re.compile(
     r"^\s*("
@@ -267,7 +264,7 @@ def _extract_fenced_blocks(lines: list[str]) -> list[str]:
 
 
 def _extract_tv_copied_blocks(lines: list[str]) -> list[str]:
-    """TradingView docs: code after a ``Pine Script`` / ``Copied`` label."""
+    """reference Pine docs: code after a ``Pine Script`` / ``Copied`` label."""
     blocks: list[str] = []
     i = 0
     n = len(lines)
@@ -399,7 +396,7 @@ def _has_usable_pine(text: str) -> bool:
     return bool(_SCRIPT_DECL_RE.search(text))
 
 
-# Docs chrome glued onto code lines (Mintlify / TV pages).
+# Docs chrome glued onto code lines (Mintlify / reference pages).
 # Case-sensitive Capitalized nav words after ≥2 spaces; may be followed by more
 # title-case sidebar junk (``Previous Strategies Next Techniques …``).
 # Do NOT use IGNORECASE — English ``next to`` must not match.
@@ -494,7 +491,7 @@ def _polish_code_line(line: str) -> str:
     if not line.lstrip().startswith("//"):
         line = re.sub(r",\s*\.\.\.\s*$", "", line)
         line = re.sub(r"\(\s*\.\.\.\s*$", "(", line)
-    # TV library import UI residual: ``import x/y/1 as eta loading...``
+    # reference library import UI residual: ``import x/y/1 as eta loading...``
     if not line.lstrip().startswith("//"):
         line = re.sub(r"\s+loading\.\.\.\s*$", "", line, flags=re.I)
     # Dangling ``+`` / ``,`` immediately before a closer (cut mid-concat / mid-args).
@@ -999,13 +996,37 @@ def _line_has_arg_continuation(line: str, lines: list[str], index: int) -> bool:
     return False
 
 
+# Dangling binary/logical op immediately before a closer after scrape repair:
+# ``str.tostring(a) +)`` / ``"session " +)`` / ``cond and)``.
+# Space-bounded so identifiers like ``foo+)`` are untouched; mirrors line polish.
+_DANGLING_BINOP_BEFORE_CLOSER_RE = re.compile(
+    r"\s+(?:and|or|\+|\-|\*|/)\s*(?=[\)\]])"
+)
+
+
+def _strip_dangling_binop_before_closers(text: str) -> str:
+    """Drop incomplete trailing binops glued to ``)`` / ``]`` by closer injection."""
+    return _DANGLING_BINOP_BEFORE_CLOSER_RE.sub("", text)
+
+
 def _close_trailing_opens_on_line(core: str) -> str:
     """Close unclosed ``(`` / ``[`` on a truncated line.
 
     Empty calls (``log.info(``) / trailing commas get a ``na`` placeholder.
     Partial args that already end with a value (``input.int(1, minval=1``) only
     need the matching closers — injecting ``na`` would produce invalid syntax.
+
+    Mid-expression docs scrapes often cut after a binary/logical op inside an
+    open call (``label.new(..., str.tostring(a) +``). Drop that dangling op so
+    the last complete operand remains, then close — never emit invalid ``+)``.
     """
+    # High-confidence truncated scrape: incomplete ``… +`` / ``… and`` at EOL
+    # inside an unclosed call. Prefer stripping the op over inventing ``na`` so
+    # the left operand (already a full string/expr) stays the final arg.
+    mop = _TRAILING_BINOP_RE.match(core.rstrip())
+    if mop:
+        core = mop.group("head")
+
     depth_p = 0
     depth_b = 0
     for ch in core:
@@ -1214,7 +1235,7 @@ def _fix_truncated_syntax(text: str) -> str:
                 continue
 
         # Assignment to empty structure: ``x = switch`` / ``x = if c`` / ``x = for …`` /
-        # ``x = while …`` with no body (truncated TV docs demos).
+        # ``x = while …`` with no body (truncated reference docs demos).
         m_as = re.match(
             r"^(\s*.*?\S)\s*=\s*(switch|if|for|while)\b(.*)$",
             stripped_nl,
@@ -1320,6 +1341,10 @@ def _fix_truncated_syntax(text: str) -> str:
         out.append(line)
         i += 1
     repaired = _append_missing_closers("".join(out))
+    # Closer injection can recreate ``expr +)`` when a multi-line unclosed call
+    # ends on a trailing binop that only got ``na`` on a later pass, or when a
+    # residual ``+`` survived line-local close. Strip dangling ops before closers.
+    repaired = _strip_dangling_binop_before_closers(repaired)
     repaired = _collapse_na_only_control_expr_assignments(repaired)
     return _ensure_truncated_function_arrow(repaired)
 
@@ -1332,7 +1357,7 @@ _CTRL_HEAD_RE = re.compile(r"^(if|else if|else|for|while|switch)\b")
 def _collapse_na_only_control_expr_assignments(text: str) -> str:
     """Collapse ``lhs = for|while|if|switch …`` bodies that are only ``na`` / empty ctrls.
 
-    Truncated TV docs leave expression-for loops such as::
+    Truncated reference docs leave expression-for loops such as::
 
         string finalLabelText = for number in randomArray
             if number == 8
@@ -1832,7 +1857,7 @@ def sanitize_corpus_source(source: str) -> str:
     provenance, body_lines = _split_provenance(lines)
     body_text = "\n".join(body_lines)
 
-    # Candidate extractable Pine islands (fences, TV "Copied", shell heredocs).
+    # Candidate extractable Pine islands (fences, reference "Copied", shell heredocs).
     blocks: list[str] = []
     blocks.extend(_extract_fenced_blocks(lines))
     blocks.extend(_extract_tv_copied_blocks(lines))

@@ -17,7 +17,17 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Map collection evaluator for Pine Script v6."""
+"""Pine ``map.*`` builtins dispatching onto :class:`~.map.Map`.
+
+Creates maps, mutates entries, and exposes keys/values/size. Plain Python
+``dict`` values from compile/host bridges are wrapped in-place so mutations
+remain visible to the host.
+
+Mixin composition
+-----------------
+:class:`MapBuiltinsMixin` contributes ``_map_builtin_map`` into
+:class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +44,11 @@ TERNARY = 3
 
 
 class MapBuiltinsMixin(BuiltinDispatchMixin):
-    """Map collection built-in functions and methods."""
+    """``map.new`` / ``get`` / ``put`` / ``remove`` / … builtin handlers.
+
+    Validates operands as :class:`~.map.Map` (or wraps ``dict``) and forwards
+    to instance methods on the collection type.
+    """
 
     def _map_builtin_map(self) -> dict[str, BuiltinHandler]:
         """Build dispatch map for map operations."""
@@ -70,7 +84,7 @@ class MapBuiltinsMixin(BuiltinDispatchMixin):
         self._error(f"{message} (got {tname}, expected map)")
 
     def _coerce_optional_map(self, value: Any) -> Map[Any, Any] | None:
-        """Like ``_expect_map`` but ``na`` / non-map → ``None`` (TV soft-na)."""
+        """Like ``_expect_map`` but ``na`` / non-map → ``None`` (reference soft-na)."""
         if value is None:
             return None
         if isinstance(value, Map):
@@ -141,7 +155,7 @@ class MapBuiltinsMixin(BuiltinDispatchMixin):
     def _builtin_map_remove(self, args: list[Any]) -> Any:
         """map.remove(map, key) -> previous value or na
 
-        Removes key and returns the prior value (TV). Missing key / na map → na.
+        Removes key and returns the prior value (reference). Missing key / na map → na.
         """
         if len(args) < BINARY:
             self._error("map.remove requires map and key")
@@ -195,7 +209,7 @@ class MapBuiltinsMixin(BuiltinDispatchMixin):
         return map_obj.values()
 
     def _builtin_map_size(self, args: list[Any]) -> int | None:
-        """map.size(map) -> int; ``na`` map → ``na`` (TV soft-na)."""
+        """map.size(map) -> int; ``na`` map → ``na`` (reference soft-na)."""
         if len(args) < UNARY:
             self._error("map.size requires map")
         map_obj = self._coerce_optional_map(args[0])

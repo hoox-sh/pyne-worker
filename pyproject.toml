@@ -17,7 +17,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-pynescript = { path = "../../../pynescript", editable = true }
+pynescript = { path = "../pynescript", editable = true }
 
 [build-system]
 requires = ["hatchling"]
@@ -30,7 +30,7 @@ packages = ["src"]
 testpaths = ["tests"]
 pythonpath = [
     "src",
-    "../../../pynescript/src",
-    "../../../pynescript",
+    "../pynescript/src",
+    "../pynescript",
 ]
 asyncio_mode = "auto"

@@ -152,11 +152,74 @@ class PendingOrder:
     max_fill_per_bar: float = 0.0
     # entry vs reduce-only close intent
     is_entry: bool = True
+    # strategy.exit from_entry (compiler emits from_entry= on close; optional)
+    from_entry: str | None = None
+    # Trailing stop state (strategy.exit trail_*). Distances are price units.
+    trail_offset: float | None = None
+    trail_activation: float | None = None
+    trail_active: bool = False
 
     @property
     def remaining(self) -> float:
         """Unfilled quantity (never negative)."""
         return max(0.0, float(self.quantity) - float(self.filled_qty))
+
+    @property
+    def is_trail(self) -> bool:
+        """True when a positive trail offset is configured."""
+        return self.trail_offset is not None and self.trail_offset > 0
+
+
+@dataclass
+class OpenLeg:
+    """One open entry leg (minimal interpret ``OpenTrade`` subset).
+
+    Used for multi-leg pyramiding and ``strategy.exit(..., from_entry=...)``
+    targeting on the compile path. Also backs ``strategy.opentrades.*`` queries.
+
+    ``max_drawdown`` / ``max_runup`` are approximate max adverse / favorable
+    excursion (currency) while open, updated from bar high/low MTM.
+    """
+
+    entry_id: str
+    size: float
+    entry_price: float
+    direction: str  # long | short
+    commission: float = 0.0
+    entry_bar: int = 0
+    entry_time: int = 0
+    entry_comment: str = ""
+    max_drawdown: float = 0.0
+    max_runup: float = 0.0
+
+
+@dataclass
+class ClosedTradeRecord:
+    """Minimal closed-trade record for ``strategy.closedtrades.*`` queries.
+
+    One record per :meth:`CompileStrategyBroker._realize_close` call (aggregated
+    when multiple legs reduce in a single close). Not a full TV trade object.
+
+    Per-trade ``max_drawdown`` / ``max_runup`` are copied from the open leg's
+    MTM extremes (approximate OHLC path; not tick-accurate).
+    """
+
+    entry_id: str
+    size: float
+    entry_price: float
+    exit_price: float
+    profit: float
+    commission: float
+    direction: str  # long | short
+    entry_bar: int = 0
+    entry_time: int = 0
+    exit_bar: int = 0
+    exit_time: int = 0
+    exit_id: str = ""
+    entry_comment: str = ""
+    exit_comment: str = ""
+    max_drawdown: float = 0.0
+    max_runup: float = 0.0
 
 
 class CompileStrategyBroker:
@@ -181,18 +244,28 @@ class CompileStrategyBroker:
         pyramiding: int = 0,
         default_qty_type: str = "fixed",
         default_qty_value: float = 1.0,
+        avg_price_model: str = "stock",
+        leverage: float = 1.0,
     ) -> None:
         """Construct broker state for one compiled run.
 
         Parameters mirror Pine ``strategy()`` declaration kwargs when the
         visitor captures them into the generated ctor call.
 
-        Commission model (interpret parity, TV-closer): charge on **entry**
+        Commission model (interpret parity, closer to reference semantics): charge on **entry**
         (held as ``position_commission`` / openprofit drag) **and** on **exit**
         fills; both realize into netprofit on close.
 
         ``default_qty_type`` / ``default_qty_value`` mirror interpret when the
         visitor wires them into the ctor (percent_of_equity / cash / fixed).
+
+        ``avg_price_model`` (pynescript extension): ``stock`` | ``futures`` |
+        ``inverse``. Multi-leg open list supports ``from_entry`` exits.
+        ``stock`` reweights remaining-leg VWAP on partial close; ``futures`` /
+        ``inverse`` keep sticky net AEP until flat.
+
+        ``leverage`` (pynescript extension): buying-power multiplier for
+        percent_of_equity / cash default qty and margin locked in ``cash``.
         """
         self.initial_capital = float(initial_capital)
         self.commission_value = float(commission_value)
@@ -206,16 +279,36 @@ class CompileStrategyBroker:
             dqt = "percent_of_equity"
         self.default_qty_type: str = dqt
         self.default_qty_value: float = float(default_qty_value) if default_qty_value is not None else 1.0
+        # Soft-normalize avg model (keep in sync with interpret _norm_avg_price_model)
+        raw_apm = str(avg_price_model or "stock").replace("strategy.", "").replace("avg_price_", "").strip().lower()
+        if raw_apm in {"stock", "pine", "average", "avg", "lot", "fifo"}:
+            self.avg_price_model: str = "stock"
+        elif raw_apm in {"futures", "future", "perp", "perpetual", "net", "linear"}:
+            self.avg_price_model = "futures"
+        elif raw_apm in {"inverse", "coin", "coin_m", "harmonic"}:
+            self.avg_price_model = "inverse"
+        else:
+            self.avg_price_model = "stock"
+        try:
+            lev = float(leverage) if leverage is not None else 1.0
+        except (TypeError, ValueError):
+            lev = 1.0
+        if lev != lev or lev <= 0:  # NaN / non-positive
+            lev = 1.0
+        self.leverage: float = 1.0 if lev < 1.0 else lev
         self.position_size: float = 0.0  # signed: +long / -short
         self.position_avg_price: float = float("nan")
         self.position_entry_name: str = ""
-        # Count of open entry legs (market path pyramiding / replace parity).
+        # Open entry legs (pyramiding / from_entry). open_entry_count mirrors len.
+        self.open_legs: list[OpenLeg] = []
         self.open_entry_count: int = 0
         # Remaining entry commission on the open position (openprofit drag).
         # Exit commission is charged at close time and never sits on the open.
         self.position_commission: float = 0.0
         self.netprofit: float = 0.0
         self.closed_trades: int = 0
+        # Per-close records for strategy.closedtrades.*(i) queries.
+        self.closed_trade_records: list[ClosedTradeRecord] = []
         self.wintrades: int = 0
         self.losstrades: int = 0
         self.eventrades: int = 0
@@ -236,6 +329,22 @@ class CompileStrategyBroker:
         self._max_runup: float = 0.0
         self._max_drawdown_percent: float = 0.0
         self._max_runup_percent: float = 0.0
+        # strategy.risk.* subset (not full TV risk engine; interpret-aligned halt cascade)
+        self.allow_entry_in: str = "all"  # all | long | short
+        self.max_position_size_percent: float | None = None
+        self.max_drawdown_risk: float | None = None  # absolute equity drawdown cap
+        self.max_drawdown_risk_percent: float | None = None  # % of peak equity
+        self.max_cons_loss_days: int | None = None
+        # Intraday loss halt as % of initial capital (interpret stores; we enforce)
+        self.max_intraday_loss: float = float("inf")
+        # Cap filled orders per calendar-day bucket (entries + exits)
+        self.max_intraday_filled_orders: int | None = None
+        self.entries_blocked: bool = False  # risk halt (drawdown / cons loss / intraday)
+        self.consecutive_loss_days: int = 0
+        self._last_trade_day: int | None = None  # exit_time day bucket
+        self._day_pnl: float = 0.0
+        self._fills_day: int | None = None  # day bucket for fill counting
+        self._day_filled_orders: int = 0
 
     def begin_bar(
         self,
@@ -266,6 +375,7 @@ class CompileStrategyBroker:
         # after closes (netprofit). Flat → constant; skip peak/trough work.
         if self.position_size != 0.0:
             self._update_equity_extremes()
+            self._update_leg_extremes()
         if self.pending_orders:
             self._process_pending_ohlc(o, h, l, c)
 
@@ -290,6 +400,7 @@ class CompileStrategyBroker:
         self._mark = c
         if self.position_size != 0.0:
             self._update_equity_extremes()
+            self._update_leg_extremes()
 
     def process_pending_orders(
         self,
@@ -324,6 +435,9 @@ class CompileStrategyBroker:
                 self.pending_orders.pop(oid, None)
                 fully.append(oid)
                 continue
+            # Trail: ratchet stop from favorable extreme, then test fill
+            if order.is_trail:
+                self._update_trail_stop(order, h, l)
             fill_px = self._trigger_price(order, o, h, l, c)
             if fill_px is None:
                 continue
@@ -336,6 +450,40 @@ class CompileStrategyBroker:
             if order.remaining <= 1e-12:
                 fully.append(oid)
         return fully
+
+    def _update_trail_stop(self, order: PendingOrder, high: float, low: float) -> None:
+        """Ratchet a trailing stop from bar extremes once armed.
+
+        Long exit (sell stop, direction ``short``): after activation,
+        ``stop = high - offset``, only rising. Short exit (buy stop, direction
+        ``long``): ``stop = low + offset``, only falling. Fixed ``stop_price``
+        set at placement acts as a floor/ceiling that the trail may improve
+        but not worsen beyond on first arm.
+        """
+        if not order.is_trail:
+            return
+        offset = float(order.trail_offset or 0.0)
+        if offset <= 0:
+            return
+        action = order.direction  # short closes long; long covers short
+        act = order.trail_activation
+        if not order.trail_active:
+            if act is None:
+                order.trail_active = True
+            elif action == "short" and high >= float(act):
+                order.trail_active = True
+            elif action == "long" and low <= float(act):
+                order.trail_active = True
+            else:
+                return
+        if action == "short":
+            candidate = float(high) - offset
+            if order.stop_price is None or candidate > float(order.stop_price):
+                order.stop_price = candidate
+        elif action == "long":
+            candidate = float(low) + offset
+            if order.stop_price is None or candidate < float(order.stop_price):
+                order.stop_price = candidate
 
     def _trigger_price(
         self,
@@ -385,13 +533,26 @@ class CompileStrategyBroker:
         order.filled_qty += fill_qty
         d = order.direction
         px = self._slip(float(fill_price), d)
-        # Closing opposite / reducing
+        fe = order.from_entry
+        # Closing opposite / reducing — honor from_entry when set (exit brackets)
         if not order.is_entry:
             # Force close in this direction (sell covers long, buy covers short)
             if d == "short" and self.position_size > 0:
-                self.close(id=order.order_id, qty=fill_qty, price=px, comment=order.comment)
+                self.close(
+                    id=order.order_id,
+                    qty=fill_qty,
+                    price=px,
+                    comment=order.comment,
+                    from_entry=fe,
+                )
             elif d == "long" and self.position_size < 0:
-                self.close(id=order.order_id, qty=fill_qty, price=px, comment=order.comment)
+                self.close(
+                    id=order.order_id,
+                    qty=fill_qty,
+                    price=px,
+                    comment=order.comment,
+                    from_entry=fe,
+                )
             else:
                 self._open_or_add(d, fill_qty, px, order.order_id, order.comment)
         else:
@@ -429,6 +590,87 @@ class CompileStrategyBroker:
                     self.pending_orders.pop(oid, None)
                     self._emit("cancel", id=oid, oca_name=name, comment="oca_reduce")
 
+    def _entry_open_size(self, from_entry: str | None) -> float:
+        """Open size for ``from_entry`` legs, or whole position when unset."""
+        if not from_entry:
+            return abs(float(self.position_size))
+        if not self.open_legs:
+            # Single-lot fallback: match last entry name or accept when unnamed.
+            if abs(self.position_size) <= 0:
+                return 0.0
+            if not self.position_entry_name or self.position_entry_name == from_entry:
+                return abs(float(self.position_size))
+            return 0.0
+        return float(sum(leg.size for leg in self.open_legs if leg.entry_id == from_entry))
+
+    def _new_leg(
+        self,
+        entry_id: str,
+        size: float,
+        entry_price: float,
+        direction: str,
+        commission: float = 0.0,
+        *,
+        entry_bar: int | None = None,
+        entry_time: int | None = None,
+        entry_comment: str = "",
+        max_drawdown: float = 0.0,
+        max_runup: float = 0.0,
+    ) -> OpenLeg:
+        """Build an :class:`OpenLeg` stamped with current bar context."""
+        return OpenLeg(
+            entry_id=str(entry_id),
+            size=float(size),
+            entry_price=float(entry_price),
+            direction=direction,
+            commission=float(commission),
+            entry_bar=int(self._bar_index if entry_bar is None else entry_bar),
+            entry_time=int(self._bar_time if entry_time is None else entry_time),
+            entry_comment=str(entry_comment or ""),
+            max_drawdown=float(max_drawdown),
+            max_runup=float(max_runup),
+        )
+
+    @staticmethod
+    def _day_bucket(ts: int) -> int:
+        """Calendar-day bucket from bar/exit time (ms, s, or raw)."""
+        t = int(ts)
+        if t > 10_000_000_000:  # ms epoch
+            return t // 86_400_000
+        if t > 10_000_000:  # seconds epoch
+            return t // 86_400
+        return t
+
+    def _roll_fill_day(self) -> None:
+        """Reset intraday fill counter when the bar-time day bucket changes."""
+        day = self._day_bucket(self._bar_time)
+        if self._fills_day is None or day != self._fills_day:
+            self._fills_day = day
+            self._day_filled_orders = 0
+
+    def _note_filled_order(self) -> None:
+        """Count one filled order toward max_intraday_filled_orders."""
+        self._roll_fill_day()
+        self._day_filled_orders += 1
+
+    def _ensure_legs(self) -> None:
+        """Materialise a single synthetic leg when size is open but list empty."""
+        if self.open_legs or abs(self.position_size) <= 0:
+            return
+        d = "long" if self.position_size > 0 else "short"
+        self.open_legs = [
+            self._new_leg(
+                entry_id=str(self.position_entry_name or ""),
+                size=abs(float(self.position_size)),
+                entry_price=float(self.position_avg_price)
+                if self.position_avg_price == self.position_avg_price
+                else 0.0,
+                direction=d,
+                commission=float(self.position_commission or 0.0),
+            )
+        ]
+        self.open_entry_count = 1
+
     def _open_or_add(
         self,
         direction: str,
@@ -459,12 +701,14 @@ class CompileStrategyBroker:
         q = abs(float(qty))
         if q <= 0 or not math.isfinite(q):
             return False
+        eid = str(entry_id)
         # Reverse if opposite — emit close only (interpret parity; no close_all).
         if (d == "long" and self.position_size < 0) or (d == "short" and self.position_size > 0):
-            self.close(id=str(entry_id), qty=abs(self.position_size), comment="reverse", price=px)
+            self.close(id=eid, qty=abs(self.position_size), comment="reverse", price=px)
         same_dir = (self.position_size > 0 and d == "long") or (self.position_size < 0 and d == "short")
         if same_dir and abs(self.position_size) > 0:
-            same_id = self.position_entry_name == str(entry_id)
+            self._ensure_legs()
+            same_id = self.position_entry_name == eid or any(leg.entry_id == eid for leg in self.open_legs)
             if respect_pyramiding and replace_same_id and same_id:
                 # Interpret oracle: same-id re-entry overwrites without realizing PnL.
                 pass  # fall through to flat open below
@@ -478,26 +722,83 @@ class CompileStrategyBroker:
                 self.position_avg_price = (self.position_avg_price * old + px * q) / (old + q)
                 self.position_size += signed
                 self.position_commission += comm
-                self.position_entry_name = str(entry_id)
-                self.open_entry_count += 1
-                self._emit("entry", id=str(entry_id), direction=d, qty=q, comment=comment)
+                self.position_entry_name = eid
+                cmt = str(comment) if comment else ""
+                self.open_legs.append(
+                    self._new_leg(
+                        entry_id=eid,
+                        size=q,
+                        entry_price=px,
+                        direction=d,
+                        commission=comm,
+                        entry_comment=cmt,
+                    )
+                )
+                self.open_entry_count = len(self.open_legs)
+                self._note_filled_order()
+                self._update_leg_extremes()
+                self._emit("entry", id=eid, direction=d, qty=q, comment=comment)
                 return True
             elif not (respect_pyramiding and replace_same_id and same_id):
                 # Average-add (pending order fills / non-replace path).
-                # F2: pyramiding<=0 → single leg + VWAP; pyramiding>0 leaves
-                # open_entry_count unchanged (max(1, …)) — no silent multi-leg.
+                # F2: pyramiding<=0 → single leg + VWAP; pyramiding>0 appends a
+                # leg when under cap (interpret open_trades parity).
+                if self.pyramiding > 0 and len(self.open_legs) >= int(self.pyramiding) + 1:
+                    return False  # at open-leg cap
                 comm = self._commission(q, px)
                 signed = q if d == "long" else -q
                 old = abs(self.position_size)
                 self.position_avg_price = (self.position_avg_price * old + px * q) / (old + q)
                 self.position_size += signed
                 self.position_commission += comm
-                self.position_entry_name = str(entry_id)
-                # Always one logical entry for pending averages when pyramiding
-                # is off; when on, still do not invent extra legs without market
-                # respect_pyramiding (compile pending has no open-trade list).
-                self.open_entry_count = 1 if self.pyramiding <= 0 else max(1, self.open_entry_count)
-                self._emit("entry", id=str(entry_id), direction=d, qty=q, comment=comment)
+                self.position_entry_name = eid
+                cmt = str(comment) if comment else ""
+                if self.pyramiding <= 0:
+                    # Merge into one leg (VWAP), keep first entry_id when present
+                    if self.open_legs:
+                        first = self.open_legs[0]
+                        total_comm = float(sum(leg.commission for leg in self.open_legs)) + comm
+                        self.open_legs = [
+                            self._new_leg(
+                                entry_id=first.entry_id,
+                                size=old + q,
+                                entry_price=float(self.position_avg_price),
+                                direction=d,
+                                commission=total_comm,
+                                entry_bar=first.entry_bar,
+                                entry_time=first.entry_time,
+                                entry_comment=first.entry_comment or cmt,
+                                max_drawdown=float(first.max_drawdown),
+                                max_runup=float(first.max_runup),
+                            )
+                        ]
+                    else:
+                        self.open_legs = [
+                            self._new_leg(
+                                entry_id=eid,
+                                size=q,
+                                entry_price=px,
+                                direction=d,
+                                commission=comm,
+                                entry_comment=cmt,
+                            )
+                        ]
+                    self.open_entry_count = 1
+                else:
+                    self.open_legs.append(
+                        self._new_leg(
+                            entry_id=eid,
+                            size=q,
+                            entry_price=px,
+                            direction=d,
+                            commission=comm,
+                            entry_comment=cmt,
+                        )
+                    )
+                    self.open_entry_count = len(self.open_legs)
+                self._note_filled_order()
+                self._update_leg_extremes()
+                self._emit("entry", id=eid, direction=d, qty=q, comment=comment)
                 return True
         # Flat open, reverse re-entry, or same-id replace overwrite
         comm = self._commission(q, px)
@@ -505,9 +806,22 @@ class CompileStrategyBroker:
         self.position_size = signed
         self.position_avg_price = px
         self.position_commission = comm
-        self.position_entry_name = str(entry_id)
+        self.position_entry_name = eid
+        cmt = str(comment) if comment else ""
+        self.open_legs = [
+            self._new_leg(
+                entry_id=eid,
+                size=q,
+                entry_price=px,
+                direction=d,
+                commission=comm,
+                entry_comment=cmt,
+            )
+        ]
         self.open_entry_count = 1
-        self._emit("entry", id=str(entry_id), direction=d, qty=q, comment=comment)
+        self._note_filled_order()
+        self._update_leg_extremes()
+        self._emit("entry", id=eid, direction=d, qty=q, comment=comment)
         return True
 
     def _slip(self, price: float, direction: str) -> float:
@@ -549,20 +863,22 @@ class CompileStrategyBroker:
         """Resolve entry size from ``default_qty_type`` / ``default_qty_value``.
 
         Mirrors interpret ``_resolve_default_entry_qty``:
-        - ``fixed``: contracts = default_qty_value (default 1)
-        - ``percent_of_equity``: equity * (pct/100) / price
-        - ``cash``: cash_amount / price
+        - ``fixed``: contracts = default_qty_value (default 1); leverage ignored
+        - ``percent_of_equity``: margin = equity * (pct/100); qty = margin * leverage / price
+        - ``cash``: margin = cash_amount; qty = margin * leverage / price
         """
         dqt = (self.default_qty_type or "fixed").replace("strategy.", "").lower()
         val = float(self.default_qty_value or 0.0)
         price = float(fill_price) if fill_price and fill_price > 0 else float(self._mark or 1.0)
         if price <= 0 or price != price:
             price = 1.0
+        lev = float(self.leverage) if self.leverage and self.leverage > 0 else 1.0
         if dqt in {"percent_of_equity", "percent", "percentage"}:
             equity = float(self.equity)
-            return max(0.0, (equity * (val / 100.0)) / price)
+            margin = equity * (val / 100.0)
+            return max(0.0, (margin * lev) / price)
         if dqt == "cash":
-            return max(0.0, val / price)
+            return max(0.0, (val * lev) / price)
         return max(0.0, val if val > 0 else 1.0)
 
     def _exit_fill_price(
@@ -573,34 +889,44 @@ class CompileStrategyBroker:
         is_long: bool,
         is_short: bool,
     ) -> float | None:
-        """Interpret-oracle exit fill when ``strategy.exit`` stop/limit present.
+        """Exit fill price when bar OHLC touches stop/limit (pending OHLC semantics).
 
-        Matches ``StrategyBuiltinsMixin._handle_strategy_exit``: when both legs
-        are set and mark is between them, still picks a leg price (legacy
-        fixture semantics). Returns ``None`` only when flat with no usable
-        price (caller emits zero-qty exit).
+        Matches interpret ``_handle_strategy_exit`` + ``process_pending_orders``:
+        returns a fill price only when high/low of the current bar reaches the
+        level. When mark sits *between* stop and limit, returns ``None`` so the
+        caller can place a pending order instead of filling immediately.
         """
         limit_p = _opt_float(limit)
         stop_p = _opt_float(stop)
         if limit_p is None and stop_p is None:
             return None
-        current_p = float(self._mark)
-        if limit_p is not None and stop_p is not None:
-            if is_long:
-                if current_p <= stop_p:
-                    return float(stop_p)
-                if current_p >= limit_p:
-                    return float(limit_p)
-                return float(min(limit_p, stop_p) if limit_p < stop_p else limit_p)
-            if is_short:
-                if current_p >= stop_p:
-                    return float(stop_p)
-                if current_p <= limit_p:
-                    return float(limit_p)
-                return float(max(limit_p, stop_p) if limit_p > stop_p else limit_p)
-            # Flat — prefer limit for event bookkeeping
-            return float(limit_p if limit_p is not None else stop_p)
-        return float(limit_p if limit_p is not None else stop_p)  # type: ignore[arg-type]
+        hi = float(self._high)
+        lo = float(self._low)
+        op = float(self._open)
+        # Prefer OHLC path (same as interpret pending fills)
+        if is_long:
+            # Close long: sell limit (TP) when high >= lim; sell stop when low <= stop
+            hit_lim = limit_p is not None and hi >= limit_p
+            hit_stop = stop_p is not None and lo <= stop_p
+            if hit_lim and hit_stop:
+                # Both touched: prefer stop (worse for long) — conservative
+                return float(stop_p)  # type: ignore[arg-type]
+            if hit_lim:
+                return float(limit_p) if op > limit_p else float(limit_p)  # type: ignore[arg-type]
+            if hit_stop:
+                return float(stop_p) if op < stop_p else float(stop_p)  # type: ignore[arg-type]
+            return None
+        if is_short:
+            hit_lim = limit_p is not None and lo <= limit_p
+            hit_stop = stop_p is not None and hi >= stop_p
+            if hit_lim and hit_stop:
+                return float(stop_p)  # type: ignore[arg-type]
+            if hit_lim:
+                return float(limit_p)  # type: ignore[arg-type]
+            if hit_stop:
+                return float(stop_p)  # type: ignore[arg-type]
+            return None
+        return None
 
     def _emit(
         self,
@@ -643,6 +969,185 @@ class CompileStrategyBroker:
             return "limit"
         return "market"
 
+    def risk_allow_entry_in(self, value: Any = "all", **_kwargs: Any) -> None:
+        """``strategy.risk.allow_entry_in(value)`` — ``all`` | ``long`` | ``short``."""
+        raw = value if value is not None else _kwargs.get("value", "all")
+        s = str(raw).replace("strategy.", "").strip().lower()
+        if s in {"long", "short", "all"}:
+            self.allow_entry_in = s
+        else:
+            self.allow_entry_in = "all"
+
+    def risk_max_position_size(self, percent: Any = None, **_kwargs: Any) -> None:
+        """``strategy.risk.max_position_size(percent)`` — cap entry notional vs equity."""
+        raw = percent if percent is not None else _kwargs.get("percent", _kwargs.get("value"))
+        if raw is None or _is_na(raw):
+            return
+        try:
+            p = float(raw)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(p) or p <= 0:
+            return
+        self.max_position_size_percent = p
+
+    def risk_max_drawdown(self, value: Any = None, type: Any = "absolute", **_kwargs: Any) -> None:
+        """``strategy.risk.max_drawdown(value, type)`` — absolute or % of peak.
+
+        When *type* is percent (``percent`` / ``percent_of_equity`` / ``%``),
+        store as percent-of-peak; otherwise absolute currency units.
+        """
+        raw = value if value is not None else _kwargs.get("value")
+        if raw is None or _is_na(raw):
+            return
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(v) or v < 0:
+            return
+        risk_type = type if type is not None else _kwargs.get("type", "absolute")
+        rt = str(risk_type).replace("strategy.", "").strip().lower()
+        if rt in {"percent", "percentage", "percent_of_equity", "%"}:
+            self.max_drawdown_risk_percent = v
+        else:
+            self.max_drawdown_risk = v
+
+    def risk_max_cons_loss_days(self, days: Any = None, **_kwargs: Any) -> None:
+        """``strategy.risk.max_cons_loss_days(days)`` — halt after N loss days."""
+        raw = days if days is not None else _kwargs.get("days", _kwargs.get("value"))
+        if raw is None or _is_na(raw):
+            return
+        try:
+            d = int(raw)
+        except (TypeError, ValueError):
+            return
+        if d < 0:
+            return
+        self.max_cons_loss_days = d
+
+    def risk_max_intraday_loss(self, percent: Any = None, **_kwargs: Any) -> None:
+        """``strategy.risk.max_intraday_loss(percent)`` — halt on day loss % of capital.
+
+        Interpret stores the limit; compile also enforces via day PnL tracking
+        shared with :meth:`note_closed_trade_day`.
+        """
+        raw = percent if percent is not None else _kwargs.get("percent", _kwargs.get("value"))
+        if raw is None or _is_na(raw):
+            return
+        try:
+            p = float(raw)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(p) or p < 0:
+            return
+        self.max_intraday_loss = p
+
+    def risk_max_intraday_filled_orders(self, max_orders: Any = None, **_kwargs: Any) -> None:
+        """``strategy.risk.max_intraday_filled_orders(max)`` — cap fills per day.
+
+        Counts successful entry and exit fills in the current bar-time day
+        bucket. Further entries are blocked (``risk_blocked``) once the cap is
+        hit; the counter resets when the day bucket rolls.
+        """
+        raw = max_orders if max_orders is not None else _kwargs.get(
+            "max_orders", _kwargs.get("value", _kwargs.get("max"))
+        )
+        if raw is None or _is_na(raw):
+            return
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return
+        if n < 0:
+            return
+        self.max_intraday_filled_orders = n
+
+    def note_closed_trade_day(self, exit_time: int, profit: float) -> None:
+        """Track consecutive calendar-day losses for risk.max_cons_loss_days.
+
+        Day bucket = floor(exit_time / 86_400_000) when time looks like ms,
+        else floor(exit_time / 86_400) for seconds, else bar-time as-is.
+        Mirrors interpret ``StrategyState.note_closed_trade_day``.
+        """
+        day = self._day_bucket(int(exit_time))
+        if self._last_trade_day is None or day != self._last_trade_day:
+            if self._last_trade_day is not None:
+                if self._day_pnl < 0:
+                    self.consecutive_loss_days += 1
+                elif self._day_pnl > 0:
+                    self.consecutive_loss_days = 0
+            self._last_trade_day = day
+            self._day_pnl = 0.0
+        self._day_pnl += float(profit)
+        if self.max_cons_loss_days is not None and self.consecutive_loss_days >= int(self.max_cons_loss_days):
+            self.entries_blocked = True
+        # Intraday loss: day's realized loss as % of initial capital
+        if (
+            math.isfinite(self.max_intraday_loss)
+            and self.max_intraday_loss < float("inf")
+            and self.initial_capital > 0
+            and self._day_pnl < 0
+        ):
+            loss_pct = 100.0 * (-self._day_pnl) / float(self.initial_capital)
+            if loss_pct >= float(self.max_intraday_loss):
+                self.entries_blocked = True
+
+    def _risk_allows_entry(self, direction: str) -> bool:
+        """Interpret-aligned risk gates before opening an entry.
+
+        Checks: allow_entry_in, entries_blocked, max_drawdown (abs/%),
+        max_cons_loss_days, max_intraday_loss, max_intraday_filled_orders.
+        Sets ``entries_blocked`` when a permanent halt limit is hit (further
+        entries comment ``risk_blocked``). Filled-order cap is day-scoped.
+        """
+        allow = (self.allow_entry_in or "all").lower().replace("strategy.", "")
+        if allow in {"long"} and direction != "long":
+            return False
+        if allow in {"short"} and direction != "short":
+            return False
+        if self.entries_blocked:
+            return False
+        # Drawdown caps (series extremes already updated on bars / closes)
+        if self.max_drawdown_risk is not None and self._max_drawdown >= float(self.max_drawdown_risk):
+            self.entries_blocked = True
+            return False
+        if self.max_drawdown_risk_percent is not None and self._max_drawdown_percent >= float(
+            self.max_drawdown_risk_percent
+        ):
+            self.entries_blocked = True
+            return False
+        if self.max_cons_loss_days is not None and self.consecutive_loss_days >= int(self.max_cons_loss_days):
+            self.entries_blocked = True
+            return False
+        if (
+            math.isfinite(self.max_intraday_loss)
+            and self.max_intraday_loss < float("inf")
+            and self.initial_capital > 0
+            and self._day_pnl < 0
+        ):
+            loss_pct = 100.0 * (-self._day_pnl) / float(self.initial_capital)
+            if loss_pct >= float(self.max_intraday_loss):
+                self.entries_blocked = True
+                return False
+        # Day-scoped fill cap (resets when bar-time day bucket rolls)
+        if self.max_intraday_filled_orders is not None:
+            self._roll_fill_day()
+            if self._day_filled_orders >= int(self.max_intraday_filled_orders):
+                return False
+        return True
+
+    def _cap_qty_by_max_position(self, qty: float, fill_price: float) -> float:
+        """Apply ``max_position_size_percent`` of equity at *fill_price*."""
+        pct = self.max_position_size_percent
+        if pct is None or pct <= 0 or fill_price <= 0 or fill_price != fill_price:
+            return qty
+        equity = float(self.equity)
+        max_qty = (equity * (pct / 100.0)) / float(fill_price)
+        if max_qty < 0 or not math.isfinite(max_qty):
+            return 0.0
+        return min(float(qty), float(max_qty))
+
     def entry(
         self,
         id: str = "entry",
@@ -670,6 +1175,16 @@ class CompileStrategyBroker:
                 comment="invalid_direction",
             )
             return
+        if not self._risk_allows_entry(d):
+            self._emit(
+                "order",
+                id=str(id),
+                direction=d,
+                qty=0.0,
+                order_type="market",
+                comment="risk_blocked",
+            )
+            return
         status, parsed_q = _parse_qty(qty)
         if status == "invalid":
             self._emit(
@@ -687,6 +1202,7 @@ class CompileStrategyBroker:
         else:
             px_hint = float(price)
         q = self._resolve_default_qty(px_hint) if status == "missing" else abs(parsed_q)
+        q = self._cap_qty_by_max_position(q, px_hint if px_hint and px_hint > 0 else 1.0)
         if q <= 0:
             self._emit(
                 "order",
@@ -741,6 +1257,29 @@ class CompileStrategyBroker:
             d, q, px, str(id), comment, respect_pyramiding=True, replace_same_id=True
         )
 
+    def _resolve_trail_params(
+        self,
+        trail_price: float | None,
+        trail_points: float | None,
+        trail_offset: float | None,
+    ) -> tuple[float | None, float | None]:
+        """Parse trail_* kwargs → (activation_price, offset_price units).
+
+        Distances are in **ticks** (× :attr:`mintick`) per Pine. Prefer
+        ``trail_points`` when both offset and points are set. Returns
+        ``(None, None)`` when trail is not configured or offset is na/≤0.
+        """
+        act = _opt_float(trail_price)
+        points = _opt_float(trail_points)
+        offset = _opt_float(trail_offset)
+        ticks = points if points is not None else offset
+        if ticks is None or ticks <= 0:
+            return (None, None)
+        offset_price = float(ticks) * float(self.mintick)
+        if offset_price <= 0:
+            return (None, None)
+        return (act, offset_price)
+
     def close(
         self,
         id: str | None = None,
@@ -751,6 +1290,10 @@ class CompileStrategyBroker:
         stop: float | None = None,
         profit: float | None = None,
         loss: float | None = None,
+        qty_percent: float | None = None,
+        trail_price: float | None = None,
+        trail_points: float | None = None,
+        trail_offset: float | None = None,
         **_kwargs: Any,
     ) -> None:
         """Close (part of) the open position at mark or *price*; update PnL.
@@ -758,12 +1301,41 @@ class CompileStrategyBroker:
         When ``stop`` / ``limit`` (or ``loss`` / ``profit``) are provided the
         compiler has mapped ``strategy.exit`` → ``close``. Match the interpret
         oracle: pick an exit fill price from those legs and emit ``kind=exit``.
+
+        ``qty_percent`` (when set and not na) sizes as ``target * pct/100``
+        capped to the open target (whole lot or ``from_entry`` size); wins over
+        absolute ``qty``.
+
+        Trail (``trail_offset`` / ``trail_points`` ticks × mintick, optional
+        ``trail_price`` activation) places a pending stop that ratchets with
+        bar high/low in :meth:`process_pending_orders` (interpret-aligned
+        minimal trail).
+
+        ``from_entry`` (explicit kwarg from compiler, or for stop/limit exit
+        brackets ``id`` when used as the entry filter) reduces only matching
+        open legs. Unknown ``from_entry`` is a soft no-op after the
+        placement/close event.
         """
-        # Compiler maps strategy.exit → close(..., stop=..., limit=...).
+        # Compiler maps strategy.exit → close(..., from_entry=..., stop/limit/trail).
+        # Prefer explicit from_entry; fall back to id only for exit brackets so
+        # direct broker tests that pass id= keep working.
         limit_p = _opt_float(limit if limit is not None else profit)
         stop_p = _opt_float(stop if stop is not None else loss)
-        is_exit = limit_p is not None or stop_p is not None
+        trail_activation, trail_offset_px = self._resolve_trail_params(
+            trail_price if trail_price is not None else _kwargs.get("trail_price"),
+            trail_points if trail_points is not None else _kwargs.get("trail_points"),
+            trail_offset if trail_offset is not None else _kwargs.get("trail_offset"),
+        )
+        has_trail = trail_offset_px is not None
+        is_exit = limit_p is not None or stop_p is not None or has_trail
         event_kind = "exit" if is_exit else "close"
+        event_stop = stop_p if stop_p is not None else (trail_activation if has_trail else None)
+        raw_fe = _kwargs.get("from_entry")
+        from_entry: str | None = None
+        if raw_fe is not None and str(raw_fe) != "":
+            from_entry = str(raw_fe)
+        elif is_exit and id is not None and str(id) != "":
+            from_entry = str(id)
 
         if self.position_size == 0:
             self._emit(
@@ -772,10 +1344,34 @@ class CompileStrategyBroker:
                 qty=0.0,
                 comment=comment,
                 limit=limit_p,
-                stop=stop_p,
+                stop=event_stop,
             )
             return
-        if qty is not None and not _is_na(qty):
+
+        target_size = self._entry_open_size(from_entry)
+        # Soft no-op when from_entry matches no open leg.
+        if from_entry is not None and target_size <= 0:
+            self._emit(
+                event_kind,
+                id=id,
+                qty=0.0,
+                comment=comment,
+                limit=limit_p,
+                stop=event_stop,
+            )
+            return
+
+        d = "long" if self.position_size > 0 else "short"
+        # qty_percent wins over qty when both provided (interpret parity).
+        pct = _opt_float(qty_percent if qty_percent is not None else _kwargs.get("qty_percent"))
+        if pct is not None:
+            if pct <= 0:
+                close_qty = 0.0
+            else:
+                close_qty = float(target_size) * (min(float(pct), 100.0) / 100.0)
+        elif qty is None or _is_na(qty):
+            close_qty = float(target_size)
+        else:
             status, parsed = _parse_qty(qty)
             if status == "invalid":
                 self._emit(
@@ -787,9 +1383,39 @@ class CompileStrategyBroker:
                     comment="invalid_qty",
                 )
                 return
-        d = "long" if self.position_size > 0 else "short"
+            close_qty = (
+                float(target_size) if status == "missing" else min(abs(float(parsed)), float(target_size))
+            )
+        if close_qty <= 0 or not math.isfinite(close_qty):
+            return
+
         if is_exit:
-            # Interpret: no extra slip on stop/limit exit prices.
+            # Always emit exit event (placement / intent) for host parity.
+            self._emit(
+                "exit",
+                id=id,
+                qty=close_qty,
+                comment=comment,
+                direction=None,
+                limit=limit_p,
+                stop=event_stop,
+            )
+            # Trail always goes through pending + process (ratchet needs bar path).
+            # Fixed stop/limit: fill same-bar when OHLC already touches, else pending.
+            if has_trail:
+                self._place_exit_pending(
+                    base=str(id) if id is not None else "exit",
+                    exit_dir="short" if d == "long" else "long",
+                    close_qty=close_qty,
+                    limit_p=limit_p,
+                    stop_p=stop_p,
+                    comment=comment,
+                    from_entry=from_entry,
+                    trail_offset_px=trail_offset_px,
+                    trail_activation=trail_activation,
+                )
+                self.process_pending_orders()
+                return
             px = self._exit_fill_price(
                 limit=limit_p,
                 stop=stop_p,
@@ -797,34 +1423,254 @@ class CompileStrategyBroker:
                 is_short=(d == "short"),
             )
             if px is None:
-                px = self._mark
+                self._place_exit_pending(
+                    base=str(id) if id is not None else "exit",
+                    exit_dir="short" if d == "long" else "long",
+                    close_qty=close_qty,
+                    limit_p=limit_p,
+                    stop_p=stop_p,
+                    comment=comment,
+                    from_entry=from_entry,
+                    trail_offset_px=None,
+                    trail_activation=None,
+                )
+                return
+            # Same-bar fill at touched level — fall through to realize PnL
         elif price is None or _is_na(price):
             # Exit slip: long close sells (worse), short cover buys (worse).
             px = self._slip(self._mark, "short" if d == "long" else "long")
         else:
             px = float(price)
-        pos_before = abs(self.position_size)
-        if qty is None or _is_na(qty):
-            close_qty = pos_before
+
+        self._realize_close(
+            close_qty,
+            float(px),
+            from_entry=from_entry,
+            exit_id=str(id) if id is not None else "",
+            exit_comment=str(comment) if comment else "",
+        )
+        # Market close keeps direction; stop/limit exit already emitted above.
+        if not is_exit:
+            self._emit(
+                event_kind,
+                id=id,
+                qty=close_qty,
+                comment=comment,
+                direction=d,
+                limit=limit_p,
+                stop=stop_p,
+            )
+
+    def _place_exit_pending(
+        self,
+        *,
+        base: str,
+        exit_dir: str,
+        close_qty: float,
+        limit_p: float | None,
+        stop_p: float | None,
+        comment: str | None,
+        from_entry: str | None,
+        trail_offset_px: float | None,
+        trail_activation: float | None,
+    ) -> None:
+        """Install pending close leg(s) for strategy.exit brackets / trail."""
+        for oid in list(self.pending_orders.keys()):
+            if oid == base or oid.startswith(base + ":"):
+                del self.pending_orders[oid]
+        cmt = str(comment) if comment else ""
+        has_trail = trail_offset_px is not None and trail_offset_px > 0
+        trail_kw: dict[str, Any] = {}
+        if has_trail:
+            trail_kw = {
+                "trail_offset": float(trail_offset_px),
+                "trail_activation": trail_activation,
+                "trail_active": trail_activation is None,
+            }
+
+        if limit_p is not None and (stop_p is not None or has_trail):
+            self.pending_orders[f"{base}:limit"] = PendingOrder(
+                order_id=f"{base}:limit",
+                order_type="limit",
+                direction=exit_dir,
+                quantity=close_qty,
+                limit_price=limit_p,
+                stop_price=None,
+                comment=cmt,
+                oca_name=base,
+                oca_type="cancel",
+                is_entry=False,
+                from_entry=from_entry,
+            )
+            # limit+stop → :stop; limit+trail-only → :trail (interpret parity)
+            stop_id = f"{base}:stop" if stop_p is not None else f"{base}:trail"
+            self.pending_orders[stop_id] = PendingOrder(
+                order_id=stop_id,
+                order_type="stop",
+                direction=exit_dir,
+                quantity=close_qty,
+                limit_price=None,
+                stop_price=stop_p,
+                comment=cmt,
+                oca_name=base,
+                oca_type="cancel",
+                is_entry=False,
+                from_entry=from_entry,
+                **trail_kw,
+            )
+        elif limit_p is not None:
+            self.pending_orders[base] = PendingOrder(
+                order_id=base,
+                order_type="limit",
+                direction=exit_dir,
+                quantity=close_qty,
+                limit_price=limit_p,
+                stop_price=None,
+                comment=cmt,
+                is_entry=False,
+                from_entry=from_entry,
+            )
+        elif has_trail:
+            self.pending_orders[base] = PendingOrder(
+                order_id=base,
+                order_type="stop",
+                direction=exit_dir,
+                quantity=close_qty,
+                limit_price=None,
+                stop_price=stop_p,
+                comment=cmt,
+                is_entry=False,
+                from_entry=from_entry,
+                **trail_kw,
+            )
         else:
-            close_qty = min(abs(float(qty)), pos_before)
-        if close_qty <= 0 or not math.isfinite(close_qty):
+            self.pending_orders[base] = PendingOrder(
+                order_id=base,
+                order_type="stop",
+                direction=exit_dir,
+                quantity=close_qty,
+                limit_price=None,
+                stop_price=stop_p,
+                comment=cmt,
+                is_entry=False,
+                from_entry=from_entry,
+            )
+
+    def _realize_close(
+        self,
+        close_qty: float,
+        px: float,
+        *,
+        from_entry: str | None = None,
+        exit_id: str = "",
+        exit_comment: str = "",
+    ) -> None:
+        """Reduce open legs (optional ``from_entry`` filter) and realize PnL."""
+        self._ensure_legs()
+        fe = str(from_entry) if from_entry else None
+        if fe is not None and not any(leg.entry_id == fe for leg in self.open_legs):
             return
-        if d == "long":
-            trade_profit = (px - self.position_avg_price) * close_qty
-            self.position_size -= close_qty
-        else:
-            trade_profit = (self.position_avg_price - px) * close_qty
-            self.position_size += close_qty
-        # Realize proportional *entry* commission + charge *exit* commission.
-        entry_comm = 0.0
-        if pos_before > 0 and self.position_commission:
-            entry_comm = float(self.position_commission) * (close_qty / pos_before)
-            self.position_commission = max(0.0, float(self.position_commission) - entry_comm)
-        exit_comm = self._commission(close_qty, px)
-        trade_profit -= entry_comm + exit_comm
+
+        model = self.avg_price_model or "stock"
+        use_sticky = model in {"futures", "inverse"}
+        sticky_avg = float(self.position_avg_price) if self.position_avg_price == self.position_avg_price else 0.0
+
+        eligible = (
+            [leg for leg in self.open_legs if leg.entry_id == fe] if fe is not None else list(self.open_legs)
+        )
+        total_close = min(float(close_qty), float(sum(leg.size for leg in eligible)))
+        if total_close <= 0:
+            return
+        exit_comm_total = self._commission(total_close, px)
+        remaining = total_close
+        trade_profit = 0.0
+        trade_comm = 0.0
+        trade_entry_notional = 0.0  # size-weighted entry for record
+        trade_entry_bar = self._bar_index
+        trade_entry_time = self._bar_time
+        trade_entry_id = ""
+        trade_entry_comment = ""
+        trade_max_dd = 0.0
+        trade_max_ru = 0.0
+        trade_dir = "long"
+        new_legs: list[OpenLeg] = []
+        closed_any = False
+
+        for leg in self.open_legs:
+            if fe is not None and leg.entry_id != fe:
+                new_legs.append(leg)
+                continue
+            if remaining <= 1e-12:
+                new_legs.append(leg)
+                continue
+            cq = min(float(leg.size), remaining)
+            entry_comm = float(leg.commission) * (cq / leg.size) if leg.size else 0.0
+            exit_comm = exit_comm_total * (cq / total_close) if total_close > 0 else 0.0
+            basis = sticky_avg if use_sticky else float(leg.entry_price)
+            if leg.direction == "long":
+                profit = (px - basis) * cq - entry_comm - exit_comm
+            else:
+                profit = (basis - px) * cq - entry_comm - exit_comm
+            trade_profit += profit
+            trade_comm += entry_comm + exit_comm
+            trade_entry_notional += basis * cq
+            # Aggregate open-leg extremes (MAE/MFE) across reduced legs
+            trade_max_dd = max(trade_max_dd, float(leg.max_drawdown))
+            trade_max_ru = max(trade_max_ru, float(leg.max_runup))
+            if not closed_any:
+                trade_entry_bar = int(leg.entry_bar)
+                trade_entry_time = int(leg.entry_time)
+                trade_entry_id = str(leg.entry_id or "")
+                trade_entry_comment = str(leg.entry_comment or "")
+                trade_dir = leg.direction
+            closed_any = True
+            leftover = float(leg.size) - cq
+            if leftover > 1e-12:
+                new_legs.append(
+                    self._new_leg(
+                        entry_id=leg.entry_id,
+                        size=leftover,
+                        entry_price=leg.entry_price,
+                        direction=leg.direction,
+                        commission=float(leg.commission) - entry_comm,
+                        entry_bar=leg.entry_bar,
+                        entry_time=leg.entry_time,
+                        entry_comment=leg.entry_comment,
+                        max_drawdown=float(leg.max_drawdown),
+                        max_runup=float(leg.max_runup),
+                    )
+                )
+            remaining -= cq
+
+        if not closed_any:
+            return
+
+        self.open_legs = new_legs
         self.netprofit += trade_profit
         self.closed_trades += 1
+        entry_px = (trade_entry_notional / total_close) if total_close > 0 else float(px)
+        exit_time = int(self._bar_time)
+        self.closed_trade_records.append(
+            ClosedTradeRecord(
+                entry_id=trade_entry_id if fe is None else str(fe),
+                size=float(total_close),
+                entry_price=float(entry_px),
+                exit_price=float(px),
+                profit=float(trade_profit),
+                commission=float(trade_comm),
+                direction=trade_dir,
+                entry_bar=int(trade_entry_bar),
+                entry_time=int(trade_entry_time),
+                exit_bar=int(self._bar_index),
+                exit_time=exit_time,
+                exit_id=str(exit_id or ""),
+                entry_comment=trade_entry_comment,
+                exit_comment=str(exit_comment or ""),
+                max_drawdown=float(trade_max_dd),
+                max_runup=float(trade_max_ru),
+            )
+        )
+        self._note_filled_order()
         if trade_profit > 0:
             self.wintrades += 1
             self.grossprofit += trade_profit
@@ -833,23 +1679,28 @@ class CompileStrategyBroker:
             self.grossloss += abs(trade_profit)
         else:
             self.eventrades += 1
-        if abs(self.position_size) < 1e-12:
+        # Risk day cascade (cons loss days / max_intraday_loss)
+        self.note_closed_trade_day(exit_time, float(trade_profit))
+
+        if not self.open_legs or sum(leg.size for leg in self.open_legs) <= 1e-12:
+            self.open_legs = []
             self.position_size = 0.0
             self.position_avg_price = float("nan")
             self.position_entry_name = ""
             self.position_commission = 0.0
             self.open_entry_count = 0
+        else:
+            total = float(sum(leg.size for leg in self.open_legs))
+            d0 = self.open_legs[0].direction
+            self.position_size = total if d0 == "long" else -total
+            if use_sticky:
+                self.position_avg_price = sticky_avg
+            else:
+                self.position_avg_price = sum(leg.entry_price * leg.size for leg in self.open_legs) / total
+            self.position_entry_name = str(self.open_legs[0].entry_id)
+            self.position_commission = float(sum(leg.commission for leg in self.open_legs))
+            self.open_entry_count = len(self.open_legs)
         self._update_equity_extremes()
-        # Interpret exit events leave direction=None; plain close keeps direction.
-        self._emit(
-            event_kind,
-            id=id,
-            qty=close_qty,
-            comment=comment,
-            direction=None if is_exit else d,
-            limit=limit_p,
-            stop=stop_p,
-        )
 
     def close_all(self, comment: str | None = None, price: float | None = None, **_kwargs: Any) -> None:
         """Flatten any open position then emit ``close_all``."""
@@ -1001,38 +1852,60 @@ class CompileStrategyBroker:
 
     @property
     def cash(self) -> float:
-        """Approximate free cash: equity minus capital locked in open position."""
+        """Approximate free cash: equity minus margin locked (notional / leverage)."""
         ps = self.position_size
         if ps == 0.0 or self.position_avg_price != self.position_avg_price:
             return float(self.equity)
-        held = abs(float(self.position_avg_price) * float(ps))
+        notional = abs(float(self.position_avg_price) * float(ps))
+        lev = float(self.leverage) if self.leverage and self.leverage > 0 else 1.0
+        held = notional / lev
         return float(self.equity) - held
 
     @property
+    def margin_liquidation_price(self) -> float:
+        """Simple isolated liq estimate: entry ± entry/leverage; nan if flat or lev≤1."""
+        ps = self.position_size
+        avg = self.position_avg_price
+        if ps == 0.0 or avg != avg or avg <= 0:
+            return float("nan")
+        lev = float(self.leverage) if self.leverage and self.leverage > 0 else 1.0
+        if lev <= 1.0:
+            return float("nan")
+        if ps > 0:
+            return float(avg) * (1.0 - 1.0 / lev)
+        return float(avg) * (1.0 + 1.0 / lev)
+
+    @property
     def avg_trade(self) -> float:
+        """Mean closed-trade PnL (netprofit / closed_trades); 0 if none closed."""
         n = int(self.closed_trades)
         return float(self.netprofit) / n if n else 0.0
 
     @property
     def avg_trade_percent(self) -> float:
+        """:attr:`avg_trade` as percent of initial capital."""
         return self._pct_of_initial(self.avg_trade)
 
     @property
     def avg_winning_trade(self) -> float:
+        """Mean winning-trade PnL (grossprofit / wintrades); 0 if none."""
         n = int(self.wintrades)
         return float(self.grossprofit) / n if n else 0.0
 
     @property
     def avg_winning_trade_percent(self) -> float:
+        """:attr:`avg_winning_trade` as percent of initial capital."""
         return self._pct_of_initial(self.avg_winning_trade)
 
     @property
     def avg_losing_trade(self) -> float:
+        """Mean losing-trade loss magnitude (grossloss / losstrades); 0 if none."""
         n = int(self.losstrades)
         return float(self.grossloss) / n if n else 0.0
 
     @property
     def avg_losing_trade_percent(self) -> float:
+        """:attr:`avg_losing_trade` as percent of initial capital."""
         return self._pct_of_initial(self.avg_losing_trade)
 
     def _update_equity_extremes(self) -> None:
@@ -1055,6 +1928,36 @@ class CompileStrategyBroker:
             if self._equity_trough != 0:
                 self._max_runup_percent = 100.0 * ru / abs(self._equity_trough)
 
+    def _update_leg_extremes(self) -> None:
+        """Approximate per-open-leg MAE/MFE from bar high/low (currency units).
+
+        Long: favorable at high, adverse at low; short: inverted. Values are
+        max adverse excursion (``max_drawdown``) and max favorable
+        (``max_runup``) observed while the leg is open. Commission is ignored
+        for extremes (cheap OHLC path; not tick-accurate).
+        """
+        if not self.open_legs:
+            return
+        hi = float(self._high)
+        lo = float(self._low)
+        if hi != hi or lo != lo:
+            return
+        for leg in self.open_legs:
+            ep = float(leg.entry_price)
+            sz = float(leg.size)
+            if sz <= 0 or ep != ep:
+                continue
+            if leg.direction == "long":
+                fav = (hi - ep) * sz
+                adv = (ep - lo) * sz
+            else:
+                fav = (ep - lo) * sz
+                adv = (hi - ep) * sz
+            if fav > leg.max_runup:
+                leg.max_runup = float(fav)
+            if adv > leg.max_drawdown:
+                leg.max_drawdown = float(adv)
+
     @property
     def max_drawdown(self) -> float:
         """Peak-to-trough equity drawdown (absolute currency units)."""
@@ -1074,6 +1977,152 @@ class CompileStrategyBroker:
     def max_runup_percent(self) -> float:
         """Max run-up as percent of equity trough when recorded."""
         return float(self._max_runup_percent)
+
+    # --- strategy.opentrades.* / strategy.closedtrades.* query surface -------
+
+    def _open_leg_at(self, trade_index: Any) -> OpenLeg | None:
+        """Return open leg at *trade_index*, or synthetic single-lot leg."""
+        try:
+            i = int(trade_index) if trade_index is not None else 0
+        except (TypeError, ValueError):
+            i = 0
+        if i < 0:
+            return None
+        if self.open_legs:
+            if i < len(self.open_legs):
+                return self.open_legs[i]
+            return None
+        if abs(self.position_size) > 0 and i == 0:
+            d = "long" if self.position_size > 0 else "short"
+            return self._new_leg(
+                entry_id=str(self.position_entry_name or ""),
+                size=abs(float(self.position_size)),
+                entry_price=float(self.position_avg_price)
+                if self.position_avg_price == self.position_avg_price
+                else 0.0,
+                direction=d,
+                commission=float(self.position_commission or 0.0),
+            )
+        return None
+
+    def _closed_at(self, trade_index: Any) -> ClosedTradeRecord | None:
+        try:
+            i = int(trade_index) if trade_index is not None else 0
+        except (TypeError, ValueError):
+            i = 0
+        if i < 0 or i >= len(self.closed_trade_records):
+            return None
+        return self.closed_trade_records[i]
+
+    def opentrades_size(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        leg = self._open_leg_at(trade_index)
+        return float(leg.size) if leg is not None else 0.0
+
+    def opentrades_entry_price(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        leg = self._open_leg_at(trade_index)
+        if leg is None:
+            return float("nan")
+        return float(leg.entry_price)
+
+    def opentrades_entry_id(self, trade_index: Any = 0, **_kwargs: Any) -> str:
+        leg = self._open_leg_at(trade_index)
+        return str(leg.entry_id) if leg is not None else ""
+
+    def opentrades_entry_bar_index(self, trade_index: Any = 0, **_kwargs: Any) -> int:
+        leg = self._open_leg_at(trade_index)
+        return int(leg.entry_bar) if leg is not None else 0
+
+    def opentrades_entry_time(self, trade_index: Any = 0, **_kwargs: Any) -> int:
+        leg = self._open_leg_at(trade_index)
+        return int(leg.entry_time) if leg is not None else 0
+
+    def opentrades_commission(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        leg = self._open_leg_at(trade_index)
+        return float(leg.commission) if leg is not None else 0.0
+
+    def opentrades_profit(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        """Mark-to-market open-leg PnL at current bar close (minus entry commission)."""
+        leg = self._open_leg_at(trade_index)
+        if leg is None:
+            return 0.0
+        mark = float(self._mark)
+        if mark != mark:
+            return 0.0
+        if leg.direction == "long":
+            return (mark - float(leg.entry_price)) * float(leg.size) - float(leg.commission)
+        return (float(leg.entry_price) - mark) * float(leg.size) - float(leg.commission)
+
+    def opentrades_entry_comment(self, trade_index: Any = 0, **_kwargs: Any) -> str:
+        leg = self._open_leg_at(trade_index)
+        return str(leg.entry_comment) if leg is not None else ""
+
+    def opentrades_max_drawdown(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        leg = self._open_leg_at(trade_index)
+        return float(leg.max_drawdown) if leg is not None else 0.0
+
+    def opentrades_max_runup(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        leg = self._open_leg_at(trade_index)
+        return float(leg.max_runup) if leg is not None else 0.0
+
+    def closedtrades_profit(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        rec = self._closed_at(trade_index)
+        return float(rec.profit) if rec is not None else 0.0
+
+    def closedtrades_size(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        rec = self._closed_at(trade_index)
+        return float(rec.size) if rec is not None else 0.0
+
+    def closedtrades_entry_price(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        rec = self._closed_at(trade_index)
+        return float(rec.entry_price) if rec is not None else 0.0
+
+    def closedtrades_exit_price(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        rec = self._closed_at(trade_index)
+        return float(rec.exit_price) if rec is not None else 0.0
+
+    def closedtrades_commission(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        rec = self._closed_at(trade_index)
+        return float(rec.commission) if rec is not None else 0.0
+
+    def closedtrades_entry_id(self, trade_index: Any = 0, **_kwargs: Any) -> str:
+        rec = self._closed_at(trade_index)
+        return str(rec.entry_id) if rec is not None else ""
+
+    def closedtrades_exit_id(self, trade_index: Any = 0, **_kwargs: Any) -> str:
+        rec = self._closed_at(trade_index)
+        return str(rec.exit_id) if rec is not None else ""
+
+    def closedtrades_entry_bar_index(self, trade_index: Any = 0, **_kwargs: Any) -> int:
+        rec = self._closed_at(trade_index)
+        return int(rec.entry_bar) if rec is not None else 0
+
+    def closedtrades_exit_bar_index(self, trade_index: Any = 0, **_kwargs: Any) -> int:
+        rec = self._closed_at(trade_index)
+        return int(rec.exit_bar) if rec is not None else 0
+
+    def closedtrades_entry_time(self, trade_index: Any = 0, **_kwargs: Any) -> int:
+        rec = self._closed_at(trade_index)
+        return int(rec.entry_time) if rec is not None else 0
+
+    def closedtrades_exit_time(self, trade_index: Any = 0, **_kwargs: Any) -> int:
+        rec = self._closed_at(trade_index)
+        return int(rec.exit_time) if rec is not None else 0
+
+    def closedtrades_entry_comment(self, trade_index: Any = 0, **_kwargs: Any) -> str:
+        rec = self._closed_at(trade_index)
+        return str(rec.entry_comment) if rec is not None else ""
+
+    def closedtrades_exit_comment(self, trade_index: Any = 0, **_kwargs: Any) -> str:
+        rec = self._closed_at(trade_index)
+        return str(rec.exit_comment) if rec is not None else ""
+
+    def closedtrades_max_drawdown(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        rec = self._closed_at(trade_index)
+        return float(rec.max_drawdown) if rec is not None else 0.0
+
+    def closedtrades_max_runup(self, trade_index: Any = 0, **_kwargs: Any) -> float:
+        rec = self._closed_at(trade_index)
+        return float(rec.max_runup) if rec is not None else 0.0
 
     def to_events(self) -> list[dict[str, Any]]:
         """Return the live event list for host packing as ``__events``.

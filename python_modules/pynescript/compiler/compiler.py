@@ -436,6 +436,10 @@ class CompilerVisitor(NodeVisitor):
         self.object_mode = bool(force_object_mode)
         self.uses_strategy = False
         self.strategy_kwargs: dict[str, str] = {}
+        # Name → const-like Python expr for strategy() ctor kwargs (literals / input defvals).
+        # reference requires const for most strategy() params; pyne compile mirrors that by folding
+        # bar-constant series (``lev = input.float(10)`` → ``leverage=10``) into the broker ctor.
+        self.const_like_values: dict[str, str] = {}
         self.udt_types: dict[str, list[str]] = {}  # type name -> field names
         self.udt_vars: set[str] = set()  # series names holding UDT instances
         self.map_vars: set[str] = set()  # var map names (single object, not series)
@@ -860,7 +864,9 @@ class CompilerVisitor(NodeVisitor):
             ]
         )
         if self.uses_strategy:
-            # Broker ctor kwargs from strategy() declaration when present
+            # Broker ctor kwargs from strategy() declaration when present.
+            # Only const-like exprs (literals or folded input/const series) — never
+            # ``name_arr[__bar_idx]`` (undefined at ctor time; not a reference const either).
             sk = self.strategy_kwargs
             ctor_args = []
             for key in (
@@ -870,10 +876,18 @@ class CompilerVisitor(NodeVisitor):
                 "slippage",
                 "mintick",
                 "pyramiding",
+                "avg_price_model",
+                "default_qty_type",
+                "default_qty_value",
+                "leverage",
             ):
-                if key in sk:
-                    py_key = "slippage_ticks" if key == "slippage" else key
-                    ctor_args.append(f"{py_key}={sk[key]}")
+                if key not in sk:
+                    continue
+                resolved = self._resolve_strategy_ctor_kwarg(sk[key])
+                if resolved is None:
+                    continue
+                py_key = "slippage_ticks" if key == "slippage" else key
+                ctor_args.append(f"{py_key}={resolved}")
             ctor = ", ".join(ctor_args)
             lines.append(f"    __strategy = CompileStrategyBroker({ctor})")
             # End-of-bar history for strategy.position_size[n] (always when broker)
@@ -1485,12 +1499,52 @@ class CompilerVisitor(NodeVisitor):
         if not self._is_safe_numeric_expr(val) and not self.in_function:
             self.object_mode = True
             store_val = f"safe_float({val})"
+        # Track bar-constant literals / input defvals for strategy() ctor folding
+        if self._looks_like_const_expr(store_val):
+            self.const_like_values[name] = store_val
         if is_var:
             return (
                 f"{name}_arr[__bar_idx] = {store_val} if __bar_idx == 0 "
                 f"else {name}_arr[__bar_idx-1]"
             )
         return f"{name}_arr[__bar_idx] = {store_val}"
+
+    def _looks_like_const_expr(self, expr: str) -> bool:
+        """True for numeric / string / bool Python literals usable in broker ctor."""
+        s = (expr or "").strip()
+        if not s:
+            return False
+        if s in {"True", "False", "None", "true", "false"}:
+            return True
+        if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+            return True
+        # bare number (int / float / scientific)
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
+    def _resolve_strategy_ctor_kwarg(self, expr: str) -> str | None:
+        """Fold strategy() kwargs to const-like ctor args; drop non-const series refs.
+
+        reference ``strategy()`` declaration params require *const* (not input/simple/series).
+        PYNE still allows ``lev = input.float(10)`` then ``strategy(..., leverage=lev)``
+        by folding the input's constant defval into the compile broker ctor.
+        """
+        import re
+
+        s = (expr or "").strip()
+        if not s:
+            return None
+        if self._looks_like_const_expr(s):
+            return s
+        m = re.fullmatch(r"([A-Za-z_]\w*)_arr\[__bar_idx\]", s)
+        if m:
+            return self.const_like_values.get(m.group(1))
+        if re.fullmatch(r"[A-Za-z_]\w*", s):
+            return self.const_like_values.get(s)
+        return None
 
     _STRINGY_INPUT_ATTRS = frozenset(
         {
@@ -2378,6 +2432,8 @@ class CompilerVisitor(NodeVisitor):
                 (
                     "numba_bb(",
                     "numba_bb_inc(",
+                    "numba_kc(",
+                    "numba_kc_inc(",
                     "numba_macd(",
                     "numba_macd_inc(",
                     "numba_dmi(",
@@ -2681,7 +2737,7 @@ class CompilerVisitor(NodeVisitor):
             st = self._alloc_fixed_state("pvt", 2)
             return f"numba_pvt_inc(close_arr, vol_arr, __bar_idx, {st})"
         if node.id in ("accdist", "ad", "accumulation_distribution"):
-            # Cumulative Chaikin A/D (matches interpret ``_accdist`` / TV ta.accdist).
+            # Cumulative Chaikin A/D (matches interpret ``_accdist`` / reference ta.accdist).
             st = self._alloc_fixed_state("ad", 2)
             return (
                 f"numba_accdist_inc(high_arr, low_arr, close_arr, vol_arr, "
@@ -2924,7 +2980,7 @@ class CompilerVisitor(NodeVisitor):
                     f"and __d.get('kind') == {kind!r}]"
                 )
             # bare style-ish attrs already handled via _STYLE_NS; leave rest
-        # dayofweek.monday … dayofweek.sunday — integer constants (TV: Sunday=1 … Saturday=7)
+        # dayofweek.monday … dayofweek.sunday — integer constants (Reference Pine: Sunday=1 … Saturday=7)
         # Must run before fallthrough (visit Name dayofweek → "1" then "1_monday").
         if isinstance(node.value, ast.Name) and node.value.id == "dayofweek":
             m = {
@@ -3657,8 +3713,10 @@ class CompilerVisitor(NodeVisitor):
             "netprofit": "__strategy.netprofit",
             "equity": "__strategy.equity",
             "closedtrades": "__strategy.closed_trades",
-            "opentrades": "0 if __strategy.position_size == 0 else 1",
+            # open_entry_count tracks open_legs (pyramiding-aware); 0 when flat.
+            "opentrades": "__strategy.open_entry_count",
             "initial_capital": "__strategy.initial_capital",
+            "leverage": "__strategy.leverage",
             "max_drawdown": "__strategy.max_drawdown",
             "max_runup": "__strategy.max_runup",
             "max_drawdown_percent": "__strategy.max_drawdown_percent",
@@ -3668,6 +3726,7 @@ class CompilerVisitor(NodeVisitor):
             "grossloss": "__strategy.grossloss",
             "wintrades": "__strategy.wintrades",
             "losstrades": "__strategy.losstrades",
+            "margin_liquidation_price": "__strategy.margin_liquidation_price",
         }
         if attr in series_map:
             self.object_mode = True
@@ -3677,7 +3736,7 @@ class CompilerVisitor(NodeVisitor):
             self.arrays.add("__strategy_position_avg_price_arr")
             self.arrays.add("__strategy_closed_trades_arr")
             return series_map[attr]
-        # Qty type / risk constants used as values (not broker properties)
+        # Qty type / risk / avg-price constants used as values (not broker properties)
         if attr in (
             "percent_of_equity",
             "fixed",
@@ -3687,12 +3746,18 @@ class CompilerVisitor(NodeVisitor):
             "long",
             "short",
             "all",
+            "avg_price_stock",
+            "avg_price_futures",
+            "avg_price_inverse",
         ):
             self.object_mode = True
             self.uses_strategy = True
+            # Strip avg_price_ prefix so strategy.avg_price_futures → "futures"
+            if attr.startswith("avg_price_"):
+                return repr(attr[len("avg_price_") :])
             return repr(attr)
         # oca / commission nested attrs: strategy.oca → leave for outer attr
-        if attr in ("oca", "commission", "direction", "risk"):
+        if attr in ("oca", "commission", "direction", "risk", "avg_price"):
             return f"strategy_{attr}"
         self.object_mode = True
         self.uses_strategy = True
@@ -3755,7 +3820,7 @@ class CompilerVisitor(NodeVisitor):
                 and func.value.value.id == "strategy"
                 and func.value.attr == "risk"
             ):
-                # strategy.risk.max_drawdown(...) / max_cons_loss_days(...) — no-op
+                # strategy.risk.* → strategy_risk_* (emit subset on CompileStrategyBroker)
                 func_name = f"strategy_risk_{func.attr}"
             elif isinstance(func.value, ast.Name) and func.value.id == "log":
                 func_name = f"log_{func.attr}"
@@ -3768,7 +3833,7 @@ class CompilerVisitor(NodeVisitor):
             ):
                 # Library methods: ae.index_2d_to_1d / agen.sequence_float / …
                 # Do not pass the alias as method_src (undefined free var).
-                # BUT: ``import TradingView/ta/7`` (alias ``ta``) / math / str / …
+                # BUT: ``import reference Pine/ta/7`` (alias ``ta``) / math / str / …
                 # must keep namespace prefix so ``ta.rma`` → ``ta_rma``, not bare
                 # ``rma`` (which collides with user ``method rma`` → recursion).
                 alias = func.value.id
@@ -4664,6 +4729,7 @@ class CompilerVisitor(NodeVisitor):
             "macd": "ta_macd",
             "bb": "ta_bb",
             "bbw": "ta_bbw",
+            "kc": "ta_kc",
             "median": "ta_median",
             "wpr": "ta_wpr",
             "cmo": "ta_cmo",
@@ -4832,6 +4898,27 @@ class CompilerVisitor(NodeVisitor):
                 )
             return (
                 f"numba_atr_inc(high_arr, low_arr, close_arr, {self._emit_period(length)}, __bar_idx, {st})"
+            )
+        if func_name == "ta_kc":
+            # ta.kc(source, length, mult) → (middle, upper, lower); ATR from chart H/L/C
+            # Legacy: ta.kc(high, low, close, length) mult defaults to 1
+            st = self._alloc_fixed_state("kc", 4)
+            if len(args) >= 4 and _is_series_arr(args[0]) and _is_series_arr(args[1]):
+                length = kwargs.get("length", args[3] if len(args) > 3 else "20")
+                mult = kwargs.get("mult", args[4] if len(args) > 4 else "1.0")
+                return (
+                    f"numba_kc_inc({_arr(args[2])}, {_arr(args[0])}, {_arr(args[1])}, "
+                    f"{_arr(args[2])}, {self._emit_period(length)}, float({mult}), __bar_idx, {st})"
+                )
+            if len(args) >= 3:
+                src, length, mult = args[0], args[1], args[2]
+            elif len(args) == 2:
+                src, length, mult = "close_arr[__bar_idx]", args[0], args[1]
+            else:
+                src, length, mult = "close_arr[__bar_idx]", "20", "1.0"
+            return (
+                f"numba_kc_inc({_arr(src)}, high_arr, low_arr, close_arr, "
+                f"{self._emit_period(length)}, float({mult}), __bar_idx, {st})"
             )
         if func_name == "ta_bb":
             # ta.bb(source, length, mult) or ta.bb(length, mult)
@@ -5148,7 +5235,7 @@ class CompilerVisitor(NodeVisitor):
         if func_name == "ta_vwap":
             # ta.vwap([source[, anchor]]) — cumulative source*vol / cum vol.
             # Default source is hlc3 (not close). Optional anchor bool resets
-            # the cumulative window when true (TV ``ta.vwap(src, anchor)``).
+            # the cumulative window when true (reference ``ta.vwap(src, anchor)``).
             st = self._alloc_fixed_state("vwap", 3)
             if args:
                 src = _arr(args[0])
@@ -5454,7 +5541,7 @@ class CompilerVisitor(NodeVisitor):
                 f"numba_sum_inc({_arr(src_e)}, {self._emit_period(period)}, __bar_idx, {st})"
             )
         if func_name == "math_avg":
-            # TV ``math.avg(number0, number1, ...)`` — arithmetic mean of the
+            # reference ``math.avg(number0, number1, ...)`` — arithmetic mean of the
             # arguments (not a rolling window; use ta.sma / math.sum for that).
             # Prior emit treated the 2-arg form as SMA(source, length), which
             # crashed on ``math.avg(get, array.get(levels, j+1))`` by feeding
@@ -5734,7 +5821,7 @@ class CompilerVisitor(NodeVisitor):
             const = method.split("_")[-1]
             return repr(const)
         if method.startswith("risk_"):
-            return ""  # risk.* declaration no-op in compile path for now
+            return self._emit_strategy_risk_call(method, args, kwargs)
         if method == "default_entry_qty":
             # strategy.default_entry_qty(series) → default size stub
             return "1.0"
@@ -5766,18 +5853,24 @@ class CompilerVisitor(NodeVisitor):
             "cancel": ("id",),
             "cancel_all": (),
         }
-        # Pine strategy.exit(id, from_entry, qty, qty_percent, profit, limit, loss, stop, …)
-        # First positional is the *exit order* name, not the position id. from_entry → id.
+        # Pine strategy.exit(id, from_entry, qty, qty_percent, profit, limit, loss, stop,
+        # trail_price, trail_points, trail_offset, …)
+        # First positional is the *exit order* name (→ comment), not the position id.
+        # Always emit from_entry= so market exits filter multi-leg open size too
+        # (broker only treats bare id= as from_entry when stop/limit/trail make is_exit).
         if method == "exit":
             param_names: tuple[str, ...] = (
                 "_exit_id",
-                "id",
+                "from_entry",
                 "qty",
                 "qty_percent",
                 "profit",
                 "limit",
                 "loss",
                 "stop",
+                "trail_price",
+                "trail_points",
+                "trail_offset",
             )
         else:
             param_names = names_by_method.get(broker_method, ())
@@ -5789,11 +5882,10 @@ class CompilerVisitor(NodeVisitor):
                 seen[param_names[i]] = a
         for k, v in kwargs.items():
             key = k
-            if key == "from_entry":
-                key = "id"
-            elif method == "exit" and key == "id":
+            if method == "exit" and key == "id":
                 # keyword id= is the exit order name, not the position id
                 key = "_exit_id"
+            # from_entry stays from_entry (positional + kwarg) — do not remap to id
             seen[key] = v  # later wins
 
         if method == "exit":
@@ -5806,34 +5898,96 @@ class CompilerVisitor(NodeVisitor):
         parts = [f"{k}={v}" for k, v in seen.items()]
         return f"__strategy.{broker_method}({', '.join(parts)})"
 
-    def _emit_strategy_trade_query(self, method: str, args: list[str], kwargs: dict[str, str]) -> str:
-        """Stub strategy.opentrades.* / strategy.closedtrades.* method calls."""
+    def _emit_strategy_risk_call(self, method: str, args: list[str], kwargs: dict[str, str]) -> str:
+        """Emit ``strategy.risk.*`` when broker supports it; else silent no-op.
+
+        Wired (state + enforcement on entry; interpret-aligned halt cascade):
+        - ``allow_entry_in`` → ``__strategy.risk_allow_entry_in``
+        - ``max_position_size`` → ``__strategy.risk_max_position_size``
+        - ``max_drawdown`` → ``__strategy.risk_max_drawdown`` (abs or % of peak)
+        - ``max_cons_loss_days`` → ``__strategy.risk_max_cons_loss_days``
+        - ``max_intraday_loss`` → ``__strategy.risk_max_intraday_loss``
+        - ``max_intraday_filled_orders`` → ``__strategy.risk_max_intraday_filled_orders``
+        """
         self.object_mode = True
         self.uses_strategy = True
+        risk = method[len("risk_") :]
+        if risk == "allow_entry_in":
+            val = args[0] if args else kwargs.get("value", repr("all"))
+            return f"__strategy.risk_allow_entry_in({val})"
+        if risk == "max_position_size":
+            # positional percent or keyword percent=
+            val = args[0] if args else kwargs.get("percent", kwargs.get("value", "None"))
+            return f"__strategy.risk_max_position_size({val})"
+        if risk == "max_drawdown":
+            val = args[0] if args else kwargs.get("value", "None")
+            rtype = args[1] if len(args) > 1 else kwargs.get("type", repr("absolute"))
+            return f"__strategy.risk_max_drawdown({val}, {rtype})"
+        if risk == "max_cons_loss_days":
+            days = args[0] if args else kwargs.get("days", kwargs.get("value", "None"))
+            return f"__strategy.risk_max_cons_loss_days({days})"
+        if risk == "max_intraday_loss":
+            val = args[0] if args else kwargs.get("percent", kwargs.get("value", "None"))
+            return f"__strategy.risk_max_intraday_loss({val})"
+        if risk == "max_intraday_filled_orders":
+            val = args[0] if args else kwargs.get(
+                "max_orders", kwargs.get("value", kwargs.get("max", "None"))
+            )
+            return f"__strategy.risk_max_intraday_filled_orders({val})"
+        return ""  # remaining risk.* still no-op on compile path
+
+    def _emit_strategy_trade_query(self, method: str, args: list[str], kwargs: dict[str, str]) -> str:
+        """Emit strategy.opentrades.* / strategy.closedtrades.* from broker records.
+
+        Real fields when data exists on ``CompileStrategyBroker`` (open_legs /
+        closed_trade_records), including per-trade comments and approximate
+        max_drawdown / max_runup (OHLC MTM extremes).
+        """
+        self.object_mode = True
+        self.uses_strategy = True
+        idx = args[0] if args else kwargs.get("trade_num", kwargs.get("trade_index", "0"))
         if method.startswith("opentrades_"):
             attr = method[len("opentrades_") :]
-            if attr == "entry_price":
-                return "(__strategy.position_avg_price if __strategy.position_size != 0 else np.nan)"
-            if attr == "size":
-                return "__strategy.position_size"
-            if attr == "entry_id":
-                return "(__strategy.position_entry_name if __strategy.position_size != 0 else '')"
-            if attr in (
-                "entry_bar_index",
-                "profit",
-                "commission",
-                "max_runup",
-                "max_drawdown",
-                "comment",
-            ):
-                return "0.0"
+            real = {
+                "size": "opentrades_size",
+                "entry_price": "opentrades_entry_price",
+                "entry_id": "opentrades_entry_id",
+                "entry_bar_index": "opentrades_entry_bar_index",
+                "entry_time": "opentrades_entry_time",
+                "commission": "opentrades_commission",
+                "profit": "opentrades_profit",
+                "entry_comment": "opentrades_entry_comment",
+                "max_drawdown": "opentrades_max_drawdown",
+                "max_runup": "opentrades_max_runup",
+            }
+            if attr in real:
+                return f"__strategy.{real[attr]}({idx})"
+            if attr in ("comment",):
+                return f"__strategy.opentrades_entry_comment({idx})"
             return "0.0"
         if method.startswith("closedtrades_"):
             attr = method[len("closedtrades_") :]
-            if attr in ("exit_bar_index", "entry_bar_index"):
-                return "0"
-            if attr == "entry_id" or attr == "exit_id":
-                return "''"
+            real = {
+                "profit": "closedtrades_profit",
+                "size": "closedtrades_size",
+                "entry_price": "closedtrades_entry_price",
+                "exit_price": "closedtrades_exit_price",
+                "commission": "closedtrades_commission",
+                "entry_id": "closedtrades_entry_id",
+                "exit_id": "closedtrades_exit_id",
+                "entry_bar_index": "closedtrades_entry_bar_index",
+                "exit_bar_index": "closedtrades_exit_bar_index",
+                "entry_time": "closedtrades_entry_time",
+                "exit_time": "closedtrades_exit_time",
+                "entry_comment": "closedtrades_entry_comment",
+                "exit_comment": "closedtrades_exit_comment",
+                "max_drawdown": "closedtrades_max_drawdown",
+                "max_runup": "closedtrades_max_runup",
+            }
+            if attr in real:
+                return f"__strategy.{real[attr]}({idx})"
+            if attr in ("comment",):
+                return f"__strategy.closedtrades_entry_comment({idx})"
             return "0.0"
         return "0.0"
     def _emit_udt_new(self, type_name: str, node: ast.Call) -> str:
