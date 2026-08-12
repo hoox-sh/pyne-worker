@@ -14,7 +14,9 @@
       "head_sampling_rate": 1,
       "persist": true,
       "invocation_logs": true
-    }
+    },
+    // Unified traces across service bindings / DO (CF May 2026)
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
   },
   "vars": {
     "TRADE_WORKER_NAME": "trade-worker"
