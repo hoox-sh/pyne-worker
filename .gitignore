@@ -15,3 +15,4 @@ uv.lock
 # Do not ignore python_modules/ if you choose to commit it; only strip bytecode:
 python_modules/**/__pycache__/
 python_modules/**/*.pyc
+.dev.vars
