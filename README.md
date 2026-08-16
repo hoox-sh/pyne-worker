@@ -3,25 +3,47 @@
 > Production **Python Cloudflare® Worker** for the **[PYNE](https://hoox.sh/pyne)** stack —
 > evaluate TradingView® Pine Script™ on the edge with the same bar-loop contract as the Pro API.
 
-**Version:** 0.5.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript`)
+**Version:** 0.6.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.3.8)
 
 **Website:** [hoox.sh/pyne](https://hoox.sh/pyne) · **Docs:** [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) · **Repo:** [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker)
 
 **Edge deploy (example):** [`https://pyne-worker.cryptolinx.workers.dev`](https://pyne-worker.cryptolinx.workers.dev)
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/hoox-sh/pyne-worker)
+
+This button deploys **this edge host only**. Need parse, lint, compile, LSP, Flask Pro API, or the language SoT? Use **[hoox-sh/pyne](https://github.com/hoox-sh/pyne)** — `pip install "hoox-pyne[lsp,compile,pro]"`.
+
 _Pine Script™ and TradingView® are trademarks of TradingView, Inc. Cloudflare® is a trademark of Cloudflare, Inc. This project is an independent effort and is not affiliated with or endorsed by TradingView, Inc. or Cloudflare, Inc._
+
+## Limitations (read before you click Deploy)
+
+`pyne-worker` is a **thin Cloudflare® Workers wrap** around the vendored `pynescript` bar-loop. It is **not** a substitute for the main PYNE repo.
+
+| This Worker | Use [hoox-sh/pyne](https://github.com/hoox-sh/pyne) instead |
+|-------------|--------------------------------------------------------------|
+| `POST /run` evaluate + alerts + libraries | CLI (`pyne`), LSP (`pyne-lsp`), VS Code extension |
+| R2 bars, 1m cron, L2 webhooks | Flask Pro API, Docker images, `/run/batch`, chart preview |
+| Vendored engine snapshot (sync via `./scripts/sync_vendor.sh`) | Live package, Numba desk compile, corpus / parity harness |
+| 30s / 100KB / 100K bars / 5MB envelope | Uncapped research on a machine you control |
+| Optional `TRADE_SERVICE` → trade-worker | Full HOOX mesh (gateway, D1, risk, execution) |
+
+One-click notes:
+
+- Dashboard prompts for `API_KEY` (required), `ALERT_WEBHOOK_URL`, `INTERNAL_KEY_BINDING` (see `.dev.vars.example`).
+- R2 bucket `OHLCV_DATA` is provisioned from `wrangler.jsonc`.
+- `TRADE_SERVICE` binds a Worker named `trade-worker`. If that Worker is not in your account, **remove the `services` block** from `wrangler.jsonc` before retrying — trade forward is optional and fails closed.
 
 ## Ecosystem
 
-Part of the **[HOOX](https://hoox.sh)** open trading stack ([org: `hoox-sh`](https://github.com/hoox-sh)):
+Part of the **[HOOX](https://hoox.sh)** open trading stack:
 
 | Product | Role | Repo | Website |
 |---------|------|------|---------|
 | **HOOX** | Edge trading framework (Workers mesh) | [hoox-sh/hoox](https://github.com/hoox-sh/hoox) | [hoox.sh](https://hoox.sh) · [docs](https://docs.hoox.sh) |
 | **PYNE** | Pine Script™ toolchain + Pro API | [hoox-sh/pyne](https://github.com/hoox-sh/pyne) | [hoox.sh/pyne](https://hoox.sh/pyne) · [docs](https://hoox.sh/pyne/docs) |
-| **pyne-worker** | Python edge evaluate host (this repo) | [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker) | [hoox.sh/pyne](https://hoox.sh/pyne) |
-| **pyne-agent-worker** | NL → PYNE scripts (Workers AI™; optional validate via this worker) | [hoox-sh/pyne-agent-worker](https://github.com/hoox-sh/pyne-agent-worker) | [AXIS plugin docs](https://hoox.sh/axis/docs/plugins/pine-agent) · [PYNE agent](https://hoox.sh/pyne/docs/agent) |
-| **pine-worker** | TypeScript edge evaluate + trade events | [hoox-sh/pine-worker](https://github.com/hoox-sh/pine-worker) | — |
+| **PyneTS** | TypeScript / Bun library (`@hoox-sh/pynets`) — not a Worker | [hoox-sh/pynets](https://github.com/hoox-sh/pynets) | [docs](https://hoox.sh/pyne/docs/pynets) |
+| **pyne-worker** | Python edge evaluate host (this repo) | [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker) | [docs](https://hoox.sh/pyne/docs/pyne-worker) |
+| **pyne-agent-worker** | NL → PYNE scripts (Workers AI™; optional validate via this worker) | [hoox-sh/pyne-agent-worker](https://github.com/hoox-sh/pyne-agent-worker) | [AXIS plugin](https://hoox.sh/axis/docs/plugins/pyne-agent) · [PYNE agent](https://hoox.sh/pyne/docs/agent) |
 | **AXIS** | Installable charting PWA | [hoox-sh/axis](https://github.com/hoox-sh/axis) | [hoox.sh/axis](https://hoox.sh/axis) · [docs](https://hoox.sh/axis/docs) |
 | **trade-worker** | Multi-exchange order routing | [hoox-sh/trade-worker](https://github.com/hoox-sh/trade-worker) | — |
 
@@ -78,6 +100,8 @@ Strong real-world Pine coverage via the open PYNE engine — **not** a claim of 
 - **Live market feed** — closed klines (Bybit → R2, Binance fallback)
 - **Trade forwarding** — strategy events → trade-worker
 - **Alert engine + L2 webhooks** — `ALERT_WEBHOOK_URL` or per-job `webhook_url`
+- **Libraries** — `POST /run` `libraries: [{namespace, name, version, source}]` for `import ns/Name/ver` (AXIS git-publish emulator; pynescript 0.3.7+)
+- **Drawings / plot_meta / logs** — same evaluate-contract envelope as the Pro API
 - **$0 tier OK** for light use; Paid Workers recommended for heavy 1m cron
 
 Product docs: [Alerts](https://hoox.sh/pyne/docs/runtime/alerts) · [Evaluate contract](https://hoox.sh/pyne/docs/api/contract)
@@ -139,9 +163,32 @@ After pulling new PYNE APIs, always re-run `./scripts/sync_vendor.sh`.
 | `ohlcv` / `data` | Bars; or omit and set `symbol` + `timeframe` to read R2 |
 | `mode` | `interpret` (default) · `compile` · `auto` (compile then fall back) |
 | `inputs` | Optional `input.*` overrides (title → value); forces interpret under `auto` |
+| `libraries` | Optional `[{namespace, name, version, source}]` — binds `import ns/Name/ver` (max 32; interpret/`auto` only) |
+| `profiler` | Per-line interpret timings (AXIS gutter) |
+| `timeout_seconds` | Wall-clock budget (default 30, max 30) |
 | `max_bars` | Tail length when loading long R2 history |
 
-Also accepts `"data"` instead of `"ohlcv"` (PYNE Pro API compat). Response includes `plots`, `series`, `alerts`, `events`, `inputs`, `meta`, and structured `error` / `error_kind` on failure.
+Also accepts `"data"` instead of `"ohlcv"` (PYNE Pro API compat). Success response includes `status`, `plots`, `series`, `plot_meta`, `alerts`, `events`, `drawings`, `inputs`, `logs`, `meta`, `count`/`bars`, and structured `error` / `error_kind` on failure.
+
+Library example (`import ns/Lib/1`):
+
+```json
+{
+  "script": "//@version=6\nindicator('use')\nimport ns/Lib/1 as x\nplot(x.FOO)",
+  "mode": "interpret",
+  "ohlcv": [{"open": 1, "high": 2, "low": 0.5, "close": 1.5, "time": 1}],
+  "libraries": [
+    {
+      "namespace": "ns",
+      "name": "Lib",
+      "version": 1,
+      "source": "//@version=6\nlibrary(\"Lib\")\nexport const float FOO = 1.5\n"
+    }
+  ]
+}
+```
+
+Deployed scripts may store the same `libraries` (and `inputs`) array; `POST /run` with `script_id` and cron both reuse them.
 
 ### Deploy a script + 1m bar-close cron
 
@@ -364,7 +411,9 @@ Vendored deploy tree: `python_modules/` (sync with `./scripts/sync_vendor.sh`).
 | [hoox.sh/pyne](https://hoox.sh/pyne) | PYNE product + playground entry |
 | [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) | PYNE manuals (runtime, API, alerts) |
 | [hoox-sh/pyne](https://github.com/hoox-sh/pyne) | Pine engine (this worker’s dependency) |
-| [hoox-sh/pine-worker](https://github.com/hoox-sh/pine-worker) | TypeScript edge sibling |
+| [hoox.sh/pyne/docs/pyne-worker](https://hoox.sh/pyne/docs/pyne-worker) | This host’s product docs |
+| [hoox-sh/pynets](https://github.com/hoox-sh/pynets) | TypeScript library (`@hoox-sh/pynets`) |
+| [hoox-sh/pyne-agent-worker](https://github.com/hoox-sh/pyne-agent-worker) | NL authoring (optional `/run` validate) |
 | [hoox-sh/trade-worker](https://github.com/hoox-sh/trade-worker) | Exchange execution |
 | [hoox-sh/hoox](https://github.com/hoox-sh/hoox) | Edge trading framework |
 | [hoox-sh/axis](https://github.com/hoox-sh/axis) | Charting PWA |
