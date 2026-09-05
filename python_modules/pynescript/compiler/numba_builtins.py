@@ -1860,11 +1860,23 @@ def _udt_sort_key(elem, sort_field):
             return vals[idx]
         return np.nan
     get_field = getattr(elem, "get_field", None)
-    if callable(get_field) and isinstance(sort_field, str):
-        try:
-            return get_field(sort_field)
-        except Exception:
-            return np.nan
+    if callable(get_field):
+        if isinstance(sort_field, str):
+            try:
+                return get_field(sort_field)
+            except Exception:
+                return np.nan
+        if isinstance(sort_field, (int, float)) and not isinstance(sort_field, bool):
+            udt = getattr(elem, "udt", None)
+            fields = getattr(udt, "fields", None)
+            if fields:
+                names = list(fields.keys())
+                idx = int(sort_field)
+                if 0 <= idx < len(names):
+                    try:
+                        return get_field(names[idx])
+                    except Exception:
+                        return np.nan
     return elem
 
 
@@ -2041,6 +2053,138 @@ def array_sort_indices(arr, order="ascending", sort_field=None):
             reverse=reverse,
         )
     return [idx for _, idx in non_na] + na_idx
+
+
+def _looks_like_udt(elem) -> bool:
+    if elem is None:
+        return False
+    if isinstance(elem, dict) and "__type__" in elem:
+        return True
+    return getattr(elem, "get_field", None) is not None and getattr(elem, "udt", None) is not None
+
+
+def _resolve_search_field(arr, sort_field):
+    """Default *sort_field* to ``0`` (first field) on UDT arrays."""
+    if sort_field is not None:
+        return sort_field
+    if not isinstance(arr, list):
+        return None
+    for x in arr:
+        if x is None:
+            continue
+        if _looks_like_udt(x):
+            return 0
+        break
+    return None
+
+
+def _search_elem_key(elem, sort_field):
+    if sort_field is None:
+        return elem
+    return _udt_sort_key(elem, sort_field)
+
+
+def _search_target_key(value, sort_field):
+    if sort_field is None:
+        return value
+    if _looks_like_udt(value):
+        return _udt_sort_key(value, sort_field)
+    return value
+
+
+def _key_lt(left, right) -> bool:
+    if left is None:
+        return False
+    if right is None:
+        return True
+    try:
+        if left != left:  # NaN
+            return False
+        if right != right:
+            return True
+    except Exception:
+        pass
+    try:
+        return left < right
+    except TypeError:
+        return (str(type(left)), str(left)) < (str(type(right)), str(right))
+
+
+def _key_eq(left, right) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    try:
+        if left != left or right != right:  # NaN ≠ NaN for search
+            return False
+    except Exception:
+        pass
+    try:
+        return left == right
+    except Exception:
+        return False
+
+
+def _binary_search_by_field(arr, value, sort_field=None, side="any"):
+    """Shared object-mode binary search; *side* is ``any`` / ``left`` / ``right``."""
+    if not isinstance(arr, list):
+        return -1
+    sort_field = _resolve_search_field(arr, sort_field)
+    target = _search_target_key(value, sort_field)
+    n = len(arr)
+    if side == "left":
+        left, right = 0, n
+        while left < right:
+            mid = (left + right) // 2
+            if _key_lt(_search_elem_key(arr[mid], sort_field), target):
+                left = mid + 1
+            else:
+                right = mid
+        if left < n and _key_eq(_search_elem_key(arr[left], sort_field), target):
+            return left
+        return -1
+    if side == "right":
+        left, right = 0, n
+        while left < right:
+            mid = (left + right) // 2
+            if _key_lt(target, _search_elem_key(arr[mid], sort_field)):
+                right = mid
+            else:
+                left = mid + 1
+        if left > 0 and _key_eq(_search_elem_key(arr[left - 1], sort_field), target):
+            return left - 1
+        return -1
+    lo, hi = 0, n - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        mid_k = _search_elem_key(arr[mid], sort_field)
+        if _key_eq(mid_k, target):
+            return mid
+        if _key_lt(mid_k, target):
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+
+
+def array_binary_search(arr, value, sort_field=None):
+    """Pine ``array.binary_search(id, value, sort_field?)`` → index or -1.
+
+    UDT arrays compare *sort_field* (const int index, default 0, or const
+    string name). The array must be sorted by that field in ascending order.
+    """
+    return _binary_search_by_field(arr, value, sort_field, side="any")
+
+
+def array_binary_search_leftmost(arr, value, sort_field=None):
+    """Pine ``array.binary_search_leftmost(id, value, sort_field?)`` → first index or -1."""
+    return _binary_search_by_field(arr, value, sort_field, side="left")
+
+
+def array_binary_search_rightmost(arr, value, sort_field=None):
+    """Pine ``array.binary_search_rightmost(id, value, sort_field?)`` → last index or -1."""
+    return _binary_search_by_field(arr, value, sort_field, side="right")
 
 
 def _matrix_ncols(m) -> int:
@@ -4933,10 +5077,11 @@ def numba_dmi_inc(high, low, close, di_len, adx_smooth, i, st):
 
 @numba.njit(cache=True)
 def numba_supertrend(high, low, close, factor, atr_period, i):
-    """Simplified Supertrend matching interpret BasicIndicators (not reference ratchet).
+    """Simplified Supertrend matching interpret ``_supertrend`` (not TV ratchet).
 
-    Returns ``(supertrend, direction)`` with direction -1 (up) / +1 (down).
-    ATR via ``numba_atr``; nan ATR treated as 0.0.
+    ``mid=(H+L)/2``; ``dir=-1`` if ``close>=mid`` else ``+1``;
+    band = lower (up) / upper (down) = ``mid ± factor·ATR``.
+    ATR via ``numba_atr``; nan ATR → 0.0 (warmup ``st == mid``).
     """
     atr_period = int(atr_period)
     atr_v = numba_atr(high, low, close, atr_period, i)
@@ -4954,7 +5099,10 @@ def numba_supertrend(high, low, close, factor, atr_period, i):
 
 @numba.njit(cache=True)
 def numba_supertrend_inc(high, low, close, factor, atr_period, i, st):
-    """Incremental Supertrend. ``st`` length 2 — shared with ``numba_atr_inc``."""
+    """Incremental Supertrend. Same simplified mid±factor·ATR as ``numba_supertrend``.
+
+    ``st`` length 2 — shared with ``numba_atr_inc``. Nan ATR → 0.0.
+    """
     atr_period = int(atr_period)
     atr_v = numba_atr_inc(high, low, close, atr_period, i, st)
     if np.isnan(atr_v):
@@ -5130,6 +5278,338 @@ def numba_bbw_inc(arr, period, mult, i, st):
     if np.isnan(mid) or mid == 0.0:
         return np.nan
     return (upper - lower) / mid
+
+
+@numba.njit(cache=True)
+def _kama_sc(arr, j, length, fast, slow):
+    """Kaufman smoothing constant at bar ``j``; NaN window → nan."""
+    oldest = arr[j - length]
+    newest = arr[j]
+    if np.isnan(oldest) or np.isnan(newest):
+        return np.nan
+    change = abs(newest - oldest)
+    vol = 0.0
+    for k in range(length):
+        a = arr[j - k - 1]
+        b = arr[j - k]
+        if np.isnan(a) or np.isnan(b):
+            return np.nan
+        vol += abs(b - a)
+    if vol != 0.0:
+        efficiency = change / vol
+        fastest = 2.0 / (fast + 1.0)
+        slowest = 2.0 / (slow + 1.0)
+        smoothing = efficiency * (fastest - slowest) + slowest
+        return smoothing * smoothing
+    return (2.0 / (slow + 1.0)) ** 2
+
+
+@numba.njit(cache=True)
+def numba_kama(arr, length, fast, slow, i):
+    """Kaufman's AMA at bar ``i``.
+
+    Matches interpret ``_builtin_ta_kama`` / ``_kama_inc_update``: seed at
+    index ``length-1`` (output still na); first value at ``i == length``.
+    """
+    length = int(length)
+    fast = int(fast)
+    slow = int(slow)
+    if length < 1 or i < length:
+        return np.nan
+    seed = arr[length - 1]
+    if np.isnan(seed):
+        return np.nan
+    kama = seed
+    out = np.nan
+    for j in range(length, i + 1):
+        sc = _kama_sc(arr, j, length, float(fast), float(slow))
+        x = arr[j]
+        if np.isnan(sc) or np.isnan(x):
+            out = np.nan
+            continue
+        kama = kama + sc * (x - kama)
+        out = kama
+    return out
+
+
+@numba.njit(cache=True)
+def numba_kama_inc(arr, length, fast, slow, i, st):
+    """Incremental KAMA. ``st``: [kama, last_i, seeded].
+
+    Catch-up / rewind safe. NaN current or window holds prior kama and
+    returns nan (no na→0). Matches ``numba_kama`` on all-finite series.
+    """
+    length = int(length)
+    fast = int(fast)
+    slow = int(slow)
+    if length < 1 or i < 0:
+        return np.nan
+    if np.isnan(st[1]):
+        last = -1
+    else:
+        last = int(st[1])
+    if i < last:
+        last = -1
+        st[0] = np.nan
+        st[2] = 0.0
+    kama = st[0]
+    seeded = st[2] >= 0.5
+    out = np.nan
+    for j in range(last + 1, i + 1):
+        if j < length - 1:
+            out = np.nan
+            continue
+        x = arr[j]
+        if j == length - 1:
+            if np.isnan(x):
+                seeded = False
+                out = np.nan
+            else:
+                kama = x
+                seeded = True
+                out = np.nan
+            continue
+        if not seeded:
+            if not np.isnan(x):
+                kama = x
+                seeded = True
+            out = np.nan
+            continue
+        sc = _kama_sc(arr, j, length, float(fast), float(slow))
+        if np.isnan(sc) or np.isnan(x) or np.isnan(kama):
+            out = np.nan
+            continue
+        kama = kama + sc * (x - kama)
+        out = kama
+    st[0] = kama
+    st[1] = float(i)
+    st[2] = 1.0 if seeded else 0.0
+    return out
+
+
+@numba.njit(cache=True)
+def _simple_rsi_at(arr, t, rsi_len):
+    """Non-Wilder RSI over ``arr[t-rsi_len+1 : t+1]`` (interpret StochRSI)."""
+    start = t - rsi_len + 1
+    if start < 0:
+        return np.nan
+    gains = 0.0
+    losses = 0.0
+    prev = arr[start]
+    if np.isnan(prev):
+        return np.nan
+    for j in range(start + 1, t + 1):
+        cur = arr[j]
+        if np.isnan(cur):
+            return np.nan
+        d = cur - prev
+        if d > 0.0:
+            gains += d
+        else:
+            losses += -d
+        prev = cur
+    avg_gain = gains / rsi_len
+    avg_loss = losses / rsi_len
+    if avg_loss != 0.0:
+        rs = avg_gain / avg_loss
+    else:
+        rs = 100.0
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+@numba.njit(cache=True)
+def numba_stochrsi(arr, rsi_len, stoch_len, i):
+    """StochRSI + 0.33/0.67 signal at bar ``i``.
+
+    Matches interpret ``_stochrsi_inc_update`` (simple RSI, not Wilder).
+    First output at ``i == rsi_len + stoch_len - 1``.
+    """
+    rsi_len = int(rsi_len)
+    stoch_len = int(stoch_len)
+    if rsi_len < 1 or stoch_len < 1 or i < rsi_len + stoch_len - 1:
+        return np.nan, np.nan
+    rsi_buf = np.empty(stoch_len, dtype=np.float64)
+    n_rsi = 0
+    signal = np.nan
+    sr = np.nan
+    have_sig = False
+    for t in range(rsi_len, i + 1):
+        rsi_val = _simple_rsi_at(arr, t, rsi_len)
+        if np.isnan(rsi_val):
+            return np.nan, np.nan
+        if n_rsi < stoch_len:
+            rsi_buf[n_rsi] = rsi_val
+            n_rsi += 1
+        else:
+            for k in range(stoch_len - 1):
+                rsi_buf[k] = rsi_buf[k + 1]
+            rsi_buf[stoch_len - 1] = rsi_val
+        if n_rsi < stoch_len:
+            continue
+        rsi_high = rsi_buf[0]
+        rsi_low = rsi_buf[0]
+        for k in range(1, stoch_len):
+            v = rsi_buf[k]
+            if v > rsi_high:
+                rsi_high = v
+            if v < rsi_low:
+                rsi_low = v
+        span = rsi_high - rsi_low
+        if span == 0.0:
+            sr = 0.0
+        else:
+            sr = (rsi_val - rsi_low) / span * 100.0
+        if not have_sig:
+            signal = sr
+            have_sig = True
+        else:
+            signal = 0.33 * sr + 0.67 * signal
+    return sr, signal
+
+
+@numba.njit(cache=True)
+def numba_stochrsi_inc(arr, rsi_len, stoch_len, i, st):
+    """Incremental StochRSI.
+
+    ``st`` layout (need ``3 + stoch_len``):
+    [0] signal, [1] last_i, [2] n_rsi, [3 .. 2+stoch_len] RSI ring (oldest first).
+    """
+    rsi_len = int(rsi_len)
+    stoch_len = int(stoch_len)
+    if rsi_len < 1 or stoch_len < 1 or i < 0:
+        return np.nan, np.nan
+    if np.isnan(st[1]):
+        last = -1
+    else:
+        last = int(st[1])
+    if i < last:
+        last = -1
+        st[0] = np.nan
+        st[2] = 0.0
+    signal = st[0]
+    n_rsi = 0 if np.isnan(st[2]) else int(st[2])
+    have_sig = not np.isnan(signal)
+    sr = np.nan
+    for t in range(last + 1, i + 1):
+        if t < rsi_len:
+            sr = np.nan
+            continue
+        rsi_val = _simple_rsi_at(arr, t, rsi_len)
+        if np.isnan(rsi_val):
+            sr = np.nan
+            continue
+        if n_rsi < stoch_len:
+            st[3 + n_rsi] = rsi_val
+            n_rsi += 1
+        else:
+            for k in range(stoch_len - 1):
+                st[3 + k] = st[4 + k]
+            st[2 + stoch_len] = rsi_val
+        if n_rsi < stoch_len:
+            sr = np.nan
+            continue
+        rsi_high = st[3]
+        rsi_low = st[3]
+        for k in range(1, stoch_len):
+            v = st[3 + k]
+            if v > rsi_high:
+                rsi_high = v
+            if v < rsi_low:
+                rsi_low = v
+        span = rsi_high - rsi_low
+        if span == 0.0:
+            sr = 0.0
+        else:
+            sr = (rsi_val - rsi_low) / span * 100.0
+        if not have_sig:
+            signal = sr
+            have_sig = True
+        else:
+            signal = 0.33 * sr + 0.67 * signal
+    st[0] = signal
+    st[1] = float(i)
+    st[2] = float(n_rsi)
+    if not have_sig:
+        return np.nan, np.nan
+    return sr, signal
+
+
+@numba.njit(cache=True)
+def _cmf_mf(high, low, close, vol, j):
+    """One-bar CMF money-flow contribution ``(clv * volume, volume)``."""
+    h = high[j]
+    l_ = low[j]
+    c = close[j]
+    v = vol[j]
+    if np.isnan(h) or np.isnan(l_) or np.isnan(c):
+        return np.nan, np.nan
+    vv = 0.0 if np.isnan(v) else v
+    rng = h - l_
+    if rng == 0.0:
+        clv = 0.0
+    else:
+        clv = ((c - l_) - (h - c)) / rng
+    return clv * vv, vv
+
+
+@numba.njit(cache=True)
+def numba_cmf(high, low, close, vol, period, i):
+    """Chaikin Money Flow at bar ``i``.
+
+    Matches interpret ``_cmf``: partial windows from bar 0; zero volume → 0.0.
+    """
+    period = int(period)
+    if period <= 0 or i < 0:
+        return np.nan
+    start = i - period + 1
+    if start < 0:
+        start = 0
+    clv_sum = 0.0
+    vol_sum = 0.0
+    for j in range(start, i + 1):
+        mf, vv = _cmf_mf(high, low, close, vol, j)
+        if np.isnan(mf):
+            continue
+        clv_sum += mf
+        vol_sum += vv
+    if vol_sum > 0.0:
+        return clv_sum / vol_sum
+    return 0.0
+
+
+@numba.njit(cache=True)
+def numba_cmf_inc(high, low, close, vol, period, i, st):
+    """Incremental CMF. ``st``: [clv_vol_sum, vol_sum, last_i]."""
+    period = int(period)
+    if period <= 0 or i < 0:
+        return np.nan
+    if np.isnan(st[2]):
+        last = -1
+    else:
+        last = int(st[2])
+    if i < last:
+        last = -1
+        st[0] = 0.0
+        st[1] = 0.0
+    s = 0.0 if np.isnan(st[0]) or last < 0 else st[0]
+    vs = 0.0 if np.isnan(st[1]) or last < 0 else st[1]
+    for j in range(last + 1, i + 1):
+        drop = j - period
+        if drop >= 0:
+            mf, vv = _cmf_mf(high, low, close, vol, drop)
+            if not np.isnan(mf):
+                s -= mf
+                vs -= vv
+        mf, vv = _cmf_mf(high, low, close, vol, j)
+        if not np.isnan(mf):
+            s += mf
+            vs += vv
+    st[0] = s
+    st[1] = vs
+    st[2] = float(i)
+    if vs > 0.0:
+        return s / vs
+    return 0.0
 
 
 def array_range(arr):

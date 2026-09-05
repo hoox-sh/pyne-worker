@@ -185,3 +185,27 @@ class TestCompileSuccessCache:
         r2 = rt.run(script, _bars(50), mode="compile")
         assert "error" not in r2
         assert r2.get("compile_cached") is True
+
+
+class TestLibraries:
+    def test_runtime_run_libraries_plots_exported_const(self) -> None:
+        lib = """//@version=6
+library("Lib")
+export const float FOO = 1.5
+"""
+        script = """//@version=6
+indicator("axis lib")
+import ns/Lib/1 as x
+plot(x.FOO)
+"""
+        r = Runtime(symbol="TEST").run(
+            script,
+            _bars(5),
+            mode="interpret",
+            libraries=[
+                {"namespace": "ns", "name": "Lib", "version": 1, "source": lib}
+            ],
+        )
+        assert "error" not in r, r.get("error")
+        vals = (r.get("series") or {}).get("plot_0") or r.get("plots") or []
+        assert vals == [1.5] * 5

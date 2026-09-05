@@ -269,6 +269,10 @@ _METHOD_TA = frozenset(
         "vwap",
         "tr",
         "correlation",
+        "kama",
+        "cmf",
+        "stochrsi",
+        "willr",
         "fixnan",
         "nz",
     }
@@ -296,6 +300,9 @@ _ARRAY_METHODS: dict[str, str] = {
     "concat": "array_concat",
     "indexof": "array_indexof",
     "lastindexof": "array_lastindexof",
+    "binary_search": "array_binary_search",
+    "binary_search_leftmost": "array_binary_search_leftmost",
+    "binary_search_rightmost": "array_binary_search_rightmost",
     "insert": "array_insert",
     "first": "array_first",
     "last": "array_last",
@@ -441,6 +448,8 @@ class CompilerVisitor(NodeVisitor):
         # bar-constant series (``lev = input.float(10)`` → ``leverage=10``) into the broker ctor.
         self.const_like_values: dict[str, str] = {}
         self.udt_types: dict[str, list[str]] = {}  # type name -> field names
+        # type name -> field name -> emitted default expr (``false`` → ``False``)
+        self.udt_field_defaults: dict[str, dict[str, str]] = {}
         self.udt_vars: set[str] = set()  # series names holding UDT instances
         self.map_vars: set[str] = set()  # var map names (single object, not series)
         self.scalar_vars: set[str] = set()  # non-series locals (map handles, etc.)
@@ -984,13 +993,18 @@ class CompilerVisitor(NodeVisitor):
 
     # ---------------------------------------------------------------- statements
     def visit_TypeDef(self, node: ast.TypeDef):
-        """Register UDT field names; forces object mode. No runtime emit."""
+        """Register UDT field names and defaults; forces object mode. No runtime emit."""
         self.object_mode = True
         fields: list[str] = []
+        defaults: dict[str, str] = {}
         for stmt in node.body:
             if isinstance(stmt, ast.Assign) and isinstance(stmt.target, ast.Name):
                 fields.append(stmt.target.id)
+                val = getattr(stmt, "value", None)
+                if val is not None:
+                    defaults[stmt.target.id] = self.visit(val)
         self.udt_types[node.name] = fields
+        self.udt_field_defaults[node.name] = defaults
         return ""  # type definitions are compile-time only
 
     def visit_EnumDef(self, node: ast.EnumDef):
@@ -2440,6 +2454,8 @@ class CompilerVisitor(NodeVisitor):
                     "numba_dmi_inc(",
                     "numba_supertrend(",
                     "numba_supertrend_inc(",
+                    "numba_stochrsi(",
+                    "numba_stochrsi_inc(",
                 )
             )
             # Explicit multi-value stubs like "(0.0, 0.0, 25.0)" only
@@ -2922,13 +2938,16 @@ class CompilerVisitor(NodeVisitor):
             if node.attr == "vwap":
                 st = self._alloc_fixed_state("vwap", 3)
                 return f"numba_vwap_inc(close_arr, vol_arr, __bar_idx, {st})"
-            if node.attr == "accdist":
+            if node.attr == "accdist" or node.attr == "ad":
                 # Cumulative A/D line (not single-bar CLV*vol).
                 st = self._alloc_fixed_state("ad", 2)
                 return (
                     f"numba_accdist_inc(high_arr, low_arr, close_arr, vol_arr, "
                     f"__bar_idx, {st})"
                 )
+            if node.attr in ("pvt", "vpt"):
+                st = self._alloc_fixed_state("pvt", 2)
+                return f"numba_pvt_inc(close_arr, vol_arr, __bar_idx, {st})"
             # Method attrs used as Call targets (ta.sma → ta_sma) stay as identifiers.
             return f"ta_{node.attr}"
         if isinstance(node.value, ast.Name) and node.value.id == "color":
@@ -3665,6 +3684,18 @@ class CompilerVisitor(NodeVisitor):
         if func_name == "array_last":
             a = ra(args, kwargs, ("id",))
             return f"({a[0]}[-1] if {a[0]} else np.nan)" if a else "np.nan"
+        if func_name in (
+            "array_binary_search",
+            "array_binary_search_leftmost",
+            "array_binary_search_rightmost",
+        ):
+            # Forms: (id, value), (id, value, sort_field), sort_field= kw.
+            a = ra(args, kwargs, ("id", "value", "sort_field"))
+            if len(a) >= 3:
+                return f"{func_name}({a[0]}, {a[1]}, {a[2]})"
+            if len(a) >= 2:
+                return f"{func_name}({a[0]}, {a[1]})"
+            return "-1"
         if func_name == "array_indexof":
             a = ra(args, kwargs, ("id", "value"))
             if len(a) >= 2:
@@ -4736,6 +4767,13 @@ class CompilerVisitor(NodeVisitor):
             "dema": "ta_dema",
             "tema": "ta_tema",
             "swma": "ta_swma",
+            "kama": "ta_kama",
+            "cmf": "ta_cmf",
+            "stochrsi": "ta_stochrsi",
+            "willr": "ta_wpr",
+            "accdist": "ta_accdist",
+            "pvt": "ta_pvt",
+            "vpt": "ta_pvt",
         }
         if func_name in _BARE_TA and func_name not in self.user_funcs:
             func_name = _BARE_TA[func_name]
@@ -4956,8 +4994,8 @@ class CompilerVisitor(NodeVisitor):
             if args:
                 return f"numba_median({_arr(args[0])}, 14, __bar_idx)"
             return "np.nan"
-        if func_name == "ta_wpr":
-            # ta.wpr(length) | ta.wpr(high, low, close, length)
+        if func_name in ("ta_wpr", "ta_willr"):
+            # ta.wpr / ta.willr(length) | ta.wpr(high, low, close, length)
             if len(args) >= 4 and _is_series_arr(args[0]):
                 return (
                     f"numba_wpr({_arr(args[0])}, {_arr(args[1])}, {_arr(args[2])}, "
@@ -5426,6 +5464,82 @@ class CompilerVisitor(NodeVisitor):
             if args:
                 return f"numba_roc({_arr(args[0])}, 1, __bar_idx)"
             return "np.nan"
+        if func_name == "ta_kama":
+            # ta.kama(source, length[, fast=2, slow=30])
+            if not args:
+                return "np.nan"
+            src = args[0]
+            if len(args) == 1 and not _is_series_arr(args[0]):
+                src = "close_arr[__bar_idx]"
+                length = args[0]
+                fast, slow = "2", "30"
+            else:
+                length = args[1] if len(args) > 1 else "10"
+                fast = kwargs.get("fastLength", args[2] if len(args) > 2 else "2")
+                slow = kwargs.get("slowLength", args[3] if len(args) > 3 else "30")
+            st = self._alloc_fixed_state("kama", 3)
+            return (
+                f"numba_kama_inc({_arr(src)}, {self._emit_period(length)}, "
+                f"int({fast}), int({slow}), __bar_idx, {st})"
+            )
+        if func_name == "ta_cmf":
+            # ta.cmf(period) | ta.cmf(close, high, low, volume, period)
+            st = self._alloc_fixed_state("cmf", 3)
+            if len(args) >= 5 and _is_series_arr(args[0]):
+                return (
+                    f"numba_cmf_inc({_arr(args[1])}, {_arr(args[2])}, {_arr(args[0])}, "
+                    f"{_arr(args[3])}, {self._emit_period(args[4])}, __bar_idx, {st})"
+                )
+            period = args[0] if args else "20"
+            return (
+                f"numba_cmf_inc(high_arr, low_arr, close_arr, vol_arr, "
+                f"{self._emit_period(period)}, __bar_idx, {st})"
+            )
+        if func_name == "ta_stochrsi":
+            # ta.stochrsi(rsiLength, stochLength) on close → (stochrsi, signal)
+            if len(args) >= 3 and _is_series_arr(args[0]):
+                src = _arr(args[0])
+                rsi_len = args[1]
+                stoch_len = args[2]
+            elif len(args) >= 2:
+                src = "close_arr"
+                rsi_len = kwargs.get("rsi_length", args[0])
+                stoch_len = kwargs.get("stoch_length", args[1])
+            elif len(args) == 1:
+                src = "close_arr"
+                rsi_len = args[0]
+                stoch_len = args[0]
+            else:
+                src = "close_arr"
+                rsi_len, stoch_len = "14", "14"
+            stoch_c = self._try_nonneg_int_const(str(stoch_len).strip())
+            if stoch_c is not None and stoch_c > 0:
+                st = self._alloc_fixed_state("srsi", 3 + stoch_c)
+                return (
+                    f"numba_stochrsi_inc({src if src.endswith('_arr') else _arr(src)}, "
+                    f"{self._emit_period(rsi_len)}, {stoch_c}, __bar_idx, {st})"
+                )
+            return (
+                f"numba_stochrsi({src if src.endswith('_arr') else _arr(src)}, "
+                f"{self._emit_period(rsi_len)}, {self._emit_period(stoch_len)}, "
+                f"__bar_idx)"
+            )
+        if func_name in ("ta_accdist", "ta_ad"):
+            st = self._alloc_fixed_state("ad", 2)
+            if len(args) >= 4 and _is_series_arr(args[0]):
+                return (
+                    f"numba_accdist_inc({_arr(args[0])}, {_arr(args[1])}, "
+                    f"{_arr(args[2])}, {_arr(args[3])}, __bar_idx, {st})"
+                )
+            return (
+                f"numba_accdist_inc(high_arr, low_arr, close_arr, vol_arr, "
+                f"__bar_idx, {st})"
+            )
+        if func_name in ("ta_pvt", "ta_vpt"):
+            st = self._alloc_fixed_state("pvt", 2)
+            if len(args) >= 2 and _is_series_arr(args[0]):
+                return f"numba_pvt_inc({_arr(args[0])}, {_arr(args[1])}, __bar_idx, {st})"
+            return f"numba_pvt_inc(close_arr, vol_arr, __bar_idx, {st})"
         if func_name in ("nz",):
             if not args:
                 return "0.0"
@@ -5994,6 +6108,7 @@ class CompilerVisitor(NodeVisitor):
         """Construct a UDT as an ordered-field dict (object mode only)."""
         self.object_mode = True
         fields = self.udt_types.get(type_name, [])
+        defaults = self.udt_field_defaults.get(type_name, {})
         args: list[str] = []
         for arg in node.args:
             if hasattr(arg, "value"):
@@ -6002,7 +6117,12 @@ class CompilerVisitor(NodeVisitor):
                 args.append(self.visit(arg))
         items = [f"'__type__': {type_name!r}"]
         for i, f in enumerate(fields):
-            v = args[i] if i < len(args) else "np.nan"
+            # Omitted ctor args use the type-body default. ``np.nan`` for
+            # missing bools is ``True`` under ``bool()`` and flips BE/flags.
+            if i < len(args):
+                v = args[i]
+            else:
+                v = defaults.get(f, "np.nan")
             items.append(f"{f!r}: {v}")
         return "{" + ", ".join(items) + "}"
 
@@ -6106,7 +6226,16 @@ class CompilerVisitor(NodeVisitor):
         """
         kind = func_name.replace("_new", "").replace("_delete", "")
         if func_name.endswith("_delete"):
-            return ""  # MVP: no-op deletes in compile path
+            # Record delete on __drawings so fold_compile_drawing_mutations can
+            # drop the target handle (shared identity from *.new).
+            target = args[0] if args else "None"
+            parts = [
+                "'kind': 'delete'",
+                f"'method': {func_name!r}",
+                f"'target': {target}",
+                "'bar': __bar_idx",
+            ]
+            return f"__drawings.append({{{', '.join(parts)}}})"
         # Build event dict
         parts = [f"'kind': {kind!r}", "'bar': __bar_idx"]
         # positional common patterns

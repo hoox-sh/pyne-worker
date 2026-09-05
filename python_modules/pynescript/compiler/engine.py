@@ -168,7 +168,7 @@ _BUILTINS_WARMED = False
 # Bump when generated IR semantics change so source→IR disk index is invalidated
 # (source hash alone is stable across compiler fixes, e.g. fill() series keys).
 # v5: strategy series history + Pine na-aware ==/!=
-_DISK_META_VERSION = 7  # risk allow_entry_in/max_position_size + trade query surface
+_DISK_META_VERSION = 8  # UDT field defaults (bool false not np.nan)
 _NJIT_CACHE_FALSE = "@numba.njit(cache=False)"
 _NJIT_CACHE_TRUE = "@numba.njit(cache=True)"
 
@@ -448,6 +448,9 @@ def _run_common_numba_builtin_warm() -> None:
         nb.numba_dema_inc(a, 5, i, st3.copy(), raw)
         nb.numba_tema_inc(a, 5, i, st4.copy(), raw, raw2)
         nb.numba_hma_inc(a, 9, i, st7.copy(), raw)
+        nb.numba_kama_inc(a, 5, 2, 30, i, st3.copy())
+        nb.numba_stochrsi_inc(a, 5, 5, i, np.full(8, np.nan))
+        nb.numba_cmf_inc(h, l, a, np.ones(32), 5, i, st3.copy())
         nb.numba_change(a, 1, i)
         nb.numba_nz(float(i), 0.0)
         nb.numba_crossover(a, l, i)

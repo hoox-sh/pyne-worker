@@ -1,0 +1,18 @@
+{
+  "name": "pyne-worker",
+  "private": true,
+  "description": "PYNE edge evaluate host — Python Cloudflare Worker. Full language toolchain lives in hoox-sh/pyne.",
+  "cloudflare": {
+    "bindings": {
+      "API_KEY": {
+        "description": "Shared secret for the `X-API-Key` header. **Required in production.** Generate with `openssl rand -hex 24`. Leave empty only for a locked-down local test."
+      },
+      "ALERT_WEBHOOK_URL": {
+        "description": "Optional default **HTTPS** destination for Pine Script™ `alert()` / `alertcondition()` firings. Leave empty to skip outbound webhooks."
+      },
+      "INTERNAL_KEY_BINDING": {
+        "description": "Optional mesh key for [trade-worker](https://github.com/hoox-sh/trade-worker) `/webhook`. Leave empty if you are **not** binding trade-worker in this account (first-time Deploy to Cloudflare®)."
+      }
+    }
+  }
+}

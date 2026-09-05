@@ -141,9 +141,12 @@ class TestRun:
         )
         assert status == 200
         assert body["bars"] == 2
+        assert body.get("count") == 2
+        assert body.get("status") == "success"
         assert "events" in body
         assert "script_id" in body
         assert "run_id" in body
+        assert "plots" in body
 
     async def test_accepts_data_alias(self) -> None:
         body, status = await _post(

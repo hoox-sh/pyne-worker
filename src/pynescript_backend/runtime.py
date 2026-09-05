@@ -10,7 +10,8 @@ This module no longer duplicates the bar loop. Worker-only deltas:
 - re-exports host compile caches under this module for existing tests
 
 ``timeout_seconds`` / ``timed_out`` live on the package Runtime so Pro API
-and edge share one circuit breaker.
+and edge share one circuit breaker. ``libraries`` is forwarded to the package
+host (AXIS ``import ns/Name/ver``).
 """
 
 from __future__ import annotations
@@ -93,6 +94,7 @@ class Runtime(_PackageRuntime):
         inputs: dict | None = None,
         profiler: bool = False,
         timeout_seconds: float | None = None,
+        libraries: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ):
         # Fail closed on malformed bars (handler also validates; this covers
@@ -109,6 +111,7 @@ class Runtime(_PackageRuntime):
             inputs=inputs,
             profiler=profiler,
             timeout_seconds=timeout_seconds,
+            libraries=libraries,
             **kwargs,
         )
 

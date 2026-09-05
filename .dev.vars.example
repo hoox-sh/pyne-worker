@@ -1,0 +1,12 @@
+# Secrets prompted by the Deploy to Cloudflare button
+# (https://developers.cloudflare.com/workers/platform/deploy-buttons/).
+# Copy to .dev.vars for local wrangler dev. Do not commit real values.
+
+# Required in production — X-API-Key for /run, /scripts, /cron, /ingest
+API_KEY=
+
+# Optional — default HTTPS webhook for alert() / alertcondition()
+ALERT_WEBHOOK_URL=
+
+# Optional — mesh key for trade-worker /webhook (same account only)
+INTERNAL_KEY_BINDING=

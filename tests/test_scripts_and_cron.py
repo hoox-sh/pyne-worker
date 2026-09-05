@@ -8,8 +8,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from handler import handle_request
 from scheduler import run_scheduled_jobs
+from scripts_registry import normalize_libraries
 
 
 class _FakeR2Object:
@@ -329,5 +332,191 @@ class TestHealthFeatures:
     async def test_health_lists_features(self) -> None:
         payload, status, _ = await handle_request("GET", "/health")
         assert status == 200
-        assert payload["version"] == "0.5.0"
+        assert payload["version"] == "0.6.0"
         assert "modes" in payload.get("features", {})
+        assert payload["features"].get("libraries") is True
+        assert payload.get("engine")
+
+
+class TestNormalizeLibraries:
+    def test_empty(self) -> None:
+        assert normalize_libraries(None) == []
+        assert normalize_libraries([]) == []
+
+    def test_valid(self) -> None:
+        out = normalize_libraries(
+            [{"namespace": "ns", "name": "Lib", "version": "2", "source": "x = 1"}]
+        )
+        assert out == [{"namespace": "ns", "name": "Lib", "version": 2, "source": "x = 1"}]
+
+    def test_rejects_non_list(self) -> None:
+        with pytest.raises(ValueError, match="must be a list"):
+            normalize_libraries({"namespace": "ns"})
+
+    def test_rejects_incomplete(self) -> None:
+        with pytest.raises(ValueError, match="source"):
+            normalize_libraries([{"namespace": "ns", "name": "Lib"}])
+
+
+LIB_SRC = """//@version=6
+library("Lib")
+export const float FOO = 1.5
+"""
+
+LIB_CONSUMER = """//@version=6
+indicator("axis lib")
+import ns/Lib/1 as x
+plot(x.FOO)
+"""
+
+
+class TestRunLibraries:
+    async def test_libraries_resolve_import(self) -> None:
+        body, status = await _api(
+            "POST",
+            "/run",
+            {
+                "script": LIB_CONSUMER,
+                "ohlcv": _bars(3),
+                "mode": "interpret",
+                "libraries": [
+                    {
+                        "namespace": "ns",
+                        "name": "Lib",
+                        "version": 1,
+                        "source": LIB_SRC,
+                    }
+                ],
+            },
+        )
+        assert status == 200, body
+        assert body.get("status") == "success"
+        assert body.get("plots") == [1.5, 1.5, 1.5]
+        assert body.get("count") == 3
+        assert "plot_meta" in body
+
+    async def test_libraries_auto_mode(self) -> None:
+        body, status = await _api(
+            "POST",
+            "/run",
+            {
+                "script": LIB_CONSUMER,
+                "ohlcv": _bars(2),
+                "mode": "auto",
+                "libraries": [
+                    {
+                        "namespace": "ns",
+                        "name": "Lib",
+                        "version": 1,
+                        "source": LIB_SRC,
+                    }
+                ],
+            },
+        )
+        assert status == 200, body
+        assert body.get("plots") == [1.5, 1.5]
+        assert body.get("auto_backend") == "interpret"
+
+    async def test_libraries_compile_rejected(self) -> None:
+        body, status = await _api(
+            "POST",
+            "/run",
+            {
+                "script": LIB_CONSUMER,
+                "ohlcv": _bars(2),
+                "mode": "compile",
+                "libraries": [
+                    {
+                        "namespace": "ns",
+                        "name": "Lib",
+                        "version": 1,
+                        "source": LIB_SRC,
+                    }
+                ],
+            },
+        )
+        assert status == 400
+        assert "libraries" in body.get("error", "").lower()
+
+    async def test_libraries_malformed_400(self) -> None:
+        body, status = await _api(
+            "POST",
+            "/run",
+            {
+                "script": LIB_CONSUMER,
+                "ohlcv": _bars(2),
+                "libraries": [{"namespace": "ns"}],
+            },
+        )
+        assert status == 400
+        assert "libraries" in body.get("error", "").lower()
+
+    async def test_deployed_script_libraries_on_run(self) -> None:
+        r2 = FakeR2Bucket()
+        from data_provider import ingest_ohlcv_to_r2
+
+        await ingest_ohlcv_to_r2(r2, "BTCUSDT", "1m", _bars(4))
+        put_body, put_status = await _api(
+            "POST",
+            "/scripts",
+            {
+                "id": "lib-bot",
+                "script": LIB_CONSUMER,
+                "symbol": "BTCUSDT",
+                "timeframe": "1m",
+                "mode": "interpret",
+                "libraries": [
+                    {
+                        "namespace": "ns",
+                        "name": "Lib",
+                        "version": 1,
+                        "source": LIB_SRC,
+                    }
+                ],
+            },
+            r2=r2,
+        )
+        assert put_status == 200, put_body
+        assert len(put_body["script"]["libraries"]) == 1
+
+        listed, _ = await _api("GET", "/scripts", r2=r2)
+        assert listed["scripts"][0].get("library_count") == 1
+        assert "libraries" not in listed["scripts"][0]
+
+        run_body, run_status = await _api(
+            "POST",
+            "/run",
+            {"script_id": "lib-bot"},
+            r2=r2,
+        )
+        assert run_status == 200, run_body
+        assert run_body.get("plots") == [1.5, 1.5, 1.5, 1.5]
+
+    async def test_cron_uses_deployed_libraries(self) -> None:
+        r2 = FakeR2Bucket()
+        from data_provider import ingest_ohlcv_to_r2
+
+        await ingest_ohlcv_to_r2(r2, "BTCUSDT", "1m", _bars(3))
+        await _api(
+            "POST",
+            "/scripts",
+            {
+                "id": "lib-cron",
+                "script": LIB_CONSUMER,
+                "symbol": "BTCUSDT",
+                "timeframe": "1m",
+                "mode": "interpret",
+                "libraries": [
+                    {
+                        "namespace": "ns",
+                        "name": "Lib",
+                        "version": 1,
+                        "source": LIB_SRC,
+                    }
+                ],
+            },
+            r2=r2,
+        )
+        summary = await run_scheduled_jobs(r2, force=True, refresh_market=False)
+        assert summary["jobs_run"] == 1, summary
+        assert summary["results"][0]["status"] == "ok"

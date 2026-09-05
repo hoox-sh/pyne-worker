@@ -5,6 +5,8 @@ __pycache__/
 *.nbc
 .pytest_cache/
 .wrangler/
+.dev.vars
+.env
 *.log
 .DS_Store
 coverage/

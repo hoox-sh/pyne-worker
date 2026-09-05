@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: pynescript
-Version: 0.3.0
+Version: 0.4.4
 Summary: Parse, inspect, and regenerate TradingView® Pine Script™ from Python
 Author: jango-blockchained
 Maintainer: jango-blockchained

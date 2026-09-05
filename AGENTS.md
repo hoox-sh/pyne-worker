@@ -1,6 +1,6 @@
 # pyne-worker — Agent Instructions
 
-Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package.
+Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package (engine ≥ 0.4.4: libraries, timeout, drawings).
 
 ## Stack
 
@@ -61,12 +61,13 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 | `src/alert_engine.py` | Last-bar alert filter + summary helpers |
 | `src/alert_forwarder.py` | L2 HTTP webhook delivery for alerts |
 | `wrangler.jsonc` | Worker config + cron `* * * * *` |
-| `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars) |
+| `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars; `libraries` / `timeout_seconds`) |
 | `pyproject.toml` | Package config (editable dep on `pynescript`) |
 
 ### Alerts (L2)
 
 - Runtime exports `alerts` on `/run` (pynescript `AlertsMixin`).
+- `POST /run` accepts `libraries: [{namespace, name, version, source}]` (pynescript 0.3.7+) so `import ns/Name/ver` resolves; also stored on deployed scripts for cron.
 - Cron keeps last closed-bar firings only; POSTs to job `webhook_url` or env `ALERT_WEBHOOK_URL`.
 - Webhook URLs must be **HTTPS public hosts** (`security.validate_webhook_url`) — private IPs / localhost rejected.
 - Product docs: [hoox.sh/pyne/docs/runtime/alerts](https://hoox.sh/pyne/docs/runtime/alerts)

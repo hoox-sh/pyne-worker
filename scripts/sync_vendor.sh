@@ -8,16 +8,19 @@
 #
 # Usage:
 #   ./scripts/sync_vendor.sh
-#   PYNESCRIPT_SRC=/path/to/pynescript/src/pynescript ./scripts/sync_vendor.sh
+#   PYNESCRIPT_SRC=/path/to/pyne/src/pynescript ./scripts/sync_vendor.sh
+#   (repo may be cloned as pyne or pynescript)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/python_modules/pynescript"
 
-# Prefer explicit env, then common sibling layouts
+# Prefer explicit env, then common sibling layouts (published clone name is often `pyne`)
 CANDIDATES=(
   "${PYNESCRIPT_SRC:-}"
+  "$ROOT/../pyne/src/pynescript"
   "$ROOT/../pynescript/src/pynescript"
+  "$ROOT/../hoox-pyne/src/pynescript"
   "/mnt/data/home/jango/Git/pynescript/src/pynescript"
   "/home/jango/Git/pynescript/src/pynescript"
 )
@@ -32,7 +35,8 @@ done
 
 if [[ -z "$SRC" ]]; then
   echo "error: cannot find pynescript package tree" >&2
-  echo "set PYNESCRIPT_SRC=/path/to/pynescript/src/pynescript" >&2
+  echo "set PYNESCRIPT_SRC=/path/to/pyne/src/pynescript" >&2
+  echo "# (repo may be cloned as pyne or pynescript)" >&2
   exit 1
 fi
 
@@ -58,9 +62,26 @@ else
   find "$DEST" \( -name '*.pyc' -o -name '*.nbi' -o -name '*.nbc' \) -delete 2>/dev/null || true
 fi
 
-# Refresh dist-info RECORD is optional; keep version label honest
-if [[ -d "$ROOT/python_modules/pynescript-0.3.0.dist-info" ]]; then
-  touch "$ROOT/python_modules/pynescript-0.3.0.dist-info"
+# Refresh dist-info label from the synced package version
+PKG_VER=""
+if [[ -f "$DEST/__about__.py" ]]; then
+  PKG_VER=$(python3 -c "import pathlib,re; t=pathlib.Path('$DEST/__about__.py').read_text(); m=re.search(r'__version__\\s*=\\s*[\"\\']([^\"\\']+)', t); print(m.group(1) if m else '')" 2>/dev/null || true)
+fi
+if [[ -n "$PKG_VER" ]]; then
+  shopt -s nullglob
+  for old in "$ROOT"/python_modules/pynescript-*.dist-info; do
+    base=$(basename "$old")
+    if [[ "$base" != "pynescript-${PKG_VER}.dist-info" ]]; then
+      dest_info="$ROOT/python_modules/pynescript-${PKG_VER}.dist-info"
+      if [[ ! -d "$dest_info" ]]; then
+        mv "$old" "$dest_info"
+      else
+        rm -rf "$old"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  echo "ok: dist-info version $PKG_VER"
 fi
 
 # Sanity checks

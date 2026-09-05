@@ -8,6 +8,7 @@
 
 - :class:`Runtime` — package Runtime + strict OHLCV validation
 - ``timeout_seconds`` — package Runtime circuit breaker (shared with Pro API)
+- ``libraries`` — AXIS git-publish emulator (``import ns/Name/ver``)
 
 Keep ``./scripts/sync_vendor.sh`` in the deploy path so ``python_modules/``
 ships the same package tree Wrangler vendors.

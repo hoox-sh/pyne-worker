@@ -3,7 +3,7 @@
 > Production **Python Cloudflare® Worker** for the **[PYNE](https://hoox.sh/pyne)** stack —
 > evaluate TradingView® Pine Script™ on the edge with the same bar-loop contract as the Pro API.
 
-**Version:** 0.6.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.3.8)
+**Version:** 0.6.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.4.4)
 
 **Website:** [hoox.sh/pyne](https://hoox.sh/pyne) · **Docs:** [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) · **Repo:** [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker)
 
@@ -66,10 +66,17 @@ Local sibling layout (typical):
 
 ```text
 ~/Git/hoox            # edge stack (hoox-sh/hoox)
-~/Git/pynescript      # PYNE core (GitHub: hoox-sh/pyne)
+~/Git/pyne            # PYNE core (GitHub: hoox-sh/pyne) — published clone name
+~/Git/pynescript      # same repo, alternative clone name
 ~/Git/pyne-worker     # this repo
 ~/Git/pine-worker     # TS edge sibling
 ~/Git/axis            # charting PWA
+```
+
+`pyproject.toml` `[tool.uv.sources]` points at `../pynescript`. If the sibling is cloned as `pyne`, either clone/symlink it as `pynescript` or set the path and `uv sync`:
+
+```toml
+pynescript = { path = "../pyne", editable = true }
 ```
 
 ## Overview
@@ -117,6 +124,9 @@ pytest -v
 
 # Sync engine into python_modules/ (required before Cloudflare deploy)
 ./scripts/sync_vendor.sh
+# If the sibling checkout is named pyne (GitHub: hoox-sh/pyne) rather than pynescript:
+#   PYNESCRIPT_SRC=/path/to/pyne/src/pynescript ./scripts/sync_vendor.sh
+#   (repo may be cloned as pyne or pynescript)
 
 # Deploy
 npx wrangler deploy

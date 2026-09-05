@@ -66,20 +66,37 @@ def _export_num(v: Any) -> float | int | None:
 
 
 def _export_x_to_time(x: Any, xloc: str, times: list[int]) -> int | float | None:
+    """Map drawing X to unix seconds (or bare bar_index when times unavailable).
+
+    ``xloc.bar_index`` past the last bar (classic ``bar_index + 1`` on
+    ``barstate.islast``) is extrapolated from the series period so AXIS still
+    receives a finite ``t1``/``t2`` instead of dropping the whole object.
+    """
     xv = _export_num(x)
     if xv is None:
         return None
     loc = (xloc or "bar_index").lower()
     if "time" in loc:
         return xv
-    # bar_index → wall time
-    idx = int(xv)
-    if 0 <= idx < len(times):
-        return times[idx]
-    # already looks like unix seconds / ms
+    # already looks like unix seconds / ms (even with bar_index xloc mis-set)
     if xv > 1_000_000_000:
         return xv
-    return None
+    idx = int(xv)
+    n = len(times) if times is not None else 0
+    if n == 0:
+        # No bar clock — pass bar_index through; AXIS paints via logical index
+        return idx
+    if 0 <= idx < n:
+        return times[idx]
+    # Extrapolate past ends (bar_index+1 on last bar is the common TV pattern)
+    if n == 1:
+        period = 60
+    else:
+        period = max(1, int(times[-1]) - int(times[-2]))
+    if idx >= n:
+        return int(times[-1]) + (idx - (n - 1)) * period
+    # idx < 0 → before first bar
+    return int(times[0]) + idx * period
 
 
 def _export_color(c: Any) -> str:
@@ -320,6 +337,93 @@ class DrawingRegistry:
         return _merge(series, drawings, n_bars, plot_meta=plot_meta)
 
     @classmethod
+    def fold_compile_drawing_mutations(
+        cls,
+        drawings: list[dict[str, Any]] | list[Any] | None,
+    ) -> list[Any]:
+        """Apply compile-path ``kind: set`` / ``kind: delete`` onto ``target`` handles.
+
+        Object-mode compile appends ``line.set_*`` / ``label.set_*`` / … and
+        ``line.delete`` / … as separate events; the original ``line``/``label``/…
+        dict is still the live handle. Fold mutations in-process (shared identity)
+        then drop set/delete events so AXIS receives final geometry only.
+
+        Deletes: dedicated ``kind: 'delete'`` (compiler ``*_delete`` emitters) or
+        a set event whose method ends with ``.delete`` / ``_delete``.
+        """
+        if not drawings:
+            return []
+        deleted_ids: set[int] = set()
+        for item in drawings:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or item.get("type") or "").lower()
+            if kind == "delete":
+                target = item.get("target")
+                if isinstance(target, dict):
+                    deleted_ids.add(id(target))
+                    target["deleted"] = True
+                continue
+            if kind != "set":
+                continue
+            target = item.get("target")
+            if not isinstance(target, dict):
+                continue
+            method = str(item.get("method") or "")
+            args = item.get("args") if isinstance(item.get("args"), list) else []
+            # method is e.g. "line.set_xy2" or "line_set_xy2"
+            bare = method.replace("line_set_", "line.set_").replace("label_set_", "label.set_")
+            bare = bare.replace("box_set_", "box.set_").replace("polyline_set_", "polyline.set_")
+            bare = bare.replace("table_set_", "table.set_")
+            mlow = bare.lower()
+            if mlow.endswith(".delete") or mlow.endswith("_delete"):
+                deleted_ids.add(id(target))
+                target["deleted"] = True
+                continue
+            field = bare.split(".")[-1] if "." in bare else bare
+            field = field.replace("set_", "")
+            # Common mutators
+            if field == "xy1" and len(args) >= 2:
+                target["x1"] = args[0]
+                target["y1"] = args[1]
+                target["x"] = args[0]
+                target["y"] = args[1]
+            elif field == "xy2" and len(args) >= 2:
+                target["x2"] = args[0]
+                target["y2"] = args[1]
+            elif field in {"x1", "y1", "x2", "y2", "left", "right", "top", "bottom", "x", "y"}:
+                if args:
+                    target[field] = args[0]
+            elif field == "color" and args:
+                target["color"] = args[0]
+            elif field in {"width", "linewidth"} and args:
+                target["width"] = args[0]
+            elif field == "extend" and args:
+                target["extend"] = args[0]
+            elif field in {"style", "text", "textcolor", "text_color", "bgcolor"} and args:
+                key = "textcolor" if field == "text_color" else field
+                target[key] = args[0]
+            elif field == "xy" and len(args) >= 2:
+                # label.set_xy
+                target["x"] = args[0]
+                target["y"] = args[1]
+            elif args:
+                # Generic: first arg is the new value for set_<field>
+                target[field] = args[0]
+
+        out: list[Any] = []
+        for item in drawings:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or item.get("type") or "").lower()
+            if kind in ("set", "delete"):
+                continue
+            if item.get("deleted") or id(item) in deleted_ids:
+                continue
+            out.append(item)
+        return out
+
+    @classmethod
     def gc_exported_drawings(
         cls,
         drawings: list[dict[str, Any]] | list[Any],
@@ -387,11 +491,16 @@ class DrawingRegistry:
         """True when no *exportable* drawing objects exist (O(1) length checks).
 
         Used by Runtime to skip ``export_for_api`` and bar_times materialization.
-        Linefills are not serialized by :meth:`export_for_api`, so they do not
-        count (avoids allocating bar_times when only linefills exist).
         """
         # truthiness of a list is len != 0 — no iteration
-        return not (cls.lines or cls.boxes or cls.labels or cls.tables or cls.polylines)
+        return not (
+            cls.lines
+            or cls.boxes
+            or cls.labels
+            or cls.tables
+            or cls.polylines
+            or cls.linefills
+        )
 
     @classmethod
     def export_for_api(cls, bar_times: list[int] | None = None) -> list[dict[str, Any]]:
@@ -402,8 +511,14 @@ class DrawingRegistry:
         Fast path: empty registry returns ``[]`` without allocating helpers or
         walking collections (most indicator scripts never draw).
         """
-        # Exportable collections only (linefills are not serialized today)
-        if not (cls.lines or cls.boxes or cls.labels or cls.tables or cls.polylines):
+        if not (
+            cls.lines
+            or cls.boxes
+            or cls.labels
+            or cls.tables
+            or cls.polylines
+            or cls.linefills
+        ):
             return []
 
         out: list[dict[str, Any]] = []
@@ -437,6 +552,7 @@ class DrawingRegistry:
                     "width": int(_num(ln.width) or 1),
                     "style": str(ln.style or "solid"),
                     "extend": _extend(ln.extend),
+                    "force_overlay": bool(getattr(ln, "force_overlay", False)),
                 }
             )
 
@@ -463,6 +579,7 @@ class DrawingRegistry:
                     "bgcolor": _color(bx.bgcolor) if bx.bgcolor else "rgba(0,0,0,0)",
                     "width": int(_num(bx.border_width) or 1),
                     "text": str(bx.text or ""),
+                    "force_overlay": bool(getattr(bx, "force_overlay", False)),
                 }
             )
 
@@ -476,15 +593,24 @@ class DrawingRegistry:
             y = _num(lb.y)
             if t is None or y is None:
                 continue
+            size_raw = getattr(lb, "size", None)
+            if size_raw is None or size_raw == "" or size_raw == "auto":
+                size_raw = getattr(lb, "text_size", None) or "auto"
+            yloc_raw = str(getattr(lb, "yloc", None) or "price")
+            if yloc_raw.startswith("#") or yloc_raw.startswith("rgb"):
+                yloc_raw = "price"
             out.append(
                 {
                     "type": "label",
+                    "force_overlay": bool(getattr(lb, "force_overlay", False)),
                     "t1": t,
                     "p1": y,
                     "text": str(lb.text or ""),
                     "color": _color(lb.color),
                     "textcolor": _color(lb.textcolor),
                     "style": str(lb.style or "label_center"),
+                    "yloc": yloc_raw,
+                    "size": size_raw if isinstance(size_raw, (int, float)) else str(size_raw),
                 }
             )
 
@@ -521,6 +647,49 @@ class DrawingRegistry:
                     "p1": pts_out[0]["price"],
                     "t2": pts_out[-1]["time"],
                     "p2": pts_out[-1]["price"],
+                }
+            )
+
+        # linefill.new — fill between two Line objects (quad for AXIS SVG)
+        for fill in cls.linefills:
+            if getattr(fill, "deleted", False):
+                continue
+            l1 = getattr(fill, "line1", None)
+            l2 = getattr(fill, "line2", None)
+            if l1 is None or l2 is None:
+                continue
+            if getattr(l1, "deleted", False) or getattr(l2, "deleted", False):
+                continue
+            xloc1 = str(getattr(l1, "xloc", "bar_index") or "bar_index")
+            xloc2 = str(getattr(l2, "xloc", "bar_index") or "bar_index")
+            if xloc1.startswith("#") or xloc1.startswith("rgb"):
+                xloc1 = "bar_index"
+            if xloc2.startswith("#") or xloc2.startswith("rgb"):
+                xloc2 = "bar_index"
+            t1 = _x_to_time(l1.x1, xloc1, times)
+            t2 = _x_to_time(l1.x2, xloc1, times)
+            p1 = _num(l1.y1)
+            p2 = _num(l1.y2)
+            t3 = _x_to_time(l2.x1, xloc2, times)
+            t4 = _x_to_time(l2.x2, xloc2, times)
+            p3 = _num(l2.y1)
+            p4 = _num(l2.y2)
+            if None in (t1, t2, p1, p2, t3, t4, p3, p4):
+                continue
+            out.append(
+                {
+                    "type": "linefill",
+                    "t1": t1,
+                    "p1": p1,
+                    "t2": t2,
+                    "p2": p2,
+                    "t3": t3,
+                    "p3": p3,
+                    "t4": t4,
+                    "p4": p4,
+                    "color": _color(getattr(fill, "color", None)),
+                    # AXIS / SVG fill; stroke unused
+                    "bgcolor": _color(getattr(fill, "color", None)),
                 }
             )
 
@@ -1278,22 +1447,24 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
             if isinstance(x, ChartPoint):
                 x, y = _coord_from_point(x)
 
+        # Keyword ctor — `size` sits before `tooltip`/`style` in the dataclass.
         label = Label(
-            x,
-            y,
-            text,
-            xloc,
-            yloc,
-            color,
-            textcolor,
-            text_font_family,
-            text_halign,
-            text_valign,
-            text_size,
-            text_formatting,
-            tooltip,
-            style,
-            force_overlay=force_overlay,
+            x=x,
+            y=y,
+            text=str(text or ""),
+            xloc=str(xloc or "bar_index"),
+            yloc=str(yloc or "price"),
+            color=color,
+            textcolor=textcolor,
+            text_font_family=text_font_family,
+            text_halign=text_halign,
+            text_valign=text_valign,
+            text_size=text_size,
+            text_formatting=text_formatting,
+            size=text_size,
+            tooltip=str(tooltip or ""),
+            style=str(style or "label_center"),
+            force_overlay=bool(force_overlay),
         )
         return DrawingRegistry.add_label(label)
 
@@ -1308,20 +1479,24 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         label = args[0] if len(args) > 0 else None
         if isinstance(label, Label):
             new_label = Label(
-                label.x,
-                label.y,
-                label.text,
-                label.xloc,
-                label.yloc,
-                label.color,
-                label.textcolor,
-                label.text_font_family,
-                label.text_halign,
-                label.text_valign,
-                label.text_size,
-                label.text_formatting,
-                label.tooltip,
-                label.style,
+                x=label.x,
+                y=label.y,
+                text=label.text,
+                xloc=label.xloc,
+                yloc=label.yloc,
+                color=label.color,
+                textcolor=label.textcolor,
+                text_font_family=label.text_font_family,
+                text_halign=label.text_halign,
+                text_valign=label.text_valign,
+                text_size=label.text_size,
+                text_formatting=label.text_formatting,
+                size=label.size,
+                tooltip=label.tooltip,
+                style=label.style,
+                border_color=label.border_color,
+                border_width=label.border_width,
+                border_style=label.border_style,
                 force_overlay=label.force_overlay,
             )
             return DrawingRegistry.add_label(new_label)

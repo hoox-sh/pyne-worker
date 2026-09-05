@@ -32,6 +32,7 @@ from middleware import LogHelper
 from middleware import RateLimiter
 from middleware import validate_api_key
 from pynescript_backend import Runtime
+from scripts_registry import normalize_libraries
 from security import safe_error_message
 from security import sanitize_symbol
 from security import sanitize_timeframe
@@ -40,9 +41,12 @@ from security import sanitize_timeframe
 # Limits
 # ---------------------------------------------------------------------------
 
+_WORKER_VERSION = "0.6.0"
 _MAX_SCRIPT_LENGTH = 100_000  # characters
 _MAX_BARS = 100_000
 _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+_DEFAULT_TIMEOUT_SECONDS = 30.0
+_MAX_TIMEOUT_SECONDS = 30.0
 _REQUIRED_BAR_FIELDS = {"open", "high", "low", "close", "time"}
 
 # ---------------------------------------------------------------------------
@@ -291,17 +295,28 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
     Synchronously checks in-memory state; async checks are done separately
     in entry.py when the response is built.
     """
+    engine_version = ""
+    try:
+        from pynescript import __version__ as engine_version
+    except Exception:
+        engine_version = "unknown"
     return _json_response(
         {
             "status": "ok",
             "worker": "pyne-worker",
-            "version": "0.5.0",
+            "version": _WORKER_VERSION,
+            "engine": engine_version,
             "features": {
                 "modes": ["interpret", "compile", "auto"],
                 "scripts": True,
                 "cron": True,
                 "alerts": True,
                 "alert_webhooks": True,
+                "libraries": True,
+                "inputs": True,
+                "profiler": True,
+                "drawings": True,
+                "timeout_seconds": True,
                 "live_feed": True,
                 "feed_sources": ["bybit", "binance"],
                 "timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
@@ -328,6 +343,10 @@ async def handle_run(
       - ``script_id`` (str) — deployed script id from R2 registry
       - ``ohlcv`` / ``data`` (list) — bars, or resolve from R2 via symbol+timeframe
       - ``mode`` — ``interpret`` | ``compile`` | ``auto`` (default ``interpret``)
+      - ``inputs`` — optional ``input.*`` overrides (title → value)
+      - ``libraries`` — optional ``[{namespace, name, version, source}]``
+      - ``profiler`` — per-line interpret timings
+      - ``timeout_seconds`` — wall-clock budget (default 30, max 30)
       - ``max_bars`` — optional tail length when loading from R2
     """
     data, err = _parse_body(body)
@@ -360,6 +379,10 @@ async def handle_run(
         data.setdefault("mode", rec.get("mode", "auto"))
         if "max_bars" not in data and rec.get("max_bars"):
             data["max_bars"] = rec["max_bars"]
+        if "libraries" not in data and rec.get("libraries"):
+            data["libraries"] = rec["libraries"]
+        if "inputs" not in data and rec.get("inputs"):
+            data["inputs"] = rec["inputs"]
 
     if not script or not isinstance(script, str):
         return _json_response(
@@ -473,14 +496,37 @@ async def handle_run(
     if isinstance(inputs_raw, dict) and inputs_raw:
         inputs = inputs_raw
 
+    try:
+        libraries = normalize_libraries(data.get("libraries"))
+    except ValueError as e:
+        return _json_response({"error": str(e)}, 400)
+    if libraries and mode == "compile":
+        return _json_response(
+            {"error": "libraries require mode interpret or auto (compile has no import path)"},
+            400,
+        )
+
+    profiler = bool(data.get("profiler"))
+    timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
+    if "timeout_seconds" in data and data.get("timeout_seconds") is not None:
+        try:
+            timeout_seconds = float(data["timeout_seconds"])
+        except (TypeError, ValueError):
+            return _json_response({"error": "'timeout_seconds' must be a number"}, 400)
+        if timeout_seconds <= 0:
+            return _json_response({"error": "'timeout_seconds' must be > 0"}, 400)
+        timeout_seconds = min(timeout_seconds, _MAX_TIMEOUT_SECONDS)
+
     # Execute with timeout via Runtime
     runtime = Runtime(symbol=symbol)
     result = runtime.run(
         script,
         ohlcv,
-        timeout_seconds=30.0,
+        timeout_seconds=timeout_seconds,
         mode=mode,
         inputs=inputs,
+        profiler=profiler,
+        libraries=libraries or None,
     )
 
     if "error" in result:
@@ -500,10 +546,13 @@ async def handle_run(
             504,
         )
 
+    bar_count = result.get("count", len(ohlcv))
     resp: dict[str, Any] = {
+        "status": "success",
         "events": result.get("events", []),
         "plots": result.get("plots", []),
-        "bars": result.get("count", len(ohlcv)),
+        "bars": bar_count,
+        "count": bar_count,
         "script_id": result.get("script_id", ""),
         "run_id": result.get("run_id", ""),
         "mode": result.get("mode") or mode,
@@ -520,6 +569,8 @@ async def handle_run(
         resp["object_mode"] = result["object_mode"]
     if result.get("series") is not None:
         resp["series"] = result["series"]
+    if result.get("plot_meta") is not None:
+        resp["plot_meta"] = result["plot_meta"]
     if result.get("drawings") is not None:
         resp["drawings"] = result["drawings"]
     if result.get("alerts") is not None:
@@ -532,6 +583,20 @@ async def handle_run(
         resp["meta"] = result["meta"]
     if result.get("compile_cached") is not None:
         resp["compile_cached"] = result["compile_cached"]
+    if result.get("compile_ms") is not None:
+        resp["compile_ms"] = result["compile_ms"]
+    if result.get("nopython_fallback_reason"):
+        resp["nopython_fallback_reason"] = result["nopython_fallback_reason"]
+    if result.get("overlay") is not None:
+        resp["overlay"] = result["overlay"]
+    if result.get("script_name") is not None:
+        resp["script_name"] = result["script_name"]
+    if result.get("script_type") is not None:
+        resp["script_type"] = result["script_type"]
+    if result.get("logs") is not None:
+        resp["logs"] = result["logs"]
+    if result.get("profile") is not None:
+        resp["profile"] = result["profile"]
     return _json_response(resp)
 
 

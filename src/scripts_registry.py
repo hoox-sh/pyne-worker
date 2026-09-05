@@ -25,7 +25,45 @@ from security import validate_webhook_url
 _SCRIPT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _EXCHANGE_RE = re.compile(r"^[a-zA-Z0-9_]+$")
 _MAX_SCRIPT_LENGTH = 100_000
+_MAX_LIBRARIES = 32
 _VALID_MODES = frozenset({"interpret", "compile", "auto"})
+
+
+def normalize_libraries(raw: Any) -> list[dict[str, Any]]:
+    """Validate AXIS-style ``[{namespace, name, version, source}, …]``.
+
+    Matches Pro API ``POST /run`` ``libraries`` (max 32). Raises ``ValueError``
+    on malformed entries. Empty / missing input returns ``[]``.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("'libraries' must be a list")
+    if len(raw) > _MAX_LIBRARIES:
+        raise ValueError(f"'libraries' exceeds {_MAX_LIBRARIES} entries")
+    out: list[dict[str, Any]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"libraries[{i}] must be an object")
+        ns = str(item.get("namespace") or "").strip()
+        name = str(item.get("name") or "").strip()
+        src = item.get("source")
+        if not isinstance(src, str):
+            raise ValueError(f"libraries[{i}].source must be a string")
+        if not ns or not name or not src.strip():
+            raise ValueError(f"libraries[{i}] requires namespace, name, and source")
+        if len(src) > _MAX_SCRIPT_LENGTH:
+            raise ValueError(
+                f"libraries[{i}].source exceeds {_MAX_SCRIPT_LENGTH} character limit"
+            )
+        try:
+            ver = int(item.get("version") or 1)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"libraries[{i}].version must be an integer") from e
+        if ver < 1:
+            raise ValueError(f"libraries[{i}].version must be >= 1")
+        out.append({"namespace": ns, "name": name, "version": ver, "source": src})
+    return out
 
 
 def sanitize_exchange(value: str | None) -> str | None:
@@ -174,6 +212,17 @@ async def put_script(bucket: Any, record: dict[str, Any]) -> dict[str, Any]:
     if exch is not None:
         stored["exchange"] = exch
 
+    # Optional in-process library sources for ``import ns/Name/ver``
+    if "libraries" in record:
+        libs = normalize_libraries(record.get("libraries"))
+        if libs:
+            stored["libraries"] = libs
+
+    # Optional default input.* overrides applied on cron / script_id /run
+    inputs = record.get("inputs")
+    if isinstance(inputs, dict) and inputs:
+        stored["inputs"] = inputs
+
     await _put_json(bucket, _script_key(str(script_id)), stored)
     ids = await load_index(bucket)
     if script_id not in ids:
@@ -235,6 +284,9 @@ async def list_scripts(bucket: Any) -> list[dict[str, Any]]:
                 item["webhook_url"] = rec.get("webhook_url")
             if rec.get("exchange"):
                 item["exchange"] = rec.get("exchange")
+            libs = rec.get("libraries")
+            if isinstance(libs, list) and libs:
+                item["library_count"] = len(libs)
             out.append(item)
     return out
 

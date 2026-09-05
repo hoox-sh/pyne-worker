@@ -184,8 +184,17 @@ async def run_scheduled_jobs(
             )
             continue
 
+        libraries = rec.get("libraries") if isinstance(rec.get("libraries"), list) else None
+        inputs = rec.get("inputs") if isinstance(rec.get("inputs"), dict) else None
         runtime = Runtime(symbol=symbol)
-        result = runtime.run(script, ohlcv, timeout_seconds=25.0, mode=mode)
+        result = runtime.run(
+            script,
+            ohlcv,
+            timeout_seconds=25.0,
+            mode=mode,
+            inputs=inputs or None,
+            libraries=libraries or None,
+        )
 
         if "error" in result:
             results.append(

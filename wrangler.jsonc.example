@@ -1,0 +1,45 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pyne-worker",
+  "account_id": "YOUR_ACCOUNT_ID",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-07-24",
+  "compatibility_flags": ["python_workers", "disable_python_external_sdk"],
+  "placement": { "mode": "smart" },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
+  },
+  "vars": {
+    "TRADE_WORKER_NAME": "trade-worker"
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  // Production secrets (set via `wrangler secret put`):
+  //   API_KEY — HTTP auth (X-API-Key)
+  //   ALERT_WEBHOOK_URL — default HTTPS destination for alert()
+  //   INTERNAL_KEY_BINDING — must match trade-worker mesh key
+  // TRADE_SERVICE is optional. Remove the services block if trade-worker
+  // is not in this account — trade forward fails closed either way.
+  "services": [
+    {
+      "binding": "TRADE_SERVICE",
+      "service": "trade-worker"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "OHLCV_DATA",
+      "bucket_name": "pyne-worker-ohlcv",
+      "preview_bucket_name": "pyne-worker-ohlcv-dev"
+    }
+  ]
+}
