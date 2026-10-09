@@ -20,13 +20,22 @@
   },
   "vars": {
     "TRADE_WORKER_NAME": "trade-worker",
-    // SaaS console base URL for the future tenant verify / usage path
-    // (Phase 2 thin slice: Bearer hx_live_… is passthrough only, no remote
-    // fetch yet, so this var is currently informational).
+    // SaaS console base URL for live tenant verify + usage metering.
+    // Tenant `hx_live_…` keys are verified via
+    //   GET {CONSOLE_URL}/api/v1/verify?scope=pyne:run
+    // (hash-on-wire: Authorization carries sha256hex(raw), never the raw
+    // key; results cached 60s positive / 10s negative in-isolate), and
+    // `/run` + `/ingest` usage is flushed to POST {CONSOLE_URL}/api/v1/usage.
+    // Unset/empty (self-host) keeps the legacy passthrough: tenant keys are
+    // accepted without remote verify and no usage is reported.
     "CONSOLE_URL": "https://console.hoox.sh"
-    // Future quota enforcement will add a TENANT_KEYS KV binding here for the
+    // Metering auth (optional — set via `wrangler secret put USAGE_SERVICE_KEY`):
+    // Bearer for POST {CONSOLE_URL}/api/v1/usage. When unset, usage flush
+    // falls back to the per-request tenant key hash (still hash-on-wire).
+    // Future quota enforcement may add a TENANT_KEYS KV binding here for the
     // verify cache (key hash → plan/scopes/limits, 60s TTL). Do NOT add the
-    // binding until the verify path lands — a missing KV id breaks deploy.
+    // binding until needed — a missing KV id breaks deploy. Shape when added:
+    //   "kv_namespaces": [{ "binding": "TENANT_KEYS", "id": "<kv-id>" }]
   },
   // Bar-close scheduler: every minute (UTC). Only re-runs when R2 has a newer bar.
   // Keep 1m data fresh via scripts/fetch_and_ingest.py (Binance blocks CF IPs).
@@ -37,6 +46,8 @@
   //   API_KEY — shared secret for HTTP auth (X-API-Key header)
   //   ALERT_WEBHOOK_URL — default HTTPS destination for alert()/alertcondition()
   //   INTERNAL_KEY_BINDING — must match trade-worker mesh key for /webhook forward
+  //   USAGE_SERVICE_KEY — service Bearer for POST {CONSOLE_URL}/api/v1/usage
+  //     (optional; falls back to the per-request tenant key hash)
   // Optional vars:
   //   DEFAULT_EXCHANGE — default trade exchange id (default: binance)
   "services": [

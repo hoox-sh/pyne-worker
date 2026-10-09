@@ -90,8 +90,14 @@ class Default(WorkerEntrypoint):
     - ``DEFAULT_EXCHANGE`` (var) — Default exchange id for trade forward
       (default ``binance``; per-script / per-event override).
     - ``CONSOLE_URL`` (var) — Base URL of the SaaS console
-      (default ``https://console.hoox.sh``). Reserved for the future
-      tenant verify / usage path; no remote calls are made yet.
+    -   (default ``https://console.hoox.sh``). When set, ``hx_live_…`` tenant
+    -   keys are verified live (``GET /api/v1/verify``, hash-on-wire, cached)
+    -   and ``/run`` / ``/ingest`` usage is flushed to
+    -   ``POST /api/v1/usage``. When unset, tenant keys fall back to
+    -   legacy passthrough (self-host) with no remote calls.
+    - ``USAGE_SERVICE_KEY`` (secret, optional) — Service Bearer for
+    -   ``POST /api/v1/usage``. Falls back to the per-request tenant key
+    -   hash (still hash-on-wire) when unset.
     """
 
     TRADE_SERVICE: object  # service binding, set by the runtime
@@ -102,7 +108,8 @@ class Default(WorkerEntrypoint):
     TRADE_EXECUTE_KEY_BINDING: str | None = None  # optional execute-scoped key
     TRADE_INTERNAL_KEY: str | None = None  # legacy alias
     DEFAULT_EXCHANGE: str | None = None  # optional default exchange
-    CONSOLE_URL: str | None = None  # future tenant verify base URL (unused yet)
+    CONSOLE_URL: str | None = None  # tenant verify + usage base URL (None → passthrough)
+    USAGE_SERVICE_KEY: str | None = None  # optional service Bearer for POST /api/v1/usage
 
     async def fetch(self, request):
         start = time.time()
@@ -140,6 +147,8 @@ class Default(WorkerEntrypoint):
             expected_api_key=getattr(self.env, "API_KEY", None),
             request_id=request_id,
             authorization=authorization,
+            console_url=getattr(self.env, "CONSOLE_URL", None),
+            usage_auth=getattr(self.env, "USAGE_SERVICE_KEY", None),
         )
 
         # -- Forward strategy events to trade-worker ----------------------

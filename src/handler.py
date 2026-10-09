@@ -39,6 +39,13 @@ from scripts_registry import normalize_libraries
 from security import safe_error_message
 from security import sanitize_symbol
 from security import sanitize_timeframe
+from tenant_verify import TENANT_SCOPE
+from tenant_verify import UPGRADE_URL
+from tenant_verify import VerifyResult
+from tenant_verify import flush_usage_queue
+from tenant_verify import key_hash_full
+from tenant_verify import queue_usage_event
+from tenant_verify import verify_tenant
 
 # ---------------------------------------------------------------------------
 # Limits
@@ -159,6 +166,38 @@ def _match_route(path: str) -> tuple[str, str | None]:
 # ---------------------------------------------------------------------------
 
 
+async def _record_tenant_usage(
+    *,
+    console_url: str | None,
+    usage_auth: str | None,
+    verified: VerifyResult | None,
+    tenant_key_hash: str | None,
+    tenant_hash16: str | None,
+    response_status: int,
+    bars: Any,
+) -> None:
+    """Queue + flush one usage event for a verified tenant call.
+
+    Metering must never fail the ``/run``: every failure path is swallowed
+    and logged (hash prefixes only — never raw keys).
+    """
+    try:
+        if not console_url or verified is None or verified.outcome != "valid":
+            return
+        if not verified.tid or response_status != 200:
+            return
+        try:
+            bar_count = max(0, int(bars or 0))
+        except (TypeError, ValueError):
+            bar_count = 0
+        queue_usage_event(verified.tid, TENANT_SCOPE, 1, bar_count, tenant_hash16 or "unknown")
+        # Service auth when configured, else the per-request tenant key hash
+        # (hash-on-wire in both cases — never the raw key).
+        await flush_usage_queue(console_url, usage_auth or tenant_key_hash)
+    except Exception as e:
+        print(json.dumps({"type": "usage_record_error", "error": str(e)[:200]}))
+
+
 async def handle_request(
     method: str,
     path: str,
@@ -168,6 +207,8 @@ async def handle_request(
     expected_api_key: str | None = None,
     request_id: str | None = None,
     authorization: str | None = None,
+    console_url: str | None = None,
+    usage_auth: str | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, str]]:
     """Route and process a request through the middleware pipeline.
 
@@ -180,9 +221,23 @@ async def handle_request(
         expected_api_key: The expected secret, or ``None`` to disable auth.
         request_id: Unique request identifier for logging.
         authorization: Raw ``Authorization`` header value (or ``None``).
-            A ``Bearer hx_live_…`` tenant key is accepted as passthrough
-            (no remote verify, no quota yet); any other Bearer value falls
-            through to the ``X-API-Key`` path unchanged.
+            A ``Bearer hx_live_…`` tenant key is verified live against the
+            console when ``console_url`` is set (hash-on-wire, cached), and
+            accepted as legacy passthrough when it is not.
+        console_url: SaaS console base URL for tenant verify + usage flush
+            (or ``None`` for self-host passthrough — no remote calls).
+        usage_auth: Service Bearer for ``POST {console}/api/v1/usage``.
+            Falls back to the per-request tenant key hash when unset.
+
+    Tenant responses:
+        - Unknown/revoked key → ``401 {"ok": false, "error": {"code":
+          "INVALID_KEY"}}``.
+        - Authenticated but missing scope ``pyne:run`` → ``402 {"ok": false,
+          "error": {"code": "ENTITLEMENT_REQUIRED", "scope": "pyne:run",
+          "upgrade": "https://console.hoox.sh/billing"}}``.
+        - Console unreachable + legacy key match → degraded allow with
+          ``X-Hoox-Verify: degraded`` (fail-open self-host only); without a
+          legacy match the request fails closed with 401.
 
     Returns:
         ``(response_dict, status_code, response_headers)``.
@@ -206,87 +261,167 @@ async def handle_request(
     if route not in known and route != "/health":
         return _json_response({"error": "Not found"}, 404)
 
-    # -- Auth: tenant Bearer passthrough, else legacy X-API-Key -----------
+    # -- Auth: tenant Bearer (live verify when console set), else legacy X-API-Key
     bearer = extract_bearer_token(authorization)
+    verified: VerifyResult | None = None
+    verify_headers: dict[str, str] = {}
+    tenant_key_hash: str | None = None  # full sha256 hex — wire token only, never logged
+    tenant_hash16: str | None = None
     if is_tenant_key(bearer):
-        # Console-issued hx_live_… key: accept without remote verify.
-        # No metering / quota yet (Phase 2 thin slice). Log only the
-        # sha256 prefix — never the raw key — and bucket the rate limiter
-        # by hash so raw keys never sit in isolate memory as map keys.
-        key_hash = tenant_key_hash_prefix(bearer, 16)
-        print(
-            json.dumps(
-                {
-                    "type": "tenant_passthrough",
-                    "key_hash_prefix": tenant_key_hash_prefix(bearer),
-                    "route": route,
-                    "request_id": request_id,
-                }
+        tenant_key_hash = key_hash_full(bearer)
+        tenant_hash16 = tenant_key_hash[:16]
+        if console_url:
+            verified = await verify_tenant(console_url, bearer, scope=TENANT_SCOPE)
+            if verified.outcome == "invalid":
+                return _json_response(
+                    {"ok": False, "error": {"code": "INVALID_KEY"}},
+                    401,
+                )
+            if verified.outcome == "denied" or not verified.has_scope(TENANT_SCOPE):
+                return _json_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "ENTITLEMENT_REQUIRED",
+                            "scope": TENANT_SCOPE,
+                            "upgrade": UPGRADE_URL,
+                        },
+                    },
+                    402,
+                )
+            if verified.outcome == "degraded":
+                # Console unreachable: fail open only for self-host operators
+                # presenting the legacy key; hosted-only tenants fail closed.
+                if not validate_api_key(api_key, expected_api_key):
+                    return _json_response(
+                        {"ok": False, "error": {"code": "INVALID_KEY"}},
+                        401,
+                    )
+                verify_headers["X-Hoox-Verify"] = "degraded"
+            print(
+                json.dumps(
+                    {
+                        "type": "tenant_verify",
+                        "outcome": verified.outcome,
+                        "key_hash_prefix": tenant_key_hash_prefix(bearer),
+                        "tid": verified.tid,
+                        "plan": verified.plan,
+                        "route": route,
+                        "request_id": request_id,
+                    }
+                )
             )
-        )
-        rate_key = f"tenant:{key_hash}"
+        else:
+            # No console configured (self-host): accept without remote verify.
+            # No metering / quota. Log only the sha256 prefix — never the raw
+            # key — and bucket the rate limiter by hash so raw keys never sit
+            # in isolate memory as map keys.
+            print(
+                json.dumps(
+                    {
+                        "type": "tenant_passthrough",
+                        "key_hash_prefix": tenant_key_hash_prefix(bearer),
+                        "route": route,
+                        "request_id": request_id,
+                    }
+                )
+            )
+        rate_key = f"tenant:{tenant_hash16}"
     else:
         if not validate_api_key(api_key, expected_api_key):
             return _json_response({"error": "Unauthorized"}, 401)
         # -- Rate limit -------------------------------------------------------
         rate_key = api_key or "anonymous"
     allowed, rate_headers = _rate_limiter.check(rate_key)
+    if verified is not None and verified.outcome == "valid":
+        # Console-advertised quota wins over the local limiter default.
+        limit = verified.rate_limit()
+        if limit is not None:
+            rate_headers["X-RateLimit-Limit"] = str(limit)
     if not allowed:
         return _json_response(
             {"error": "Rate limit exceeded"},
             429,
-            headers=rate_headers,
+            headers={**rate_headers, **verify_headers},
         )
 
     # -- Route ------------------------------------------------------------
     if route == "/run" and method == "POST":
         resp_body, resp_status, resp_headers = await handle_run(body, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
+        await _record_tenant_usage(
+            console_url=console_url,
+            usage_auth=usage_auth,
+            verified=verified,
+            tenant_key_hash=tenant_key_hash,
+            tenant_hash16=tenant_hash16,
+            response_status=resp_status,
+            bars=resp_body.get("bars", resp_body.get("count", 0)),
+        )
         return resp_body, resp_status, resp_headers
 
     if route == "/ingest" and method == "POST":
         resp_body, resp_status, resp_headers = await handle_ingest(body, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
+        await _record_tenant_usage(
+            console_url=console_url,
+            usage_auth=usage_auth,
+            verified=verified,
+            tenant_key_hash=tenant_key_hash,
+            tenant_hash16=tenant_hash16,
+            response_status=resp_status,
+            bars=resp_body.get("ingested", 0),
+        )
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts" and method == "GET":
         resp_body, resp_status, resp_headers = await handle_list_scripts(r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts" and method == "POST":
         resp_body, resp_status, resp_headers = await handle_put_script(body, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts/:id" and method == "GET" and param is not None:
         resp_body, resp_status, resp_headers = await handle_get_script(param, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts/:id" and method == "DELETE" and param is not None:
         resp_body, resp_status, resp_headers = await handle_delete_script(param, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/cron/jobs" and method == "GET":
         resp_body, resp_status, resp_headers = await handle_get_cron_jobs(r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/cron/jobs" and method == "PUT":
         resp_body, resp_status, resp_headers = await handle_put_cron_jobs(body, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/cron/run" and method == "POST":
         resp_body, resp_status, resp_headers = await handle_cron_run(body, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/feed/refresh" and method == "POST":
         resp_body, resp_status, resp_headers = await handle_feed_refresh(body, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     return _json_response({"error": "Method not allowed"}, 405)

@@ -41,9 +41,10 @@ from typing import TypeGuard
 # ---------------------------------------------------------------------------
 
 #: Prefix for console-issued tenant keys (``hx_live_…``).
-#: Accepted via ``Authorization: Bearer`` as passthrough — no remote verify,
-#: no metering, no quota yet. Quota enforcement arrives with the verify path
-#: (``CONSOLE_URL`` + ``TENANT_KEYS`` KV); until then accept-and-log only.
+#: Accepted via ``Authorization: Bearer``. When the pipeline is configured
+#: with ``CONSOLE_URL``, keys are verified live (``tenant_verify``:
+#: hash-on-wire GET ``/api/v1/verify``, cached 60 s); without it they are
+#: accepted as legacy passthrough (self-host) — accept-and-log only.
 TENANT_KEY_PREFIX = "hx_live_"
 
 
