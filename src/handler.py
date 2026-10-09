@@ -30,6 +30,9 @@ from typing import Any
 
 from middleware import LogHelper
 from middleware import RateLimiter
+from middleware import extract_bearer_token
+from middleware import is_tenant_key
+from middleware import tenant_key_hash_prefix
 from middleware import validate_api_key
 from pynescript_backend import Runtime
 from scripts_registry import normalize_libraries
@@ -164,6 +167,7 @@ async def handle_request(
     api_key: str | None = None,
     expected_api_key: str | None = None,
     request_id: str | None = None,
+    authorization: str | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, str]]:
     """Route and process a request through the middleware pipeline.
 
@@ -175,6 +179,10 @@ async def handle_request(
         api_key: ``X-API-Key`` header value (or ``None``).
         expected_api_key: The expected secret, or ``None`` to disable auth.
         request_id: Unique request identifier for logging.
+        authorization: Raw ``Authorization`` header value (or ``None``).
+            A ``Bearer hx_live_…`` tenant key is accepted as passthrough
+            (no remote verify, no quota yet); any other Bearer value falls
+            through to the ``X-API-Key`` path unchanged.
 
     Returns:
         ``(response_dict, status_code, response_headers)``.
@@ -198,12 +206,30 @@ async def handle_request(
     if route not in known and route != "/health":
         return _json_response({"error": "Not found"}, 404)
 
-    # -- Auth -------------------------------------------------------------
-    if not validate_api_key(api_key, expected_api_key):
-        return _json_response({"error": "Unauthorized"}, 401)
-
-    # -- Rate limit -------------------------------------------------------
-    rate_key = api_key or "anonymous"
+    # -- Auth: tenant Bearer passthrough, else legacy X-API-Key -----------
+    bearer = extract_bearer_token(authorization)
+    if is_tenant_key(bearer):
+        # Console-issued hx_live_… key: accept without remote verify.
+        # No metering / quota yet (Phase 2 thin slice). Log only the
+        # sha256 prefix — never the raw key — and bucket the rate limiter
+        # by hash so raw keys never sit in isolate memory as map keys.
+        key_hash = tenant_key_hash_prefix(bearer, 16)
+        print(
+            json.dumps(
+                {
+                    "type": "tenant_passthrough",
+                    "key_hash_prefix": tenant_key_hash_prefix(bearer),
+                    "route": route,
+                    "request_id": request_id,
+                }
+            )
+        )
+        rate_key = f"tenant:{key_hash}"
+    else:
+        if not validate_api_key(api_key, expected_api_key):
+            return _json_response({"error": "Unauthorized"}, 401)
+        # -- Rate limit -------------------------------------------------------
+        rate_key = api_key or "anonymous"
     allowed, rate_headers = _rate_limiter.check(rate_key)
     if not allowed:
         return _json_response(

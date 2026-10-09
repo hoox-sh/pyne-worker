@@ -19,7 +19,14 @@
     "traces": { "enabled": true, "head_sampling_rate": 0.01 }
   },
   "vars": {
-    "TRADE_WORKER_NAME": "trade-worker"
+    "TRADE_WORKER_NAME": "trade-worker",
+    // SaaS console base URL for the future tenant verify / usage path
+    // (Phase 2 thin slice: Bearer hx_live_… is passthrough only, no remote
+    // fetch yet, so this var is currently informational).
+    "CONSOLE_URL": "https://console.hoox.sh"
+    // Future quota enforcement will add a TENANT_KEYS KV binding here for the
+    // verify cache (key hash → plan/scopes/limits, 60s TTL). Do NOT add the
+    // binding until the verify path lands — a missing KV id breaks deploy.
   },
   // Bar-close scheduler: every minute (UTC). Only re-runs when R2 has a newer bar.
   // Keep 1m data fresh via scripts/fetch_and_ingest.py (Binance blocks CF IPs).

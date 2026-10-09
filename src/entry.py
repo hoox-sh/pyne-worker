@@ -89,6 +89,9 @@ class Default(WorkerEntrypoint):
       ``TRADE_EXECUTE_KEY_BINDING``, ``TRADE_INTERNAL_KEY``.
     - ``DEFAULT_EXCHANGE`` (var) — Default exchange id for trade forward
       (default ``binance``; per-script / per-event override).
+    - ``CONSOLE_URL`` (var) — Base URL of the SaaS console
+      (default ``https://console.hoox.sh``). Reserved for the future
+      tenant verify / usage path; no remote calls are made yet.
     """
 
     TRADE_SERVICE: object  # service binding, set by the runtime
@@ -99,6 +102,7 @@ class Default(WorkerEntrypoint):
     TRADE_EXECUTE_KEY_BINDING: str | None = None  # optional execute-scoped key
     TRADE_INTERNAL_KEY: str | None = None  # legacy alias
     DEFAULT_EXCHANGE: str | None = None  # optional default exchange
+    CONSOLE_URL: str | None = None  # future tenant verify base URL (unused yet)
 
     async def fetch(self, request):
         start = time.time()
@@ -106,8 +110,9 @@ class Default(WorkerEntrypoint):
         path = urlparse(request.url).path or "/"
         method = request.method
 
-        # Read optional auth header
+        # Read optional auth headers (legacy X-API-Key + tenant Bearer passthrough)
         api_key = request.headers.get("X-API-Key", None)
+        authorization = request.headers.get("Authorization", None)
 
         # Read body for POST (hard cap before full pipeline — fail closed on size)
         body = None
@@ -134,6 +139,7 @@ class Default(WorkerEntrypoint):
             api_key=api_key,
             expected_api_key=getattr(self.env, "API_KEY", None),
             request_id=request_id,
+            authorization=authorization,
         )
 
         # -- Forward strategy events to trade-worker ----------------------

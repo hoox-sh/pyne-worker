@@ -28,10 +28,61 @@ This module provides three utilities used by the request pipeline:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import time
 import uuid
 from typing import Any
+from typing import TypeGuard
+
+
+# ---------------------------------------------------------------------------
+# Tenant keys — console-issued Bearer passthrough (Phase 2 thin slice)
+# ---------------------------------------------------------------------------
+
+#: Prefix for console-issued tenant keys (``hx_live_…``).
+#: Accepted via ``Authorization: Bearer`` as passthrough — no remote verify,
+#: no metering, no quota yet. Quota enforcement arrives with the verify path
+#: (``CONSOLE_URL`` + ``TENANT_KEYS`` KV); until then accept-and-log only.
+TENANT_KEY_PREFIX = "hx_live_"
+
+
+def extract_bearer_token(authorization: str | None) -> str | None:
+    """Extract ``token`` from an ``Authorization: Bearer <token>`` header.
+
+    Returns ``None`` for missing/non-Bearer/empty values. Case-insensitive
+    scheme per RFC 9110. Never raises.
+    """
+    if not authorization or not isinstance(authorization, str):
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    token = token.strip()
+    return token or None
+
+
+def is_tenant_key(key: str | None) -> TypeGuard[str]:
+    """Return ``True`` for console-issued ``hx_live_…`` tenant keys.
+
+    Requires at least one character after the prefix so a bare
+    ``hx_live_`` scheme probe is rejected.
+    """
+    return (
+        isinstance(key, str)
+        and len(key) > len(TENANT_KEY_PREFIX)
+        and key.startswith(TENANT_KEY_PREFIX)
+    )
+
+
+def tenant_key_hash_prefix(key: str, length: int = 8) -> str:
+    """Return a ``sha256[:length]`` hex prefix for logs / rate-limit buckets.
+
+    The raw key must never be logged or used as a storage key — always pass
+    through this helper first.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return digest[: max(1, min(length, len(digest)))]
 
 
 # ---------------------------------------------------------------------------
