@@ -162,6 +162,48 @@ class TestVerifyTenant:
         monkeypatch.setattr(tv, "_fetch_json_get", fake)
         assert (await tv.verify_tenant(_CONSOLE, _TENANT_KEY)).outcome == "degraded"
 
+    async def test_console_429_maps_to_limited_with_body_retry_after(self, monkeypatch) -> None:
+        fake, _ = _fake_get(429, {"ok": False, "retry_after": 45})
+        monkeypatch.setattr(tv, "_fetch_json_get", fake)
+        result = await tv.verify_tenant(_CONSOLE, _TENANT_KEY)
+        assert result.outcome == "limited"
+        assert result.retry_after == 45
+
+    async def test_console_429_retry_after_header(self, monkeypatch) -> None:
+        async def fake(url, headers, timeout=5.0):
+            return 429, {"ok": False}, {"retry-after": "30"}
+
+        monkeypatch.setattr(tv, "_fetch_json_get", fake)
+        result = await tv.verify_tenant(_CONSOLE, _TENANT_KEY)
+        assert result.outcome == "limited"
+        assert result.retry_after == 30
+
+    async def test_console_429_without_retry_after(self, monkeypatch) -> None:
+        fake, _ = _fake_get(429, {"ok": False})
+        monkeypatch.setattr(tv, "_fetch_json_get", fake)
+        result = await tv.verify_tenant(_CONSOLE, _TENANT_KEY)
+        assert result.outcome == "limited"
+        assert result.retry_after is None
+
+    async def test_scope_keyed_cache(self, monkeypatch) -> None:
+        fake, calls = _fake_get(200, _valid_body())
+        monkeypatch.setattr(tv, "_fetch_json_get", fake)
+        first = await tv.verify_tenant(_CONSOLE, _TENANT_KEY)
+        assert first.outcome == "valid"
+        assert calls["n"] == 1
+        # Same scope → cache hit, no new network call.
+        second = await tv.verify_tenant(_CONSOLE, _TENANT_KEY)
+        assert second.outcome == "valid"
+        assert calls["n"] == 1
+        # Different scope → cache miss (verdicts never cross scopes).
+        third = await tv.verify_tenant(_CONSOLE, _TENANT_KEY, scope="other:scope")
+        assert third.outcome == "valid"
+        assert calls["n"] == 2
+        assert "scope=other%3Ascope" in calls["url"]
+        # And the other scope is now cached too.
+        await tv.verify_tenant(_CONSOLE, _TENANT_KEY, scope="other:scope")
+        assert calls["n"] == 2
+
 
 class TestVerifyWiring:
     async def test_invalid_key_401_shape(self, monkeypatch) -> None:
@@ -226,6 +268,80 @@ class TestVerifyWiring:
         )
         assert status == 402
         assert payload["error"]["code"] == "ENTITLEMENT_REQUIRED"
+
+    async def test_valid_scopeless_still_402(self, monkeypatch) -> None:
+        # outcome == "valid" but the required scope is absent → 402
+        # (regression guard for the degraded-ordering fix: only "valid"
+        # verdicts are scope-checked, so degraded can still fail open).
+        fake, _ = _fake_get(200, _valid_body(scopes=[]))
+        monkeypatch.setattr(tv, "_fetch_json_get", fake)
+        payload, status, _ = await handle_request(
+            "POST",
+            "/run",
+            _RUN_BODY,
+            expected_api_key="secret-123",
+            authorization=f"Bearer {_TENANT_KEY}",
+            console_url=_CONSOLE,
+        )
+        assert status == 402
+        assert payload["error"]["code"] == "ENTITLEMENT_REQUIRED"
+
+    async def test_console_429_maps_to_429_shape(self, monkeypatch) -> None:
+        # Quota spent must surface as 429 (never 401 — the key is good,
+        # so clients must not rotate it) with Retry-After forwarded.
+        async def fake(url, headers, timeout=5.0):
+            return 429, {"ok": False, "retry_after": 45}, {"retry-after": "45"}
+
+        monkeypatch.setattr(tv, "_fetch_json_get", fake)
+        payload, status, headers = await handle_request(
+            "POST",
+            "/run",
+            _RUN_BODY,
+            expected_api_key="secret-123",
+            authorization=f"Bearer {_TENANT_KEY}",
+            console_url=_CONSOLE,
+        )
+        assert status == 429
+        assert payload == {"ok": False, "error": {"code": "usage.quota_exceeded", "retry_after": 45}}
+        assert headers.get("Retry-After") == "45"
+
+    async def test_console_429_without_retry_after_omits_header(self, monkeypatch) -> None:
+        fake, _ = _fake_get(429, {"ok": False})
+        monkeypatch.setattr(tv, "_fetch_json_get", fake)
+        payload, status, headers = await handle_request(
+            "POST",
+            "/run",
+            _RUN_BODY,
+            expected_api_key="secret-123",
+            authorization=f"Bearer {_TENANT_KEY}",
+            console_url=_CONSOLE,
+        )
+        assert status == 429
+        assert payload == {"ok": False, "error": {"code": "usage.quota_exceeded"}}
+        assert "Retry-After" not in headers
+
+    async def test_legacy_rate_key_never_raw(self) -> None:
+        import handler as _handler_mod
+
+        buckets = _handler_mod._rate_limiter._buckets
+        saved = dict(buckets)
+        buckets.clear()
+        try:
+            raw = "secret-legacy-rate-key"
+            payload, status, _ = await handle_request(
+                "POST",
+                "/run",
+                _RUN_BODY,
+                api_key=raw,
+                expected_api_key=raw,
+            )
+            assert status == 200
+            assert payload.get("status") == "success"
+            assert raw not in buckets
+            assert f"legacy:{tenant_key_hash_prefix(raw)}" in buckets
+        finally:
+            buckets.clear()
+            buckets.update(saved)
 
     async def test_quota_limit_overrides_rate_headers(self, monkeypatch) -> None:
         fake, _ = _fake_get(200, _valid_body(limits={"calls_per_min": 7}))

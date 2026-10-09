@@ -235,6 +235,9 @@ async def handle_request(
         - Authenticated but missing scope ``pyne:run`` → ``402 {"ok": false,
           "error": {"code": "ENTITLEMENT_REQUIRED", "scope": "pyne:run",
           "upgrade": "https://console.hoox.sh/billing"}}``.
+        - Console quota spent (verify HTTP 429) → ``429 {"ok": false,
+          "error": {"code": "usage.quota_exceeded"}}`` + ``Retry-After``
+          when the console sent one (never 401 — the key is good).
         - Console unreachable + legacy key match → degraded allow with
           ``X-Hoox-Verify: degraded`` (fail-open self-host only); without a
           legacy match the request fails closed with 401.
@@ -277,7 +280,24 @@ async def handle_request(
                     {"ok": False, "error": {"code": "INVALID_KEY"}},
                     401,
                 )
-            if verified.outcome == "denied" or not verified.has_scope(TENANT_SCOPE):
+            if verified.outcome == "limited":
+                # Console quota spent (HTTP 429 at verify): surface 429 —
+                # never 401, so clients don't rotate a good key — and
+                # forward Retry-After when the console sent one.
+                err: dict[str, Any] = {"code": "usage.quota_exceeded"}
+                if verified.retry_after is not None:
+                    err["retry_after"] = verified.retry_after
+                limited_headers = dict(verify_headers)
+                if verified.retry_after is not None:
+                    limited_headers["Retry-After"] = str(verified.retry_after)
+                return _json_response(
+                    {"ok": False, "error": err},
+                    429,
+                    headers=limited_headers,
+                )
+            if verified.outcome == "denied" or (
+                verified.outcome == "valid" and not verified.has_scope(TENANT_SCOPE)
+            ):
                 return _json_response(
                     {
                         "ok": False,
@@ -331,7 +351,13 @@ async def handle_request(
         if not validate_api_key(api_key, expected_api_key):
             return _json_response({"error": "Unauthorized"}, 401)
         # -- Rate limit -------------------------------------------------------
-        rate_key = api_key or "anonymous"
+        # Bucket by hash prefix — raw secrets never sit in isolate memory
+        # as map keys (mirrors the tenant path's tenant:{hash16} bucket).
+        rate_key = (
+            f"legacy:{tenant_key_hash_prefix(api_key)}"
+            if isinstance(api_key, str) and api_key
+            else "anonymous"
+        )
     allowed, rate_headers = _rate_limiter.check(rate_key)
     if verified is not None and verified.outcome == "valid":
         # Console-advertised quota wins over the local limiter default.
