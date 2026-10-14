@@ -13,6 +13,12 @@ coverage/
 data/
 uv.lock
 .cache/
+# Benchmark output. scripts/benchmark.py writes benchmark_results.csv to the
+# project root by default, so tracking it would dirty the tree on every run and
+# the timings are machine-local anyway. The corpus sweeps are ad-hoc and have no
+# committed generator. Force-add one if you want a recorded baseline:
+#   git add -f benchmark_results.csv
+benchmark_*.csv
 # Vendored tree is local deploy payload (run scripts/sync_vendor.sh before deploy).
 # Do not ignore python_modules/ if you choose to commit it; only strip bytecode:
 python_modules/**/__pycache__/
