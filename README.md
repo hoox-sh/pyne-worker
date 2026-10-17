@@ -137,6 +137,44 @@ echo "my-secret-key" | wrangler secret put API_KEY
 **Deploy gotcha:** Wrangler packages `python_modules/pynescript`, not the editable install.
 After pulling new PYNE APIs, always re-run `./scripts/sync_vendor.sh`.
 
+### npm shortcuts
+
+```bash
+npm run dev            # wrangler dev (local)
+npm run deploy         # wrangler deploy
+npm run tail           # live logs
+npm run vendor         # sync_vendor.sh
+npm test               # offline pytest suite (repo .venv)
+npm run test:live      # live E2E + latency suite against production
+npm run test:live:local  # ... against wrangler dev on :8787
+npm run test:live:json   # ... writes live_report.json
+npm run bench          # engine micro-benchmark
+```
+
+### Live test (`scripts/live_test.py`)
+
+Black-box end-to-end + latency probe against a **running** deployment (prod or
+`wrangler dev`) — every case is a real HTTP request:
+
+```bash
+# Needs the worker's API_KEY (env PYNE_API_KEY / API_KEY, --api-key, or .dev.vars)
+PYNE_API_KEY=… npm run test:live
+python3 scripts/live_test.py --url http://127.0.0.1:8787 --repeat 5 --json live_report.json
+```
+
+Covers health/feature flags, 401 auth paths, interpret + strategy events +
+alerts + drawings + inputs + libraries, response windowing (incl. validation
+and full-range no-op), auto/compile mode contracts, parse + timeout errors,
+the 5 MB payload cap, R2 ingest → read-back, Bybit feed refresh, scripts
+registry lifecycle (create → list → get → run-by-id → delete → 404), cron jobs
+listing, and an opt-in `--with-cron` scheduler run.
+
+Each request records wall-clock latency (`min/p50/max` per case, p50/p95/max
+overall) and `/run` cases also record the engine-reported `profile.total_ms`,
+so edge/network overhead is visible next to engine time. Exit code 0 = all
+passed. R2 writes use a clearly-named `LIVETEST` symbol; `--no-r2`,
+`--no-feed`, `--no-scripts`, `--no-limits` keep the target untouched.
+
 ## Endpoints
 
 | Method | Path | Auth | Description |

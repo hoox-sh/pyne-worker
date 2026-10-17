@@ -2,6 +2,17 @@
   "name": "pyne-worker",
   "private": true,
   "description": "PYNE edge evaluate host — Python Cloudflare Worker. Full language toolchain lives in hoox-sh/pyne.",
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "tail": "npx wrangler tail",
+    "vendor": "./scripts/sync_vendor.sh",
+    "test": ".venv/bin/python -m pytest tests/ -q",
+    "test:live": ".venv/bin/python scripts/live_test.py",
+    "test:live:local": ".venv/bin/python scripts/live_test.py --url http://127.0.0.1:8787",
+    "test:live:json": ".venv/bin/python scripts/live_test.py --json live_report.json",
+    "bench": ".venv/bin/python scripts/benchmark.py"
+  },
   "cloudflare": {
     "bindings": {
       "API_KEY": {

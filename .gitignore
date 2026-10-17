@@ -19,6 +19,8 @@ uv.lock
 # committed generator. Force-add one if you want a recorded baseline:
 #   git add -f benchmark_results.csv
 benchmark_*.csv
+# Live-test JSON reports (`npm run test:live:json`) — machine-local timings.
+live_report*.json
 # Vendored tree is local deploy payload (run scripts/sync_vendor.sh before deploy).
 # Do not ignore python_modules/ if you choose to commit it; only strip bytecode:
 python_modules/**/__pycache__/

@@ -42,6 +42,8 @@ hoox-sh/pyne (pynescript) ←── pyne-worker (depends on this)
 ```bash
 pip install -e ".[dev]"    # install + dev deps
 pytest tests/ -v            # run tests
+npm run test:live          # live E2E + latency suite (prod worker; needs API_KEY)
+npm run test:live:local    # ... against wrangler dev on :8787
 ./scripts/sync_vendor.sh   # copy live pynescript → python_modules/ (required before deploy)
 npx wrangler deploy        # deploy (uses python_modules/ as Vendored Modules)
 ```
@@ -63,6 +65,8 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 | `src/alert_forwarder.py` | L2 HTTP webhook delivery for alerts |
 | `wrangler.jsonc` | Worker config + cron `* * * * *` |
 | `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars; `libraries` / `timeout_seconds`) |
+| `scripts/live_test.py` | Live E2E + latency suite vs deployed worker (`npm run test:live`) |
+| `package.json` | npm shortcuts (`dev`, `deploy`, `test`, `test:live`, `vendor`, `bench`) |
 | `pyproject.toml` | Package config (editable dep on `pynescript`) |
 
 ### Alerts (L2)
