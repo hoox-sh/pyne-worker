@@ -79,6 +79,18 @@ class TestWebhookUrl:
         assert validate_webhook_url("https://192.168.1.1/hook") is None
         assert validate_webhook_url("https://169.254.169.254/latest") is None
 
+    def test_rejects_disguised_private_ips(self) -> None:
+        # Decimal IPv4 (spelled-out 127.0.0.1 / 192.168.1.1) and IPv6 forms
+        # that unwrap to private IPv4 must not slip past the literal check.
+        assert validate_webhook_url("https://2130706433/hook") is None
+        assert validate_webhook_url("https://3232235777/hook") is None
+        assert validate_webhook_url("https://[::ffff:127.0.0.1]/hook") is None
+        assert validate_webhook_url("https://[::ffff:10.0.0.5]/hook") is None
+        assert validate_webhook_url("https://[2002:7f00:1::]/hook") is None  # 6to4 → 127.0.0.1
+
+    def test_public_literal_ip_ok(self) -> None:
+        assert validate_webhook_url("https://8.8.8.8/hook") == "https://8.8.8.8/hook"
+
     def test_rejects_localhost(self) -> None:
         assert validate_webhook_url("https://localhost/hook") is None
         assert validate_webhook_url("https://metadata.google.internal/") is None

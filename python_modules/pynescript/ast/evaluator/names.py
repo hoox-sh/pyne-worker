@@ -59,6 +59,10 @@ from pynescript.ast.type_system import ObjectInstance
 
 _MATRIX_INDEX_DIMENSIONS = 2
 
+# Lazy handle (expressions.py imports this module at top level, so a static
+# import would be circular; subscript call-sites hit this per bar).
+_pine_call_site_id: Any = None
+
 # Drawing instance → namespace for method dispatch (``la.get_text()`` → ``label.get_text``).
 _DRAWING_METHOD_NS: dict[type, str] = {
     Label: "label",
@@ -186,10 +190,12 @@ class NameEvaluator:
         """
         # Hot path: single dict lookup for bar-mode series (close/open/…) and locals.
         # ``try/except KeyError`` is faster than ``in`` + ``[]`` when the key hits
-        # (dominant case after hosts inject OHLCV every bar).
+        # (dominant case after hosts inject OHLCV every bar). Local ``ctx`` bind
+        # avoids a second attribute lookup on the miss path.
+        ctx = self.context  # type: ignore[attr-defined]
         name = node.id
         try:
-            return self.context[name]
+            return ctx[name]
         except KeyError:
             pass
         # Bare-name series builtins only (not functions like strategy/indicator that take args)
@@ -453,7 +459,12 @@ class NameEvaluator:
             if store_map is None:
                 store_map = {}
                 self._call_expr_history = store_map  # type: ignore[attr-defined]
-            site = id(value_node)
+            global _pine_call_site_id
+            if _pine_call_site_id is None:
+                from pynescript.ast.evaluator.expressions import pine_call_site_id as _pine_call_site_id_fn
+
+                _pine_call_site_id = _pine_call_site_id_fn
+            site = _pine_call_site_id(value_node)
             bar = self.context.get("bar_index", 0)  # type: ignore[attr-defined]
             try:
                 bar_i = int(bar) if bar is not None else 0
@@ -466,9 +477,10 @@ class NameEvaluator:
             ps = store_map.get(site)
             if ps is None:
                 try:
+                    from pynescript.ast.evaluator.series_buffer import evaluator_history_length
                     from pynescript.ast.evaluator.series_buffer import make_series
 
-                    ps = make_series(history_length=512)
+                    ps = make_series(history_length=evaluator_history_length(self))
                 except Exception:
                     # No series support — scalar offset>0 → na
                     return current if slice_ == 0 else None

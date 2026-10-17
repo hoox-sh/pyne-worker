@@ -35,11 +35,11 @@ Base contract
 Main kinds (non-exhaustive)
 ---------------------------
 * Modules: ``Script`` (exec root), ``Expression`` (eval root)
-* Definitions: ``FunctionDef``, ``TypeDef``, ``EnumDef``
+* Definitions: ``FunctionDef`` (optional ``returns`` type spec), ``TypeDef``, ``EnumDef``
 * Statements: ``Assign``, ``ReAssign``, ``AugAssign``, ``Import``, ``Expr``,
   ``Break``, ``Continue``
 * Control / blocks (as expressions in Pine): ``If``, ``While``, ``ForTo``,
-  ``ForIn``, ``Switch``, ``Case``
+  ``ForIn``, ``Switch``, ``Once``, ``Case``
 * Expressions: ``BinOp``, ``UnaryOp``, ``BoolOp``, ``Compare``, ``Conditional``,
   ``Call``, ``Attribute``, ``Subscript``, ``Name``, ``Constant``, ``Tuple``, …
 * Type markers: ``Qualify``, ``Specialize``; qualifiers ``Const``, ``Input``,

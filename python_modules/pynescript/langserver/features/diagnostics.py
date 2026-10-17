@@ -49,53 +49,41 @@ def lint_warnings_to_diagnostics(warnings: list[LintWarning], source: str) -> li
         warning's severity string.
     """
     diagnostics = []
+    # Split once: per-warning whole-document splits are O(warnings × doc-size).
+    lines = source.split("\n") if source else []
 
     for warning in warnings:
-        if _is_noisy_lint_warning(warning, source):
+        if _is_noisy_lint_warning(warning, source, lines):
             continue
-        diag = _lint_warning_to_diagnostic(warning, source)
+        diag = _lint_warning_to_diagnostic(warning, source, lines)
         if diag:
             diagnostics.append(diag)
 
     return diagnostics
 
 
-def _is_noisy_lint_warning(warning: LintWarning, source: str) -> bool:
+def _is_noisy_lint_warning(warning: LintWarning, source: str, lines: list[str] | None = None) -> bool:
     """True when a linter hit is a known false positive for the editor.
 
     C001 fires on any ``ta.*`` assignment whose name starts with a lowercase
     letter — including already-camelCase names (``fastMA``, ``length``).
-    C003 flags every indented ``if``, including multi-line block forms.
+    (Retired-rule filter for C003 was removed with the rule itself.)
     """
     if warning.code == "C001":
         match = re.search(r"Variable '(\w+)'", warning.message or "")
         return bool(match and "_" not in match.group(1))
-    if warning.code == "C003" and warning.line:
-        return _c003_is_block_if(source, warning.line)
     return False
 
 
-def _c003_is_block_if(source: str, line: int) -> bool:
-    """True when the next non-empty line is more indented than *line*."""
-    lines = source.split("\n")
-    idx = line - 1
-    if idx < 0 or idx >= len(lines):
-        return False
-    current = lines[idx]
-    cur_indent = len(current) - len(current.lstrip())
-    for nxt in lines[idx + 1 :]:
-        if not nxt.strip():
-            continue
-        return (len(nxt) - len(nxt.lstrip())) > cur_indent
-    return False
-
-
-def _lint_warning_to_diagnostic(warning: LintWarning, source: str) -> lsp.Diagnostic | None:
+def _lint_warning_to_diagnostic(
+    warning: LintWarning, source: str, lines: list[str] | None = None
+) -> lsp.Diagnostic | None:
     """Convert a single LintWarning to an LSP Diagnostic.
 
     Args:
         warning: The lint warning to convert.
         source: The source text for determining line text.
+        lines: Pre-split source lines (avoids re-splitting per warning).
 
     Returns:
         LSP Diagnostic object or None if the warning can't be converted.
@@ -107,7 +95,12 @@ def _lint_warning_to_diagnostic(warning: LintWarning, source: str) -> lsp.Diagno
     line_index = max(0, warning.line - 1)
     column = warning.column if warning.column is not None else 0
 
-    line_text = _get_line_text(source, line_index)
+    if lines is None:
+        line_text = _get_line_text(source, line_index)
+    elif 0 <= line_index < len(lines):
+        line_text = lines[line_index]
+    else:
+        line_text = ""
     # Highlight from column to end of line (not column + line_len, which overshoots).
     if line_text:
         end_column = max(column + 1, len(line_text))

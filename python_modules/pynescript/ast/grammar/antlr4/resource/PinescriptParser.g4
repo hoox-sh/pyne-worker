@@ -89,15 +89,22 @@ compound_augassignment: primary_expression augassign_op structure_expression;
 //   void fft_inplace(float[] re, float[] im, int N) => ...
 
 function_declaration
-    : EXPORT? type_specification? name LPAR parameter_list? RPAR RARROW local_block;
+    : EXPORT? type_specification name LPAR parameter_list? RPAR RARROW local_block
+    | EXPORT? name LPAR parameter_list? RPAR RARROW local_block
+    ;
 
 parameter_list:       parameter_definition (COMMA parameter_definition)* COMMA?;
-parameter_definition: type_specification? name_store (EQUAL expression)?;
+parameter_definition
+    : type_specification name_store (EQUAL expression)?
+    | name_store (EQUAL expression)?
+    ;
 
 // METHOD DECLARATION
 
 method_declaration
-    : EXPORT? METHOD type_specification? name LPAR method_parameter_list? RPAR RARROW local_block;
+    : EXPORT? METHOD type_specification name LPAR method_parameter_list? RPAR RARROW local_block
+    | EXPORT? METHOD name LPAR method_parameter_list? RPAR RARROW local_block
+    ;
 
 method_parameter_list: method_parameter_definition (COMMA method_parameter_definition)* COMMA?;
 method_parameter_definition: type_specification name_store | parameter_definition;
@@ -118,10 +125,11 @@ enum_definition:  name_store (EQUAL expression)? NEWLINE;
 
 // STRUCTURES
 
-structure: if_structure | for_structure | while_structure | switch_structure;
-
-structure_statement:  structure;
-structure_expression: structure;
+value_structure: if_structure | for_structure | while_structure | switch_structure;
+structure: value_structure | once_structure;
+structure_statement: structure;
+// ``once`` does not return a value (TV Aug 2026) — not valid on the RHS of ``=``.
+structure_expression: value_structure;
 
 // IF STRUCTURE
 
@@ -155,16 +163,29 @@ while_structure: WHILE expression local_block;
 
 switch_structure: SWITCH expression? NEWLINE INDENT switch_cases DEDENT;
 
-switch_cases: switch_pattern_case+ switch_default_case?;
+// ONCE STRUCTURE (Aug 2026)
+// Optional series-bool condition (default true). Body required.
+// Fires the first time the condition is true on a closed bar, then never again.
 
-switch_pattern_case: expression RARROW local_block;
+once_structure: ONCE expression? local_block;
+
+// Default (`=>` with no pattern) may appear anywhere; first default wins.
+switch_case: switch_pattern_case | switch_default_case;
+switch_cases: switch_case+;
+
+// Multi-value arms: ``1, 2 => 100`` (OR-match on subject).
+switch_pattern_case: switch_patterns RARROW local_block;
+switch_patterns: expression (COMMA expression)*;
 switch_default_case: RARROW local_block;
 
 // LOCAL BLOCK
 
 local_block: indented_local_block | inline_local_block;
 
-indented_local_block: NEWLINE INDENT statements DEDENT;
+// NEWLINE+ : lexer hides most consecutive blank lines, but a run of
+// default-channel NEWLINEs before INDENT is valid Pine (`=>` / if / for /
+// while / switch arms with empty lines before the indented body).
+indented_local_block: NEWLINE+ INDENT statements DEDENT;
 inline_local_block:   statement;
 
 // SIMPLE ASSIGNMENTS
@@ -182,9 +203,14 @@ simple_variable_initialization
 simple_name_initialization:  EXPORT? variable_declaration EQUAL expression;
 simple_tuple_initialization: tuple_declaration EQUAL expression;
 
-// Pine uses := for reassignment; many real-world scripts also use = for
-// attribute / subscript targets (e.g. strategy.initial_capital = 50000).
-simple_reassignment:  primary_expression (COLONEQUAL | EQUAL) expression;
+// Pine uses := for reassignment. ``=`` on a bare name is initialization
+// (simple_name_initialization). ``=`` is only reassignment for attribute /
+// subscript targets (e.g. strategy.initial_capital = 50000).
+simple_reassignment
+    : assignment_target_attribute EQUAL expression
+    | assignment_target_subscript EQUAL expression
+    | primary_expression COLONEQUAL expression
+    ;
 simple_augassignment: primary_expression augassign_op expression;
 
 // EXPRESSIONS
@@ -313,7 +339,14 @@ continue_statement: CONTINUE;
 
 // VARIABLE DECLARATION AND ASSIGNMENT RELATED SEGMENTS
 
-variable_declaration: declaration_mode? type_specification? name_store;
+// Expand optional declaration_mode so VAR/SWITCH-as-name does not steal
+// `var x = 1` (mode) via type_specification / name_store.
+variable_declaration
+    : declaration_mode type_specification name_store
+    | declaration_mode name_store
+    | type_specification name_store
+    | name_store
+    ;
 tuple_declaration:    LSQB name_store (COMMA name_store)* COMMA? RSQB;
 
 declaration_mode: VARIP | VAR;
@@ -339,7 +372,16 @@ type_specification
 type_qualifier:       CONST | INPUT | SIMPLE | SERIES;
 attributed_type_name: name_load (DOT name_load)*;
 
-template_spec_suffix: LESS type_argument_list? GREATER;
+// `>>` lexes as RSHIFT, not two GREATER. Allow RSHIFT as a 2-level closer:
+// `array<array<float>>` = outer LESS + inner `array<float` + RSHIFT.
+template_spec_suffix
+    : LESS type_argument_list? GREATER
+    | LESS rshift_closed_type_args RSHIFT
+    ;
+// Unclosed last type arg so the following RSHIFT can close both levels.
+rshift_closed_type_args
+    : (type_specification COMMA)* type_qualifier? attributed_type_name LESS type_argument_list?
+    ;
 array_type_suffix:    LSQB RSQB;
 
 type_argument_list: type_specification (COMMA type_specification)* COMMA?;
@@ -360,6 +402,9 @@ name
     | AS
     | BY
     | TO
+    | VAR
+    | SWITCH
+    | ONCE
     ;
 
 name_load:  name;

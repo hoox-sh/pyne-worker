@@ -17,6 +17,9 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+# CodeQL [py/polynomial-redos]: flagged sites use string scans instead of
+# overlapping quantifiers. Remaining regexes are linear and corpus-bounded.
+
 """Sanitize messy Pine sources before parse.
 
 Useful when user-supplied text still contains page chrome that is not valid Pine:
@@ -27,6 +30,10 @@ Useful when user-supplied text still contains page chrome that is not valid Pine
 - Horizontal rules, bare URLs, publication footers
 - Leading write-ups before the real script
 - Mis-collected shell / Python / HTML fragments
+- Mustache ``{{IDENT}}`` placeholders, MDX/JSX wrappers, RST literal-block indent
+- Trailing statement ``;`` and leftover ``at https:`` docs prose
+- Unclosed ``'`` / ``"`` at EOL when the next line is not a Pine string wrap
+  (blank or leading whitespace); leftover torn tails are commented
 
 Markdown for ``//@function`` hover annotations lives only inside ``//`` comments
 and is left alone. This module strips *page* chrome, not annotation Markdown.
@@ -43,17 +50,17 @@ import re
 _MINIMAL_STUB = '//@version=5\nindicator("x")\nplot(close)\n'
 
 # reference community "Expand (N lines)" UI stub — often at EOF; closing ``)`` may be cut.
-_EXPAND_RE = re.compile(r"^\s*Expand\s*\(\s*\d+\s*lines?\s*\)?\s*$", re.I)
+_EXPAND_RE = re.compile(r"^\s*Expand\s*\(\s*\d+\s*lines?(?:\s*\))?\s*$", re.I)
 _HR_RE = re.compile(r"^\s*([-*_])\1{2,}\s*$")  # --- *** ___
 _URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$", re.I)
 _FENCE_RE = re.compile(r"^\s*```")
 _ISO_DT_RE = re.compile(r"^\s*\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?\s*$")
-_IMG_MD_RE = re.compile(r"^\s*!\[.*?\]\(.*?\)\s*$")
-_MD_LINK_LINE_RE = re.compile(r"^\s*\[.*?\]\(https?://.*?\)\s*$")
-_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_IMG_MD_RE = re.compile(r"^\s*!\[[^\]]*\]\([^\)]*\)\s*$")
+_MD_LINK_LINE_RE = re.compile(r"^\s*\[[^\]]*\]\(https?://[^\)]*\)\s*$")
+_HTML_COMMENT_RE = re.compile(r"<!--(?:[^-]|-(?!->))*-->")
 _HTML_COMMENT_OPEN_RE = re.compile(r"^\s*<!--")
 # reference Pine docs UI chrome
-_TV_PINE_LABEL_RE = re.compile(r"^\s*Pine\s+Script\s*®?\s*$", re.I)
+_TV_PINE_LABEL_RE = re.compile(r"^\s*Pine\s+Script(?:®|\s+®)?\s*$", re.I)
 _COPIED_RE = re.compile(r"^\s*Copied\s*$", re.I)
 _IMAGE_ONLY_RE = re.compile(r"^\s*image\s*$", re.I)
 _CHECKLIST_RE = re.compile(r"^\s*-\s*\[[ xX]\]")
@@ -64,19 +71,19 @@ _FOOTER_LABELS = re.compile(
     r"^\s*(Last Modified|Author|License|Tags?|Category|Source|Created|Updated|"
     r"Detail|Overview|Description|Read more|Share|Related|Name|"
     r"Strategy Description|Source\s*\(PineScript\)|"
-    r"Pine library|Disclaimer)\s*:?\s*$",
+    r"Pine library|Disclaimer)(?:\s*:)?\s*$",
     re.I,
 )
 
 # Prose blockquotes / section heads — drop entirely (do not unwrap).
 _PROSE_LABEL_RE = re.compile(
-    r"^\s*>?\s*("
+    r"^\s*(?:>\s*)?("
     r"Detail|About|Syntax|Example|Notes?|Parameters?|Returns?|Remarks?|"
     r"See also|Description|Overview|Usage|Arguments?|Type|Default|"
     r"Name|Author|Strategy Description|Source\s*\(PineScript\)|"
     r"Last Modified|License|Tags?|Category|Created|Updated|"
     r"Read more|Share|Related|Disclaimer|Pine library"
-    r")\s*:?\s*$",
+    r")(?:\s*:)?\s*$",
     re.I,
 )
 
@@ -92,7 +99,10 @@ _PROSE_CONTINUE_RE = re.compile(
     r"We\s+(use|set|provide|define|call|populate|offer|create|do|pass)|"
     r"To\s+(color|plot|use|create|exit|exit|build|learn)|"
     r"You\s+(can|may|will|should)|"
-    r"This\s+(example|plots?|script|configuration|function|parameter)|"
+    r"This\s+(example|plots?|script|configuration|function|parameter|illustrates|shows)|"
+    r"However,|"
+    r"Pinescript had |"
+    r"Added `|"
     r"When\s+(creating|populating|the|using)|"
     r"The\s+(signature|script|color|maximum|initialization|first|second|third|next|last)|"
     r"There\s+are\s+|"
@@ -117,8 +127,8 @@ _PROSE_CONTINUE_RE = re.compile(
 # the full script copy (set05 hasnocool scrapes).
 _UI_CHROME_LINE_RE = re.compile(
     r"^\s*("
-    r"PineScript\s+code\s*:?|"
-    r"Pine\s+Script\s*(?:strategy|indicator|library|code)?\s*:?|"
+    r"PineScript\s+code(?:\s*:)?|"
+    r"Pine\s+Script(?:\s+(?:strategy|indicator|library|code))?(?:\s*:)?|"
     r"Copy\s+code|"
     r"Copied|"
     r"loading\.\.\.|"
@@ -127,7 +137,49 @@ _UI_CHROME_LINE_RE = re.compile(
     re.I,
 )
 # Standalone line-number gutter from "Copy code" widgets: ``1`` .. ``999``.
-_LINE_NUMBER_ONLY_RE = re.compile(r"^\s*\d{1,4}\s*$")
+# Gutter line numbers from "Copy code" scrapes (``1`` / ``  12``). Do **not**
+# match 4+ space indent: that is a real Pine literal in an if/switch body
+# (``int transp = if cond`` / ``        80``) and must not truncate the file.
+_LINE_NUMBER_ONLY_RE = re.compile(r"^[ \t]{0,3}\d{1,4}\s*$")
+# Hugo / Goldmark shortcodes left in scraped markdown (``{{< / highlight >}}``).
+_HUGO_SHORTCODE_RE = re.compile(r"^\s*\{\{[<%].*?[%>]\}\}\s*$")
+# Mustache / MCP template placeholders: ``{{AS_OF_DATE}}`` (not Hugo ``{{<``).
+_MUSTACHE_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+# Jinja2 statements / comments (``{% for %}`` / ``{# #}``). Expressions with
+# filters or spaces (``{{ title }}`` is mustache-IDENT and is replaced first).
+_JINJA_STMT_RE = re.compile(r"\{%[+-]?")
+_JINJA_COMMENT_RE = re.compile(r"\{#")
+# Markdown list marker (planning docs wrapping `` `indicator(...)` ``).
+_MD_LIST_MARKER_RE = re.compile(r"^[-*+]\s+")
+# RST leftovers after a docs example (``.. _label:``, heading underline).
+_RST_DIRECTIVE_RE = re.compile(r"^\s*\.\.\s+\S")
+_RST_HEADING_ULINE_RE = re.compile(r"^\s*[-=~^\"'`#*+]{3,}\s*$")
+# RST walkthrough leftover: ``Line 1: ``//@version=3```` (contains ``=`` so
+# the generic prose heuristic would treat it as code and block indent-dedent).
+_RST_LINE_ANNOT_RE = re.compile(r"^\s*Line\s+\d+\s*:")
+# Docs leftover from broken RST/HTML ``<https://…>`` (``at https:…``).
+_AT_HTTPS_ONLY_RE = re.compile(r"^\s*at\s+https(:\S*)?\s*$", re.I)
+_AT_HTTPS_PROSE_RE = re.compile(r"\bat\s+https:", re.I)
+# MDX / JSX docs wrappers (fumadocs, Mintlify, skill frontmatter).
+_MDX_IMPORT_RE = re.compile(r"^\s*import\s*\{", re.M)
+_JSX_TAG_RE = re.compile(r"<(Steps|Step|Callout|Tabs|Tab|Cards|Card)\b")
+_JSX_COMMENT_RE = re.compile(r"^\s*\{\/\*", re.M)
+_JSX_LINE_RE = re.compile(r"^\s*</?(Steps|Step|Callout|Tabs|Tab|Cards|Card)\b[^>]*>\s*$")
+# Fence opener with optional language tag.
+_FENCE_OPEN_RE = re.compile(r"^\s*```\s*([\w+-]*)")
+_PINE_FENCE_LANGS = frozenset({"pine", "pinescript", "pinescriptv5", "pinescriptv6", "pine-script", "tradingview"})
+# RST literal-block body after a col-0 ``study``/``indicator``/``strategy``/``library``.
+_RST_SCRIPT_DECL_LINE_RE = re.compile(r"^(\s*)(study|indicator|strategy|library)\s*\(")
+# ``plot`` / ``fill`` / ``p1 =`` / ``src = close, len = 10`` / ``t =``.
+_RST_LITERAL_BODY_RE = re.compile(
+    r"^(?:"
+    r"plot(?:shape|char|candle|bar)?|hline|bgcolor|barcolor|fill|"
+    r"alertcondition|alert|"
+    r"[A-Za-z_]\w*\s*="
+    r")"
+)
+# Column-1 nested-ternary wrap: ``? 3 : 4`` (optional leading spaces).
+_COLUMN1_TERNARY_CONT_RE = re.compile(r"^\s*\?")
 
 # Lines that look like executable Pine (or annotations / version).
 _PINE_START_RE = re.compile(
@@ -146,7 +198,7 @@ _PINE_START_RE = re.compile(
     r"var(ip)?\s+|"
     r"(int|float|bool|string|color|line|label|box|table|array|map|matrix|"
     r"const|simple|series)\s+\w|"
-    r"(if|for|while|switch)\s|"
+    r"(if|for|while|switch|once)\s|"
     r"(plot|plotshape|plotchar|plotcandle|plotbar|fill|bgcolor|barcolor|"
     r"hline|alertcondition|alert|runtime\.|request\.|ta\.|math\.|str\.|"
     r"color\.|input\.|input\s*\(|strategy\.|ticker\.|syminfo\.|timeframe\.)"
@@ -161,7 +213,7 @@ _CODEISH_RE = re.compile(
     r"^//|"
     r"^[0-9]|"
     r"^[\(\{\[]|"
-    r"^(if|for|while|switch|var|varip|type|enum|import|export|strategy|"
+    r"^(if|for|while|switch|once|var|varip|type|enum|import|export|strategy|"
     r"indicator|library|study|plot|plotshape|line|label|box|table|array|map|"
     r"matrix|request|ta\.|math\.|str\.|color\.|input)"
 )
@@ -191,7 +243,8 @@ _FOREIGN_LINE_RE = re.compile(
     r"PROJECT_ROOT=|"
     r"LOCK_STATE=|"
     r"FILE_PATH=\"\$|"
-    r"#!/bin"
+    r"#!/bin|"
+    r"import\s*\{"
     r")"
 )
 
@@ -243,13 +296,15 @@ def _normalize_chrome(text: str) -> str:
     return text
 
 
-def _extract_fenced_blocks(lines: list[str]) -> list[str]:
-    """Return bodies of markdown fenced blocks (without fence lines)."""
-    blocks: list[str] = []
+def _extract_fenced_blocks_tagged(lines: list[str]) -> list[tuple[str, str]]:
+    """Return ``(language, body)`` for markdown fenced blocks (no fence lines)."""
+    blocks: list[tuple[str, str]] = []
     i = 0
     n = len(lines)
     while i < n:
-        if _FENCE_RE.match(lines[i]):
+        m = _FENCE_OPEN_RE.match(lines[i]) if _FENCE_RE.match(lines[i]) else None
+        if m:
+            lang = (m.group(1) or "").lower()
             i += 1
             body: list[str] = []
             while i < n and not _FENCE_RE.match(lines[i]):
@@ -257,10 +312,15 @@ def _extract_fenced_blocks(lines: list[str]) -> list[str]:
                 i += 1
             if i < n:  # consumed closing fence
                 i += 1
-            blocks.append("\n".join(body))
+            blocks.append((lang, "\n".join(body)))
             continue
         i += 1
     return blocks
+
+
+def _extract_fenced_blocks(lines: list[str]) -> list[str]:
+    """Return bodies of markdown fenced blocks (without fence lines)."""
+    return [body for _, body in _extract_fenced_blocks_tagged(lines)]
 
 
 def _extract_tv_copied_blocks(lines: list[str]) -> list[str]:
@@ -346,11 +406,14 @@ def _score_pine_block(text: str) -> int:
     codeish = sum(1 for ln in non_empty if _CODEISH_RE.match(ln.lstrip()) or "=" in ln or "(" in ln)
     score += min(30, codeish)
     # Penalize markdown image / pure Chinese-heavy docs without pine markers
-    if re.search(r"!\[.*\]\(http", text) and score < 40:
+    if score < 40 and _has_md_image_http(text):
         score -= 20
     # Penalize foreign languages
     if _looks_like_foreign(text):
         score -= 40
+    # JS/TS/PineTS fences score like pine (``indicator(`` + ``plot``) but must not win.
+    if _looks_like_js_block(text):
+        score -= 80
     return score
 
 
@@ -380,6 +443,39 @@ def _looks_like_foreign(text: str) -> bool:
     shell_if = sum(1 for ln in lines if _SHELL_IF_RE.match(ln) or re.match(r"^\s*echo\s", ln))
     if shell_if >= 3 and not re.search(r"//@version\s*=", text):
         return True
+    if _looks_like_mdx(text):
+        return True
+    return False
+
+
+def _looks_like_js_block(text: str) -> bool:
+    """True for JS/TS/PineTS fences (``const x =``, ``{ overlay: }``, ``if (…) {``)."""
+    if re.search(r"\{\s*overlay\s*:", text) or re.search(r"\{\s*color\s*:", text):
+        return True
+    if re.search(r"\{\s*style\s*:", text):
+        return True
+    if re.search(r"\b(const|let)\s+[A-Za-z_]\w*\s*=", text):
+        return True
+    if re.search(r"\bif\s*\([^)]*\)\s*\{", text):
+        return True
+    return False
+
+
+def _looks_like_mdx(text: str) -> bool:
+    """True for MDX/JSX docs wrappers (frontmatter + ``import {`` / ``<Steps>``)."""
+    lines = [ln for ln in text.splitlines() if not _is_provenance(ln)]
+    if not lines:
+        return False
+    head = "\n".join(lines[:80])
+    if _MDX_IMPORT_RE.search(head) and re.search(r"from\s+['\"]", head):
+        return True
+    if _JSX_TAG_RE.search(head) or _JSX_COMMENT_RE.search(head):
+        return True
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty and nonempty[0].strip() == "---":
+        rest = nonempty[1:30]
+        if any(ln.strip() == "---" for ln in rest) and any(re.match(r"^[A-Za-z_][\w-]*\s*:", ln) for ln in rest):
+            return True
     return False
 
 
@@ -392,25 +488,43 @@ def _has_usable_pine(text: str) -> bool:
     //@version alone is not enough (PR templates often keep only the pragma).
     A script declaration (``indicator`` / ``strategy`` / ``library`` / ``study``)
     is enough — even bare ``library()`` parses and should be preserved.
+
+    Markdown list items and backtick-wrapped inline code (planning docs that
+    mention `` `indicator(...)` ``) are not live declarations.
     """
-    return bool(_SCRIPT_DECL_RE.search(text))
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("//"):
+            continue
+        if _MD_LIST_MARKER_RE.match(s) or s.startswith("`"):
+            continue
+        if _SCRIPT_DECL_RE.search(s):
+            return True
+    return False
+
+
+def _looks_like_jinja(text: str) -> bool:
+    """True for Jinja2 templates (``{% %}`` / leftover ``{{`` after mustache)."""
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("//"):
+            continue
+        if _JINJA_STMT_RE.search(s) or _JINJA_COMMENT_RE.search(s) or "{{" in s:
+            return True
+    return False
 
 
 # Docs chrome glued onto code lines (Mintlify / reference pages).
 # Case-sensitive Capitalized nav words after ≥2 spaces; may be followed by more
 # title-case sidebar junk (``Previous Strategies Next Techniques …``).
 # Do NOT use IGNORECASE — English ``next to`` must not match.
-_DOCS_NAV_TRAIL_RE = re.compile(
-    r"[ \t]{2,}(Next|Previous|On this page)\b.*$"
-)
+_DOCS_NAV_TRAIL_RE = re.compile(r"[ \t]{2,}(Next|Previous|On this page)\b.*$")
 # Placeholder ellipsis lines from incomplete examples: `...`
 _ELLIPSIS_ONLY_RE = re.compile(r"^\s*\.\.\.\s*$")
 # Trailing binary/logical operators left by mid-expression scrapes.
 # NOTE: deliberately excludes ``?`` / ``:`` — multi-line ternaries use those as
 # line-join operators with same-indent continuations; injecting ``na`` breaks them.
-_TRAILING_BINOP_RE = re.compile(
-    r"^(?P<head>.*\S)\s+(?P<op>or|and|\+|\-|\*|/)\s*$"
-)
+_TRAILING_BINOP_RE = re.compile(r"^(?P<head>.*\S)\s+(?P<op>or|and|\+|\-|\*|/)\s*$")
 
 
 # Unicode operators / punctuation that break the ANTLR lexer outside strings.
@@ -476,6 +590,231 @@ def _normalize_unicode_ops(line: str) -> str:
     return "".join(out)
 
 
+def _code_ends_with_semicolon(code: str) -> bool:
+    """True when *code* ends with a ``;`` that is outside strings/comments."""
+    in_str: str | None = None
+    esc = False
+    last_semi = -1
+    i = 0
+    n = len(code)
+    while i < n:
+        ch = code[i]
+        if esc:
+            esc = False
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in "\"'":
+            in_str = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and code[i + 1] == "/":
+            break
+        if ch == ";":
+            last_semi = i
+        i += 1
+    return last_semi == n - 1
+
+
+def _strip_trailing_semicolon(line: str) -> str:
+    """Drop a statement-terminator ``;`` at EOL (JS leftover). Quote-aware."""
+    if line.lstrip().startswith("//"):
+        return line
+    ended_nl = line.endswith("\n")
+    core = line[:-1] if ended_nl else line
+    rstripped = core.rstrip()
+    if not rstripped.endswith(";") or not _code_ends_with_semicolon(rstripped):
+        return line
+    return rstripped[:-1].rstrip() + ("\n" if ended_nl else "")
+
+
+_NUMERIC_PLACEHOLDER_RE = re.compile(
+    r"(?i)(PCT|DAYS|LOOKBACK|THRESHOLD|SPOT|COUNT|SIZE|RATE|YIELD|"
+    r"INT|FLOAT|SLOPE|PTS|DTE|LEN(?:GTH)?|MULT|PRICE|NUM|BARS)\b"
+)
+
+
+def _mustache_sub_for_span(ident: str, before: str, *, in_string: bool) -> str:
+    """``na`` in strings / generic code; ``0`` for assignment or arithmetic RHS."""
+    if in_string:
+        return "na"
+    prev = before.rstrip()
+    if prev.endswith(("=", "+", "-", "*", "/")) or _NUMERIC_PLACEHOLDER_RE.search(ident):
+        return "0"
+    return "na"
+
+
+def _replace_mustache_in_line(line: str) -> str:
+    """Replace ``{{IDENT}}`` outside comments (and inside strings)."""
+    if not _MUSTACHE_RE.search(line):
+        return line
+    if line.lstrip().startswith("//"):
+        return line
+    out: list[str] = []
+    in_str: str | None = None
+    esc = False
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if esc:
+            out.append(ch)
+            esc = False
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\":
+                out.append(ch)
+                esc = True
+                i += 1
+                continue
+            if ch == in_str:
+                out.append(ch)
+                in_str = None
+                i += 1
+                continue
+            m = _MUSTACHE_RE.match(line, i)
+            if m:
+                out.append(_mustache_sub_for_span(m.group(1), "".join(out), in_string=True))
+                i = m.end()
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and line[i + 1] == "/":
+            out.append(line[i:])
+            break
+        if ch in "\"'":
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        m = _MUSTACHE_RE.match(line, i)
+        if m:
+            out.append(_mustache_sub_for_span(m.group(1), "".join(out), in_string=False))
+            i = m.end()
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _replace_mustache_placeholders(text: str) -> str:
+    """Replace ``{{AS_OF_DATE}}``-style templates so the lexer never sees ``{``."""
+    if "{{" not in text:
+        return text
+    ended_nl = text.endswith("\n")
+    lines = text.splitlines()
+    out = [_replace_mustache_in_line(ln) for ln in lines]
+    body = "\n".join(out)
+    if ended_nl and body and not body.endswith("\n"):
+        body += "\n"
+    return body
+
+
+def _is_rst_literal_pine_line(lstripped: str) -> bool:
+    """True for more-indented pine under an RST ``study(`` / ``indicator(``."""
+    if not lstripped or lstripped.startswith("//"):
+        return False
+    if _RST_SCRIPT_DECL_LINE_RE.match(lstripped):
+        return False  # second live declaration — stop the block
+    return bool(_RST_LITERAL_BODY_RE.match(lstripped) or _is_pine_start_line(lstripped))
+
+
+def _is_rst_literal_stop_line(line: str) -> bool:
+    """True for ``.. `` / prose / a second ``study(`` after an RST example."""
+    return bool(
+        _RST_DIRECTIVE_RE.match(line)
+        or _RST_SCRIPT_DECL_LINE_RE.match(line)
+        or _PROSE_CONTINUE_RE.match(line)
+        or _looks_like_prose_line(line)
+    )
+
+
+def _dedent_rst_literal_body(text: str) -> str:
+    """Dedent RST literal-block indent under a col-0 script declaration.
+
+    Docs often paste::
+
+        study("fill Example")
+            p1 = plot(sin(high))
+            fill(p1, p3, color=red)
+
+        .. image:: images/fill.png
+
+    ``study`` at column 0 blocks common-indent dedent; if the following
+    more-indented pine (``plot`` / ``fill`` / ``p1 =`` / ``src =``) is then
+    ``.. `` / English prose / a second ``study(``, strip that extra indent
+    (keep the intentional-error demo that has no trailing stop).
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    n = len(lines)
+    out = list(lines)
+    i = 0
+    while i < n:
+        raw = lines[i]
+        if raw.lstrip().startswith("//"):
+            i += 1
+            continue
+        m = _RST_SCRIPT_DECL_LINE_RE.match(raw.rstrip("\n"))
+        if not m:
+            i += 1
+            continue
+        decl_indent = m.group(1)
+        j = i + 1
+        while j < n and not lines[j].strip():
+            j += 1
+        body_idxs: list[int] = []
+        k = j
+        while k < n:
+            nxt = lines[k]
+            if not nxt.strip():
+                k += 1
+                continue
+            ns = nxt.lstrip()
+            indent_len = len(nxt) - len(nxt.lstrip(" \t"))
+            if ns.startswith("//"):
+                k += 1
+                continue
+            # Stop before RST leftover, English prose, or a second declaration.
+            if _is_rst_literal_stop_line(nxt):
+                break
+            if indent_len > len(decl_indent) and _is_rst_literal_pine_line(ns):
+                body_idxs.append(k)
+                k += 1
+                continue
+            break
+        p = k
+        while p < n and not lines[p].strip():
+            p += 1
+        if body_idxs and p < n and _is_rst_literal_stop_line(lines[p]):
+            extras: list[str] = []
+            for bi in body_idxs:
+                ln = lines[bi]
+                ws = ln[: len(ln) - len(ln.lstrip(" \t"))]
+                extras.append(ws[len(decl_indent) :])
+            prefix = extras[0]
+            for extra in extras[1:]:
+                while prefix and not extra.startswith(prefix):
+                    prefix = prefix[:-1]
+            if prefix:
+                drop = len(decl_indent) + len(prefix)
+                for bi in body_idxs:
+                    ln = lines[bi]
+                    if ln.startswith(decl_indent + prefix):
+                        out[bi] = decl_indent + ln[drop:]
+        i = k if body_idxs else i + 1
+    return "".join(out)
+
+
 def _polish_code_line(line: str) -> str:
     """Fix common scrape typos on an otherwise kept code line."""
     # Drop docs nav glued after real code: ``label.new(...)          Next``
@@ -493,15 +832,20 @@ def _polish_code_line(line: str) -> str:
         line = re.sub(r"\(\s*\.\.\.\s*$", "(", line)
     # reference library import UI residual: ``import x/y/1 as eta loading...``
     if not line.lstrip().startswith("//"):
-        line = re.sub(r"\s+loading\.\.\.\s*$", "", line, flags=re.I)
+        line = _strip_trailing_loading_ellipsis(line)
     # Dangling ``+`` / ``,`` immediately before a closer (cut mid-concat / mid-args).
     line = re.sub(r"\+\s*([\)\]])", r"\1", line)
     line = re.sub(r",\s*([\)\]])", r"\1", line)
-    # Python-style trailing commas on switch arms (``"EURUSD" => 3.0 * atr,``).
-    # Safe: real multi-value arms are ``=> a, b`` (no trailing comma after last).
+    # Python-style trailing commas on *simple* switch arms
+    # (``"EURUSD" => 3.0 * atr,``). Keep the comma when the RHS still has
+    # ``(`` — wrapped ``Type.new(a,`` / ``true => line.new(...,`` / statement
+    # lists ``=> foo.bar(),``.
     if "=>" in line and not line.lstrip().startswith("//"):
-        line = re.sub(r",\s*$", "", line)
+        after = line.rsplit("=>", 1)[-1]
+        if "(" not in after and line.count("(") <= line.count(")"):
+            line = re.sub(r",\s*$", "", line)
     line = _normalize_unicode_ops(line)
+    line = _strip_trailing_semicolon(line)
     return line
 
 
@@ -540,6 +884,16 @@ def _strip_line_chrome(line: str) -> str | None:
         return None
     if _CHECKLIST_RE.match(line):
         return None
+    if _HUGO_SHORTCODE_RE.match(line):
+        return None
+    if _RST_DIRECTIVE_RE.match(line):
+        return None
+    if _RST_HEADING_ULINE_RE.match(line):
+        return None
+    if not stripped.startswith("//") and (_AT_HTTPS_ONLY_RE.match(line) or _AT_HTTPS_PROSE_RE.search(line)):
+        return None
+    if _JSX_LINE_RE.match(line):
+        return None
 
     if stripped.startswith(">"):
         if _PROSE_LABEL_RE.match(line):
@@ -557,7 +911,7 @@ def _strip_line_chrome(line: str) -> str | None:
         return None
 
     # Clean broken scrape on version pragma: //@version=6`
-    m = re.match(r"^(\s*//@version\s*=\s*\d+)\W*\s*$", line)
+    m = re.match(r"^(\s*//@version\s*=\s*\d+)[^\w]*$", line)
     if m:
         return m.group(1)
 
@@ -568,6 +922,54 @@ def _is_pine_start_line(cleaned: str) -> bool:
     if _SHELL_IF_RE.match(cleaned):
         return False
     return bool(_PINE_START_RE.match(cleaned))
+
+
+def _block_comment_open_after_line(line: str, in_block: bool) -> bool:
+    """Whether a ``/* */`` block comment remains open after scanning *line*.
+
+    ``//`` is a line comment only when not already inside ``/*``. Strings hide
+    both forms. Pine block comments do not nest. Used so sanitize does not
+    treat ``Still a comment`` inside ``/* */`` as English prose (and so it
+    never strips ``*`` from ``/*`` / ``*/`` leaving a stray ``/``).
+    """
+    i = 0
+    n = len(line)
+    in_str: str | None = None
+    esc = False
+    while i < n:
+        ch = line[i]
+        if in_block:
+            if ch == "*" and i + 1 < n and line[i + 1] == "/":
+                in_block = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if esc:
+            esc = False
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\":
+                esc = True
+                i += 1
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        if ch == "/" and i + 1 < n and line[i + 1] == "*":
+            in_block = True
+            i += 2
+            continue
+        if ch in "\"'":
+            in_str = ch
+            i += 1
+            continue
+        i += 1
+    return in_block
 
 
 def _string_state_after_line(line: str, state: str | None) -> str | None:
@@ -611,18 +1013,39 @@ def _string_state_after_line(line: str, state: str | None) -> str | None:
     return state
 
 
+_VERSION_PRAGMA_RE = re.compile(r"^\s*//@version\s*=")
+
+
 def _line_filter(source: str) -> str:
     """Line-oriented chrome removal when no reliable fence body is available."""
     out: list[str] = []
     saw_pine = False
     str_state: str | None = None
+    in_block = False
+    # LLM / blog prompts often include a sample ``strategy(...)`` line *before*
+    # the real script's ``//@version``. Do not start pine on that decoy.
+    has_version_pragma = any(_VERSION_PRAGMA_RE.match(ln) for ln in source.splitlines())
+    seen_version = False
     for line in source.splitlines():
+        # Inside ``/* */``: keep verbatim (nested ``//`` and English sentences
+        # are still comments). Do not chrome-strip ``*`` from ``*/``.
+        if in_block:
+            out.append(line)
+            in_block = _block_comment_open_after_line(line, True)
+            continue
         # Inside an open multiline / unclosed string: keep the line verbatim and
         # never apply prose/chrome stops (content often looks like English docs).
         if str_state is not None:
             out.append(line)
             str_state = _string_state_after_line(line, str_state)
+            in_block = _block_comment_open_after_line(line, False)
             continue
+
+        if has_version_pragma and not seen_version:
+            if _VERSION_PRAGMA_RE.match(line):
+                seen_version = True
+            else:
+                continue
 
         if _FENCE_RE.match(line):
             # Opening fence before real pine: skip. Closing fence after pine: stop.
@@ -637,11 +1060,18 @@ def _line_filter(source: str) -> str:
                 break
             continue
 
-        # UI chrome between truncated preview and full copy (``Copy code``, gutters).
+        # UI chrome / docs tail after a complete script (Hugo shortcode, ``---``,
+        # markdown headings). Stop so trailing scrape prose cannot re-enter.
         if saw_pine and (
             _UI_CHROME_LINE_RE.match(line)
             or _LINE_NUMBER_ONLY_RE.match(line)
             or _TV_PINE_LABEL_RE.match(line)
+            or _HUGO_SHORTCODE_RE.match(line)
+            or _RST_DIRECTIVE_RE.match(line)
+            or _RST_HEADING_ULINE_RE.match(line)
+            or _RST_LINE_ANNOT_RE.match(line)
+            or _HR_RE.match(line)
+            or _MD_HEADING_RE.match(line)
         ):
             break
 
@@ -655,15 +1085,22 @@ def _line_filter(source: str) -> str:
                 or _TV_PINE_LABEL_RE.match(line)
                 or _COPIED_RE.match(line)
                 or _IMAGE_ONLY_RE.match(line)
+                or _RST_LINE_ANNOT_RE.match(line)
                 or _PROSE_CONTINUE_RE.match(line)
                 or _MD_HEADING_RE.match(line)
                 or _UI_CHROME_LINE_RE.match(line)
+                or _HUGO_SHORTCODE_RE.match(line)
+                or _RST_DIRECTIVE_RE.match(line)
+                or _RST_HEADING_ULINE_RE.match(line)
+                or _HR_RE.match(line)
             ):
                 break
             continue
 
         # After pine started, stop on English prose continuations
         if saw_pine and _PROSE_CONTINUE_RE.match(cleaned):
+            break
+        if saw_pine and _looks_like_prose_line(cleaned):
             break
         # Shell / Python leakage after we already have pine — stop
         if saw_pine and _FOREIGN_LINE_RE.match(cleaned):
@@ -678,19 +1115,23 @@ def _line_filter(source: str) -> str:
             # Blank lines before pine are fine to skip
             if not cleaned.strip():
                 continue
-            # Non-pine prose before script
-            continue
+            # Keep ``/*`` so a leading block comment is not dropped as prose
+            # (closer / body are held by ``in_block`` after this line is appended).
+            if not cleaned.lstrip().startswith("/*"):
+                # Non-pine prose before script
+                continue
 
         if _is_pine_start_line(cleaned) or (
             cleaned.strip()
             and not cleaned.lstrip().startswith("//")
             and not _SHELL_IF_RE.match(cleaned)
-            and ("=" in cleaned or "(" in cleaned or cleaned.lstrip().startswith(("if ", "for ", "while ", "switch ")))
+            and ("=" in cleaned or "(" in cleaned or cleaned.lstrip().startswith(("if ", "for ", "while ", "switch ", "once ")))
         ):
             saw_pine = True
 
         out.append(cleaned)
         str_state = _string_state_after_line(cleaned, None)
+        in_block = _block_comment_open_after_line(cleaned, False)
 
     text = "\n".join(out)
     if source.endswith("\n") and text and not text.endswith("\n"):
@@ -702,22 +1143,146 @@ def _line_filter(source: str) -> str:
 #   var float a = na var float b = na  →  var float a = na, var float b = na
 # Also:  a = 1 var b = 2  is invalid; only insert before a new var/varip keyword
 # when the preceding token looks like an expression terminator (identifier/number/na).
-_MISSING_VAR_COMMA_RE = re.compile(
-    r"(?<=[\w\)\]])\s+(?=(?:varip|var)\b)",
-)
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _has_md_image_http(text: str) -> bool:
+    """True when ``![alt](http…`` appears (markdown image with http dest)."""
+    start = 0
+    while True:
+        i = text.find("![", start)
+        if i < 0:
+            return False
+        j = text.find("](", i + 2)
+        if j < 0:
+            return False
+        if "]" not in text[i + 2 : j] and text.startswith("http", j + 2):
+            return True
+        start = i + 2
+
+
+def _strip_trailing_loading_ellipsis(line: str) -> str:
+    """Drop a trailing `` loading...`` UI leftover (case-insensitive)."""
+    nl = ""
+    core = line
+    if core.endswith("\n"):
+        nl = "\n"
+        core = core[:-1]
+        if core.endswith("\r"):
+            nl = "\r\n"
+            core = core[:-1]
+    end = len(core)
+    while end > 0 and core[end - 1] in " \t":
+        end -= 1
+    token = "loading..."
+    tlen = len(token)
+    if end < tlen or core[end - tlen : end].lower() != token:
+        return line
+    pre = end - tlen
+    if pre == 0 or core[pre - 1] not in " \t":
+        return line
+    while pre > 0 and core[pre - 1] in " \t":
+        pre -= 1
+    return core[:pre] + nl
+
+
+def _var_keyword_end(s: str, i: int) -> int | None:
+    """If ``s[i:]`` starts with ``var`` / ``varip`` at a word boundary, return end."""
+    if i > 0 and _is_word_char(s[i - 1]):
+        return None
+    if s.startswith("varip", i) and (i + 5 == len(s) or not _is_word_char(s[i + 5])):
+        return i + 5
+    if s.startswith("var", i) and (i + 3 == len(s) or not _is_word_char(s[i + 3])):
+        return i + 3
+    return None
+
+
+def _has_var_keyword(line: str) -> bool:
+    i = 0
+    while True:
+        j = line.find("var", i)
+        if j < 0:
+            return False
+        if _var_keyword_end(line, j) is not None:
+            return True
+        i = j + 1
+
+
+def _count_var_keywords(line: str) -> int:
+    n = 0
+    i = 0
+    while True:
+        j = line.find("var", i)
+        if j < 0:
+            return n
+        end = _var_keyword_end(line, j)
+        if end is not None:
+            n += 1
+            i = end
+        else:
+            i = j + 1
+
+
+def _has_assign_then_var(line: str) -> bool:
+    """True for ``= <token> var`` / ``varip`` (second same-line declaration)."""
+    start = 0
+    n = len(line)
+    while True:
+        eq = line.find("=", start)
+        if eq < 0:
+            return False
+        j = eq + 1
+        while j < n and line[j].isspace():
+            j += 1
+        if j >= n:
+            return False
+        while j < n and not line[j].isspace():
+            j += 1
+        if j >= n or not line[j].isspace():
+            start = eq + 1
+            continue
+        while j < n and line[j].isspace():
+            j += 1
+        if _var_keyword_end(line, j) is not None:
+            return True
+        start = eq + 1
+
+
+def _insert_var_commas(line: str) -> str:
+    """Insert ``, `` before a ``var`` / ``varip`` that follows a terminator token."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line[i] not in " \t":
+            out.append(line[i])
+            i += 1
+            continue
+        ws_start = i
+        while i < n and line[i] in " \t":
+            i += 1
+        prev = line[ws_start - 1] if ws_start else ""
+        if ws_start > 0 and (_is_word_char(prev) or prev in ")]") and _var_keyword_end(line, i) is not None:
+            out.append(", ")
+        else:
+            out.append(line[ws_start:i])
+    return "".join(out)
 
 
 def _fix_missing_decl_commas(source: str) -> str:
     """Insert commas between space-separated var declarations on one line."""
     out: list[str] = []
     for line in source.splitlines(keepends=True):
-        # Only touch lines that declare with var/varip more than once without a comma between.
-        if re.search(r"\bvar(?:ip)?\b", line) and line.count("var") >= 2 and "," not in line:
-            line = _MISSING_VAR_COMMA_RE.sub(", ", line)
-        elif re.search(r"\bvar(?:ip)?\b.+\bvar(?:ip)?\b", line) and re.search(
-            r"=\s*\S+\s+var(?:ip)?\b", line
-        ):
-            line = _MISSING_VAR_COMMA_RE.sub(", ", line)
+        if "var" not in line:
+            out.append(line)
+            continue
+        first = _has_var_keyword(line) and line.count("var") >= 2 and "," not in line
+        second = (not first) and _count_var_keywords(line) >= 2 and _has_assign_then_var(line)
+        if first or second:
+            line = _insert_var_commas(line)
         out.append(line)
     return "".join(out)
 
@@ -759,7 +1324,7 @@ def _starts_structural_statement(ns: str) -> bool:
     """True if *ns* begins a control/decl statement (not soft-keyword as identifier)."""
     if not ns:
         return False
-    if re.match(r"^(if|for|while|switch|else|import|export|var|varip)\b", ns):
+    if re.match(r"^(if|for|while|switch|once|else|import|export|var|varip)\b", ns):
         return True
     if _is_type_or_enum_declaration(ns) or re.match(r"^(type|enum)\s*$", ns):
         return True
@@ -906,7 +1471,7 @@ def _next_line_is_new_statement(lines: list[str], index: int) -> bool:
     ns = lines[j].lstrip()
     # Soft keywords ``type``/``method``/``enum`` are identifiers unless declaration form.
     if re.match(
-        r"^(if|for|while|switch|else|import|export|var|varip|"
+        r"^(if|for|while|switch|once|else|import|export|var|varip|"
         r"indicator|strategy|library|study|plot|plotshape|plotchar|plotcandle|"
         r"plotbar|fill|bgcolor|barcolor|hline|alertcondition|alert)\b",
         ns,
@@ -915,15 +1480,19 @@ def _next_line_is_new_statement(lines: list[str], index: int) -> bool:
     if _starts_structural_statement(ns):
         return True
     # Assignment / reassignment statement
-    if re.match(r"^[A-Za-z_]\w*(?:\.\w+|\[[^\]]*\])*\s*:=?", ns) and not re.match(
-        r"^[A-Za-z_]\w*\s*==", ns
-    ):
+    if re.match(r"^[A-Za-z_]\w*(?:\.\w+|\[[^\]]*\])*\s*:=?", ns) and not re.match(r"^[A-Za-z_]\w*\s*==", ns):
         # ``name =`` / ``name :=`` but not ``name ==``
         if re.match(r"^[A-Za-z_]\w*(?:\.\w+|\[[^\]]*\])*\s*:=", ns):
             return True
         if re.match(r"^[A-Za-z_]\w*(?:\.\w+|\[[^\]]*\])*\s*=(?![=<>])", ns):
             return True
     return False
+
+
+def _indent_width(line: str) -> int:
+    """Visual indent in columns; tab = 4, matching the Pine lexer."""
+    ws = line[: len(line) - len(line.lstrip(" \t"))]
+    return len(ws.expandtabs(4))
 
 
 def _line_has_arg_continuation(line: str, lines: list[str], index: int) -> bool:
@@ -934,14 +1503,12 @@ def _line_has_arg_continuation(line: str, lines: list[str], index: int) -> bool:
     if j >= len(lines):
         return False
     nxt = lines[j]
-    base_indent = len(line) - len(line.lstrip(" \t"))
-    nxt_indent = len(nxt) - len(nxt.lstrip(" \t"))
+    base_indent = _indent_width(line)
+    nxt_indent = _indent_width(nxt)
     ns = nxt.lstrip()
     if nxt_indent > base_indent:
         return True
-    if ns.startswith(
-        ("'", '"', "+", "-", "*", "/", "and ", "or ", "?", ":", "//", "(", "[", ".")
-    ):
+    if ns.startswith(("'", '"', "+", "-", "*", "/", "and ", "or ", "?", ":", "//", "(", "[", ".")):
         return True
     prev = line.rstrip()
     prev_code = _code_without_line_comment(prev)
@@ -999,14 +1566,37 @@ def _line_has_arg_continuation(line: str, lines: list[str], index: int) -> bool:
 # Dangling binary/logical op immediately before a closer after scrape repair:
 # ``str.tostring(a) +)`` / ``"session " +)`` / ``cond and)``.
 # Space-bounded so identifiers like ``foo+)`` are untouched; mirrors line polish.
-_DANGLING_BINOP_BEFORE_CLOSER_RE = re.compile(
-    r"\s+(?:and|or|\+|\-|\*|/)\s*(?=[\)\]])"
-)
+_DANGLING_BINOPS = ("and", "or", "+", "-", "*", "/")
 
 
 def _strip_dangling_binop_before_closers(text: str) -> str:
     """Drop incomplete trailing binops glued to ``)`` / ``]`` by closer injection."""
-    return _DANGLING_BINOP_BEFORE_CLOSER_RE.sub("", text)
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] not in " \t":
+            out.append(text[i])
+            i += 1
+            continue
+        ws_start = i
+        while i < n and text[i] in " \t":
+            i += 1
+        dropped = False
+        for op in _DANGLING_BINOPS:
+            if not text.startswith(op, i):
+                continue
+            after = i + len(op)
+            j = after
+            while j < n and text[j] in " \t":
+                j += 1
+            if j < n and text[j] in ")]":
+                i = j
+                dropped = True
+                break
+        if not dropped:
+            out.append(text[ws_start:i])
+    return "".join(out)
 
 
 def _close_trailing_opens_on_line(core: str) -> str:
@@ -1144,9 +1734,7 @@ def _fix_truncated_syntax(text: str) -> str:
         # Incomplete call / open paren: ``log.info(`` / ``label.new(`` at EOF,
         # or mid-file truncated calls after ellipsis strip: ``input.int(55, minval=1``
         # when the next line is a new statement (not an arg continuation).
-        if not stripped_nl.lstrip().startswith("//") and not _line_has_arg_continuation(
-            line, lines, i
-        ):
+        if not stripped_nl.lstrip().startswith("//") and not _line_has_arg_continuation(line, lines, i):
             code_core = _code_without_line_comment(stripped_nl)
             depth_p, depth_b = _code_paren_bracket_depth(code_core)
             bare_open = bool(re.search(r"[\(\[]\s*$", code_core))
@@ -1160,9 +1748,7 @@ def _fix_truncated_syntax(text: str) -> str:
                     continue
 
         # Incomplete assignment: ``entryLong =`` / ``string alertMessage3 =``
-        if _INCOMPLETE_ASSIGN_RE.match(stripped_nl) and not _line_has_arg_continuation(
-            line, lines, i
-        ):
+        if _INCOMPLETE_ASSIGN_RE.match(stripped_nl) and not _line_has_arg_continuation(line, lines, i):
             out.append(stripped_nl.rstrip() + " na" + eol)
             i += 1
             continue
@@ -1211,11 +1797,7 @@ def _fix_truncated_syntax(text: str) -> str:
 
         # Mid-expression cut on binary/logical op: ``x = a or`` / ``s = "a" +``
         mop = _TRAILING_BINOP_RE.match(stripped_nl)
-        if (
-            mop
-            and not stripped_nl.lstrip().startswith("//")
-            and not _line_has_arg_continuation(line, lines, i)
-        ):
+        if mop and not stripped_nl.lstrip().startswith("//") and not _line_has_arg_continuation(line, lines, i):
             out.append(stripped_nl.rstrip() + " na" + eol)
             i += 1
             continue
@@ -1224,9 +1806,7 @@ def _fix_truncated_syntax(text: str) -> str:
         #   ``c = open > close ? color.red :``  → append ``na``
         #   ``x = cond ? weekdaySession``       → append `` : na``
         # Never fires when a same-indent ternary arm continues on the next line.
-        if not stripped_nl.lstrip().startswith("//") and not _line_has_arg_continuation(
-            line, lines, i
-        ):
+        if not stripped_nl.lstrip().startswith("//") and not _line_has_arg_continuation(line, lines, i):
             code_t = _code_without_line_comment(stripped_nl).rstrip()
             tern_fix = _incomplete_ternary_suffix(code_t)
             if tern_fix is not None:
@@ -1236,17 +1816,14 @@ def _fix_truncated_syntax(text: str) -> str:
 
         # Assignment to empty structure: ``x = switch`` / ``x = if c`` / ``x = for …`` /
         # ``x = while …`` with no body (truncated reference docs demos).
-        m_as = re.match(
-            r"^(\s*.*?\S)\s*=\s*(switch|if|for|while)\b(.*)$",
-            stripped_nl,
-        )
+        ctrl_as = _split_ctrl_assignment(stripped_nl, allow_colon_eq=False)
         if (
-            m_as
+            ctrl_as is not None
             and not stripped_nl.lstrip().startswith("//")
-            and "=>" not in m_as.group(3)
+            and "=>" not in ctrl_as[3]
             and not _line_has_arg_continuation(line, lines, i)
         ):
-            indent = re.match(r"^(\s*)", stripped_nl).group(1)  # type: ignore[union-attr]
+            indent, lhs, _op, _rest = ctrl_as
             j = i + 1
             has_body = False
             while j < len(lines):
@@ -1263,12 +1840,12 @@ def _fix_truncated_syntax(text: str) -> str:
                 break
             if not has_body:
                 # Replace RHS structure with na (structure body was truncated).
-                out.append(m_as.group(1) + " = na" + eol)
+                out.append(indent + lhs + " = na" + eol)
                 i += 1
                 continue
 
         # Control header with empty/comment-only body (includes switch)
-        m = re.match(r"^(\s*)(if|else if|else|for|while|switch)\b(.*)$", stripped_nl)
+        m = re.match(r"^(\s*)(if|else if|else|for|while|switch|once)\b(.*)$", stripped_nl)
         if m and not stripped_nl.rstrip().endswith(("=>", ":")):
             indent, kw, rest = m.group(1), m.group(2), m.group(3)
             if "=>" not in rest:
@@ -1290,20 +1867,16 @@ def _fix_truncated_syntax(text: str) -> str:
                     has_body = True
                     break
                 if not has_body:
-                    child = (
-                        "\t"
-                        if any("\t" in ln for ln in lines[i : min(i + 5, len(lines))])
-                        else "    "
-                    )
+                    child = "\t" if any("\t" in ln for ln in lines[i : min(i + 5, len(lines))]) else "    "
                     # Docs scrapes often put the then/else body at the *same* indent
                     # as ``if`` / ``else if`` (no INDENT tokens). Promote those lines
                     # as a real body until the next sibling ``else`` / control / dedent.
                     if (
                         first_same is not None
                         and kw in {"if", "else if", "else", "for", "while"}
-                        and not lines[first_same].lstrip().startswith(
-                            ("else", "else if", "if ", "for ", "while ", "switch ", "type ", "enum ")
-                        )
+                        and not lines[first_same]
+                        .lstrip()
+                        .startswith(("else", "else if", "if ", "for ", "while ", "switch ", "once ", "type ", "enum "))
                     ):
                         out.append(line if line.endswith("\n") else line + "\n")
                         k = first_same
@@ -1318,7 +1891,7 @@ def _fix_truncated_syntax(text: str) -> str:
                                 break
                             ns = ln.lstrip()
                             if li == len(indent) and ns.startswith(
-                                ("else", "else if", "if ", "for ", "while ", "switch ", "type ", "enum ")
+                                ("else", "else if", "if ", "for ", "while ", "switch ", "once ", "type ", "enum ")
                             ):
                                 break
                             if li == len(indent):
@@ -1351,7 +1924,7 @@ def _fix_truncated_syntax(text: str) -> str:
 
 # Statement / expression leaves that do not constitute a real truncated-demo body.
 _NA_ONLY_LEAF_RE = re.compile(r"^(na|continue|break)\s*$")
-_CTRL_HEAD_RE = re.compile(r"^(if|else if|else|for|while|switch)\b")
+_CTRL_HEAD_RE = re.compile(r"^(if|else if|else|for|while|switch|once)\b")
 
 
 def _collapse_na_only_control_expr_assignments(text: str) -> str:
@@ -1376,16 +1949,9 @@ def _collapse_na_only_control_expr_assignments(text: str) -> str:
     while i < len(lines):
         line = lines[i]
         stripped = line.rstrip("\n")
-        m = re.match(
-            r"^(\s*)(.*?\S)\s*=\s*(for|while|if|switch)\b(.*)$",
-            stripped,
-        )
-        if (
-            m
-            and not stripped.lstrip().startswith("//")
-            and "=>" not in m.group(4)
-        ):
-            indent, lhs = m.group(1), m.group(2)
+        ctrl = _split_ctrl_assignment(stripped, allow_colon_eq=True)
+        if ctrl is not None and not stripped.lstrip().startswith("//") and "=>" not in ctrl[3]:
+            indent, lhs, op = ctrl[0], ctrl[1], ctrl[2]
             j = i + 1
             has_code = False
             only_na_or_ctrl = True
@@ -1395,13 +1961,18 @@ def _collapse_na_only_control_expr_assignments(text: str) -> str:
                     j += 1
                     continue
                 ni = len(nxt) - len(nxt.lstrip(" \t"))
+                ns = nxt.lstrip().rstrip("\n").rstrip()
+                # ``x = if cond`` / ``else if`` / ``else`` share the assignment indent.
+                if ni == len(indent) and re.match(r"^(else\s+if|else)\b", ns):
+                    has_code = True
+                    j += 1
+                    continue
                 if ni <= len(indent) and nxt.strip():
                     break
                 if nxt.lstrip().startswith("//"):
                     j += 1
                     continue
                 has_code = True
-                ns = nxt.lstrip().rstrip("\n").rstrip()
                 if _CTRL_HEAD_RE.match(ns) or _NA_ONLY_LEAF_RE.match(ns):
                     j += 1
                     continue
@@ -1409,7 +1980,7 @@ def _collapse_na_only_control_expr_assignments(text: str) -> str:
                 break
             if not has_code or only_na_or_ctrl:
                 eol = "\n" if line.endswith("\n") else ""
-                out.append(f"{indent}{lhs} = na{eol}")
+                out.append(f"{indent}{lhs} {op} na{eol}")
                 i = j
                 continue
         out.append(line)
@@ -1424,9 +1995,7 @@ _TYPED_PARAM_LINE_RE = re.compile(
     r"array(?:\s*<[^>\n]*>)?|matrix(?:\s*<[^>\n]*>)?|map(?:\s*<[^>\n]*>)?)"
     r"\s+[A-Za-z_]\w*"
 )
-_FUNC_OPEN_LINE_RE = re.compile(
-    r"^\s*(?:export\s+)?(?:method\s+)?[A-Za-z_]\w*\s*\(\s*$"
-)
+_FUNC_OPEN_LINE_RE = re.compile(r"^\s*(?:export\s+)?(?:method\s+)?[A-Za-z_]\w*\s*\(\s*$")
 
 
 def _ensure_truncated_function_arrow(text: str) -> str:
@@ -1446,9 +2015,7 @@ def _ensure_truncated_function_arrow(text: str) -> str:
         return text
 
     lines = text.splitlines()
-    code_idxs = [
-        i for i, ln in enumerate(lines) if ln.strip() and not ln.lstrip().startswith("//")
-    ]
+    code_idxs = [i for i, ln in enumerate(lines) if ln.strip() and not ln.lstrip().startswith("//")]
     if len(code_idxs) < 3:
         return text
 
@@ -1512,12 +2079,36 @@ def _is_effectively_empty_script(body: str) -> bool:
         code.append(s)
     if not code:
         return True
-    if len(code) == 1 and re.match(r"^(indicator|strategy|library|study)\s*\(.*\)\s*\.?\s*$", code[0]):
+    if len(code) == 1 and _is_decl_only_call(code[0]):
         # ``library().`` or ``strategy("x", ...)`` alone with no executable body — keep
         # declaration-only scripts that already parse; only stub broken tails.
         if code[0].endswith(").") or code[0].endswith("..."):
             return True
     return False
+
+
+def _looks_like_prose_line(line: str) -> bool:
+    """True for English/RST leftovers that must not block pine dedent."""
+    s = line.strip()
+    if not s or s.startswith("//") or s.startswith("//@"):
+        return False
+    if _PINE_START_RE.match(s) or _PROSE_CONTINUE_RE.match(s):
+        return bool(_PROSE_CONTINUE_RE.match(s))
+    if "=" in s or "(" in s or s.startswith(("if ", "for ", "while ", "switch ", "once ", "else")):
+        return False
+    if (
+        _RST_DIRECTIVE_RE.match(s)
+        or _RST_HEADING_ULINE_RE.match(s)
+        or _HUGO_SHORTCODE_RE.match(s)
+        or _RST_LINE_ANNOT_RE.match(s)
+    ):
+        return True
+    # Indented UDT fields: ``    DistMethod distMethod`` is not English prose.
+    # (unindented two-word titles like ``Last Modified`` stay prose / footers.)
+    if line[:1] in " \t" and _is_type_field_line(s):
+        return False
+    # Title-case sentence / docs prose without call/assign tokens
+    return bool(s[0].isupper() and " " in s)
 
 
 def _dedent_if_leading_indent(body: str) -> str:
@@ -1539,6 +2130,8 @@ def _dedent_if_leading_indent(body: str) -> str:
             continue
         # Skip version pragma for indent measurement
         if re.match(r"^//@version\b", s):
+            continue
+        if _looks_like_prose_line(ln):
             continue
         code_idxs.append(i)
     if not code_idxs:
@@ -1570,6 +2163,10 @@ def _dedent_if_leading_indent(body: str) -> str:
     n = len(prefix)
     out: list[str] = []
     for ln in lines:
+        if _looks_like_prose_line(ln):
+            # Drop trailing docs prose so it cannot sit at column 0 beside
+            # still-indented pine (lexer "first statement indented").
+            continue
         if ln.startswith(prefix):
             out.append(ln[n:])
         else:
@@ -1581,20 +2178,127 @@ def _dedent_if_leading_indent(body: str) -> str:
 #   type pivotPoint
 #   int x
 #   float y = close
-_TYPE_FIELD_LINE_RE = re.compile(
-    r"^(?:"
-    r"(?:(?:series|simple|const)\s+)?"
-    r"(?:int|float|bool|string|color|line|label|box|table|array|map|matrix|"
-    r"chart\.point)"
-    r"(?:\s*<[^>\n]*>)?"
-    r"(?:\[\])?"
-    r"\s+[A-Za-z_]\w*"
-    r"(?:\s*=.*)?"
-    r"|"
-    r"[A-Za-z_]\w*\s+[A-Za-z_]\w*"  # UDT-typed field: ``pivotPoint p``
-    r"(?:\s*=.*)?"
-    r")\s*$"
+_FIELD_TYPES = frozenset(
+    {
+        "int",
+        "float",
+        "bool",
+        "string",
+        "color",
+        "line",
+        "label",
+        "box",
+        "table",
+        "array",
+        "map",
+        "matrix",
+        "chart.point",
+    }
 )
+_FIELD_QUALS = frozenset({"series", "simple", "const"})
+_CTRL_ASSIGN_KWS = ("switch", "if", "for", "while")
+_DECL_CALL_NAMES = ("indicator", "strategy", "library", "study")
+
+
+def _is_ascii_ident(tok: str) -> bool:
+    if not tok:
+        return False
+    c0 = tok[0]
+    if not (("A" <= c0 <= "Z") or ("a" <= c0 <= "z") or c0 == "_"):
+        return False
+    return all(("A" <= c <= "Z") or ("a" <= c <= "z") or ("0" <= c <= "9") or c == "_" for c in tok[1:])
+
+
+def _is_builtin_field_type(tok: str) -> bool:
+    if tok.endswith("[]"):
+        tok = tok[:-2]
+    lt = tok.find("<")
+    if lt >= 0:
+        if not tok.endswith(">") or ">" in tok[lt + 1 : -1]:
+            return False
+        tok = tok[:lt]
+    return tok in _FIELD_TYPES
+
+
+def _is_type_field_line(raw: str) -> bool:
+    """True for a UDT field line (builtin or user type, optional default)."""
+    s = raw.rstrip(" \t")
+    if not s:
+        return False
+    eq = s.find("=")
+    if eq >= 0:
+        s = s[:eq].rstrip(" \t")
+    parts = s.split()
+    if len(parts) == 2:
+        typ, name = parts
+        if not _is_ascii_ident(name):
+            return False
+        return _is_builtin_field_type(typ) or _is_ascii_ident(typ)
+    if len(parts) == 3 and parts[0] in _FIELD_QUALS:
+        typ, name = parts[1], parts[2]
+        return _is_ascii_ident(name) and _is_builtin_field_type(typ)
+    return False
+
+
+def _keyword_at(s: str, kws: tuple[str, ...]) -> tuple[str, str] | None:
+    for kw in kws:
+        if s.startswith(kw) and (len(s) == len(kw) or not _is_word_char(s[len(kw)])):
+            return kw, s[len(kw) :]
+    return None
+
+
+def _split_ctrl_assignment(line: str, *, allow_colon_eq: bool) -> tuple[str, str, str, str] | None:
+    """Split ``lhs = if/for/while/switch …`` (optional ``:=``).
+
+    Returns ``(indent, lhs, op, rest_after_keyword)`` or ``None``.
+    """
+    body = line.lstrip()
+    indent = line[: len(line) - len(body)]
+    pos = 0
+    while True:
+        eq = body.find("=", pos)
+        if eq < 0:
+            return None
+        op = "="
+        lhs_end = eq
+        if allow_colon_eq and eq > 0 and body[eq - 1] == ":":
+            op = ":="
+            lhs_end = eq - 1
+        lhs = body[:lhs_end].rstrip(" \t")
+        if lhs:
+            rhs = body[eq + 1 :].lstrip(" \t")
+            hit = _keyword_at(rhs, _CTRL_ASSIGN_KWS)
+            if hit is not None:
+                _kw, rest = hit
+                return indent, lhs, op, rest
+        pos = eq + 1
+
+
+def _is_decl_only_call(s: str) -> bool:
+    """True for a lone ``indicator/strategy/library/study(…)`` (optional trailing ``.``)."""
+    for name in _DECL_CALL_NAMES:
+        if not s.startswith(name):
+            continue
+        rest = s[len(name) :]
+        k = 0
+        while k < len(rest) and rest[k].isspace():
+            k += 1
+        if k >= len(rest) or rest[k] != "(":
+            continue
+        close = rest.find(")", k + 1)
+        if close < 0:
+            continue
+        tail = rest[close + 1 :]
+        t = 0
+        while t < len(tail) and tail[t] in " \t":
+            t += 1
+        if t < len(tail) and tail[t] == ".":
+            t += 1
+            while t < len(tail) and tail[t] in " \t":
+                t += 1
+        if t == len(tail):
+            return True
+    return False
 
 
 def _fix_empty_type_body(body: str) -> str:
@@ -1662,6 +2366,7 @@ def _fix_empty_type_body(body: str) -> str:
                                 "for ",
                                 "while ",
                                 "switch ",
+                                "once ",
                                 "indicator(",
                                 "strategy(",
                                 "library(",
@@ -1669,7 +2374,7 @@ def _fix_empty_type_body(body: str) -> str:
                             )
                         ) or re.match(r"^//@version\b", ns):
                             break
-                        if not _TYPE_FIELD_LINE_RE.match(ns):
+                        if not _is_type_field_line(ns):
                             # Non-field sibling (e.g. ``pivotHighPrice = …``)
                             break
                         piece = indent + child + ns
@@ -1796,9 +2501,157 @@ def _pick_best_version_island(body: str) -> str:
     return best
 
 
+def _next_line_is_pine_string_wrap(line: str | None) -> bool:
+    """True when *line* continues a single/double-quoted Pine string.
+
+    TradingView wraps ``'…'`` / ``"…"`` onto the next physical line only if
+    that line is blank or starts with whitespace. A non-WS character at
+    column 1 (even the closer) is CE10017, not a continuation.
+    """
+    if line is None:
+        return False
+    core = line.split("\n", 1)[0].rstrip("\r")
+    if not core.strip():
+        return True
+    return core[0] in " \t"
+
+
+def _is_torn_string_residue(line: str) -> bool:
+    """True for leftover tails after a scrape-broken string (``left", …``)."""
+    s = line.lstrip()
+    if not s or s.startswith("//"):
+        return False
+    if _is_pine_start_line(s) and s.count(")") <= s.count("(") and s.count("]") <= s.count("["):
+        return False
+    if s[0] in "'\"[],.+":
+        return True
+    if re.match(r"""^[A-Za-z_]\w*["']""", s):
+        return True
+    return s.count(")") > s.count("(") or s.count("]") > s.count("[")
+
+
+def _comment_out_code_line(line: str) -> str:
+    """Prefix a non-comment line with ``// ``, keeping leading indent."""
+    ended_nl = line.endswith("\n")
+    core = line[:-1] if ended_nl else line
+    if core.lstrip().startswith("//"):
+        return line
+    i = 0
+    while i < len(core) and core[i] in " \t":
+        i += 1
+    indent, rest = core[:i], core[i:]
+    return f"{indent}// {rest}" + ("\n" if ended_nl else "")
+
+
+def _close_unbalanced_opens(core: str) -> str:
+    """Append ``)`` / ``]`` in reverse open order (quote-aware)."""
+    stack: list[str] = []
+    in_str: str | None = None
+    esc = False
+    i = 0
+    n = len(core)
+    while i < n:
+        ch = core[i]
+        if esc:
+            esc = False
+            i += 1
+            continue
+        if in_str:
+            if ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in "\"'":
+            in_str = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and core[i + 1] == "/":
+            break
+        if ch == "(":
+            stack.append(")")
+        elif ch == "[":
+            stack.append("]")
+        elif stack and ch == stack[-1]:
+            stack.pop()
+        i += 1
+    if not stack:
+        return core
+    return core + "".join(reversed(stack))
+
+
+def _close_uncontinued_quoted_strings(text: str) -> str:
+    """Close dangling ``'`` / ``"`` at EOL when the next line is not a wrap.
+
+    Does not touch triple-quoted v6 strings. After the opener is closed,
+    leftover torn tails (``[1.0.0]', overlay = true)``) are commented and
+    residual ``(`` / ``[`` on the repaired line are closed so parse can
+    recover a minimal statement.
+    """
+    if not text:
+        return text
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    n = len(lines)
+    out = list(lines)
+    state: str | None = None
+    i = 0
+    while i < n:
+        raw = out[i]
+        ended_nl = raw.endswith("\n")
+        core = raw[:-1] if ended_nl else raw
+        new_state = _string_state_after_line(core, state)
+        if new_state in ("'", '"') and not _next_line_is_pine_string_wrap(out[i + 1] if i + 1 < n else None):
+            core = core + new_state
+            core = _close_unbalanced_opens(core)
+            out[i] = core + ("\n" if ended_nl else "")
+            new_state = None
+            j = i + 1
+            while j < n and _is_torn_string_residue(out[j]):
+                out[j] = _comment_out_code_line(out[j])
+                j += 1
+        state = new_state
+        i += 1
+    return "".join(out)
+
+
+def _join_column1_ternary_continuations(text: str) -> str:
+    """Join a ``? …`` line onto the previous non-comment statement.
+
+    Scrapes wrap nested ternaries so the next arm starts at column 1::
+
+        x = close > open ? 1 : close < open ? 2 : close == open
+        ? 3 : 4
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    out: list[str] = []
+    for line in lines:
+        core = line[:-1] if line.endswith("\n") else line
+        if _COLUMN1_TERNARY_CONT_RE.match(core) and not core.lstrip().startswith("//"):
+            idx = len(out) - 1
+            while idx >= 0 and (not out[idx].strip() or out[idx].lstrip().startswith("//")):
+                idx -= 1
+            if idx >= 0:
+                prev = out[idx]
+                prev_nl = prev.endswith("\n")
+                prev_core = prev[:-1] if prev_nl else prev
+                joined = prev_core.rstrip() + " " + core.lstrip()
+                out[idx] = joined + ("\n" if prev_nl or line.endswith("\n") else "")
+                continue
+        out.append(line)
+    return "".join(out)
+
+
 def _finalize(provenance: list[str], body: str, ends_with_nl: bool) -> str:
     body = _pick_best_version_island(body)
+    body = _replace_mustache_placeholders(body)
     body = _dedent_if_leading_indent(body)
+    body = _close_uncontinued_quoted_strings(body)
+    body = _join_column1_ternary_continuations(body)
     body = _fix_truncated_syntax(_fix_missing_decl_commas(body))
     body = _fix_empty_type_body(body)
     # Only substitute the minimal stub for *non-Pine* / empty chrome.
@@ -1806,7 +2659,9 @@ def _finalize(provenance: list[str], body: str, ends_with_nl: bool) -> str:
     # keep their declaration + remaining statements — never overwrite with
     # ``indicator("x"); plot(close)``. Broken bare ``library().`` tails are the
     # sole declaration-shaped exception via ``_is_effectively_empty_script``.
-    if not _has_usable_pine(body) or _is_effectively_empty_script(body):
+    # Jinja2 templates (``{% for %}`` / leftover ``{{ expr }}``) are not Pine —
+    # never feed ``{`` to the lexer.
+    if _looks_like_jinja(body) or not _has_usable_pine(body) or _is_effectively_empty_script(body):
         body = _MINIMAL_STUB
     return _compose(provenance, body, ends_with_nl)
 
@@ -1838,7 +2693,7 @@ def _clean_and_score_island(text: str) -> tuple[str, int]:
         filt_lines.pop(0)
     while filt_lines and not filt_lines[0].strip():
         filt_lines.pop(0)
-    body = "\n".join(filt_lines)
+    body = _dedent_if_leading_indent("\n".join(filt_lines))
     sc = _score_pine_block(body)
     dp, db = _code_paren_bracket_depth(body)
     if dp == 0 and db == 0:
@@ -1852,16 +2707,30 @@ def sanitize_corpus_source(source: str) -> str:
     """Drop or unwrap non-Pine chrome common in scraped corpus scripts."""
     ends_with_nl = source.endswith("\n")
     source = _normalize_chrome(source)
+    source = _dedent_rst_literal_body(source)
     lines = source.splitlines()
 
     provenance, body_lines = _split_provenance(lines)
     body_text = "\n".join(body_lines)
 
     # Candidate extractable Pine islands (fences, reference "Copied", shell heredocs).
-    blocks: list[str] = []
-    blocks.extend(_extract_fenced_blocks(lines))
+    tagged_fences = _extract_fenced_blocks_tagged(lines)
+    blocks: list[str] = [body for _, body in tagged_fences]
     blocks.extend(_extract_tv_copied_blocks(lines))
     blocks.extend(_extract_heredoc_blocks(lines))
+
+    # MDX / JSX docs: never feed ``import {`` / ``<Steps>`` to the lexer.
+    # Use the first real pine fence if any; otherwise the minimal stub.
+    if _looks_like_mdx(body_text):
+        pine_only = [
+            body
+            for lang, body in tagged_fences
+            if (lang in _PINE_FENCE_LANGS or not lang) and not _looks_like_js_block(body)
+        ]
+        best_mdx, score_mdx = _pick_best_block(pine_only)
+        if best_mdx is not None and score_mdx >= 40 and _has_usable_pine(best_mdx):
+            return _finalize(provenance, _clean_block_body(best_mdx), ends_with_nl)
+        return _finalize(provenance, _MINIMAL_STUB, ends_with_nl)
 
     best, best_score = _pick_best_block(blocks)
 
@@ -1887,7 +2756,7 @@ def sanitize_corpus_source(source: str) -> str:
                 return _finalize(provenance, cand, ends_with_nl)
         else:
             best_body: str | None = None
-            best_sc = -10**9
+            best_sc = -(10**9)
             for isl in version_islands:
                 cand, sc = _clean_and_score_island(isl)
                 if not _has_usable_pine(cand):

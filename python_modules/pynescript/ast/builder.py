@@ -143,34 +143,6 @@ class PinescriptASTLocator:
 
     # ruff: noqa: N802
 
-    def _getLocations(self, ctx: ParserRuleContext) -> dict[str, int]:
-        """Extract location info from a parse tree context.
-
-        Args:
-            ctx: ANTLR parser context node
-
-        Returns:
-            Dict with lineno, col_offset, end_lineno, end_col_offset keys
-        """
-        start = ctx.start
-        stop = ctx.stop
-        stop_text = stop.text
-        stop_len = stop.stop - stop.start + 1
-        if stop_text is not None and "\n" in stop_text:
-            stop_nls = stop_text.count("\n")
-            stop_nlpos = stop_text.rfind("\n")
-            end_lineno = stop.line + stop_nls
-            end_col_offset = stop_len - stop_nlpos + 1
-        else:
-            end_lineno = stop.line
-            end_col_offset = stop.column + stop_len
-        return {
-            "lineno": start.line,
-            "col_offset": start.column,
-            "end_lineno": end_lineno,
-            "end_col_offset": end_col_offset,
-        }
-
     def _setLocations(self, node: ast.AST, ctx: ParserRuleContext) -> ast.AST:
         """Attach location metadata from parser context to AST node.
 
@@ -181,16 +153,24 @@ class PinescriptASTLocator:
         Returns:
             The modified node with location info attached
         """
-        # Optimized: directly set attributes; cache stop.text (hot path)
+        # Optimized: directly set attributes (hot path — called per node).
         start = ctx.start
         stop = ctx.stop
-        stop_text = stop.text
         stop_len = stop.stop - stop.start + 1
 
         node.lineno = start.line  # type: ignore[attr-defined]
         node.col_offset = start.column  # type: ignore[attr-defined]
 
-        # Most tokens are single-line; avoid count/rfind when no newline present
+        # Fast path: the lexer only bumps `line` on '\n', so a token that
+        # starts and ends on the same line cannot contain a newline — skip the
+        # stop.text substring allocation entirely (most tokens).
+        if stop.line == start.line:
+            node.end_lineno = stop.line  # type: ignore[attr-defined]
+            node.end_col_offset = stop.column + stop_len  # type: ignore[attr-defined]
+            return node
+
+        # Multi-line token (multiline strings/comments): may need the text.
+        stop_text = stop.text
         if stop_text is not None and "\n" in stop_text:
             stop_nls = stop_text.count("\n")
             stop_nlpos = stop_text.rfind("\n")
@@ -462,10 +442,15 @@ class PinescriptASTBuilder(
         return assign
 
     def visitSimple_reassignment(self, ctx: PinescriptParser.Simple_reassignmentContext):
-        target = ctx.primary_expression()
+        """``obj.f =`` / ``a[i] =`` / ``name :=`` — store-ctx on the LHS."""
+        if ctx.assignment_target_attribute():
+            target = self.visit(ctx.assignment_target_attribute())
+        elif ctx.assignment_target_subscript():
+            target = self.visit(ctx.assignment_target_subscript())
+        else:
+            target = self.visit(ctx.primary_expression())
+            self._set_store_ctx(target)
         value = ctx.expression()
-        target = self.visit(target)
-        self._set_store_ctx(target)
         value = self.visit(value)
         re_assign = ast.ReAssign(
             target=target,
@@ -569,9 +554,9 @@ class PinescriptASTBuilder(
     def visitFunction_declaration(self, ctx: PinescriptParser.Function_declarationContext):
         """UDF: ``export? [return_type] name(params) => body``.
 
-        Grammar allows a leading ``type_specification`` as the return type
-        (Pine v5+/v6). ASDL ``FunctionDef`` has no returns field yet, so that
-        context is intentionally not mapped — parse succeeds; type is dropped.
+        Optional leading ``type_specification`` is stored on
+        :attr:`~pynescript.ast.node.FunctionDef.returns` (type spec, not a
+        value). Engines must not ``visit()`` it as an executable expression.
         """
         name = ctx.name()
         args = ctx.parameter_list()
@@ -581,10 +566,13 @@ class PinescriptASTBuilder(
         body = self.visit(body)
         export = ctx.EXPORT()
         export = 1 if export else 0
+        ret_ctx = ctx.type_specification()
+        returns = self.visit(ret_ctx) if ret_ctx else None
         func_def = ast.FunctionDef(
             name=name,
             args=args,
             body=body,
+            returns=returns,
             method=0,  # Regular functions have method=0
             export=export,
         )
@@ -592,10 +580,7 @@ class PinescriptASTBuilder(
         return func_def
 
     def visitMethod_declaration(self, ctx: PinescriptParser.Method_declarationContext):
-        """Same shape as ``visitFunction_declaration`` with ``method=1``.
-
-        Optional return ``type_specification`` is also ignored (no ASDL field).
-        """
+        """Same shape as ``visitFunction_declaration`` with ``method=1``."""
         name = ctx.name()
         args = ctx.method_parameter_list()
         body = ctx.local_block()
@@ -604,10 +589,13 @@ class PinescriptASTBuilder(
         body = self.visit(body)
         export = ctx.EXPORT()
         export = 1 if export else 0
+        ret_ctx = ctx.type_specification()
+        returns = self.visit(ret_ctx) if ret_ctx else None
         func_def = ast.FunctionDef(
             name=name,
             args=args,
             body=body,
+            returns=returns,
             method=1,  # Methods have method=1
             export=export,
         )
@@ -734,7 +722,7 @@ class PinescriptASTBuilder(
         return stmt
 
     def visitStructure_expression(self, ctx: PinescriptParser.Structure_expressionContext):
-        struct = ctx.structure()
+        struct = ctx.value_structure()
         struct = self.visit(struct)
         expr = struct
         self._setLocations(expr, ctx)
@@ -974,20 +962,38 @@ class PinescriptASTBuilder(
         self._setLocations(switch_struct, ctx)
         return switch_struct
 
+    def visitOnce_structure(self, ctx: PinescriptParser.Once_structureContext):
+        """``once [cond]`` block. Optional test defaults to true at runtime."""
+        test_ctx = ctx.expression()
+        test = test_ctx and self.visit(test_ctx)
+        body = self.visit(ctx.local_block())
+        once_struct = ast.Once(
+            test=test,
+            body=body,
+        )
+        self._setLocations(once_struct, ctx)
+        return once_struct
+
     def visitSwitch_cases(self, ctx: PinescriptParser.Switch_casesContext):
-        pattern_cases = ctx.switch_pattern_case()
-        default_case = ctx.switch_default_case()
-        cases = [self.visit(case) for case in pattern_cases]
-        if default_case:
-            case = self.visit(default_case)
-            cases.append(case)
-        return cases
+        return [self.visit(case) for case in ctx.switch_case()]
+
+    def visitSwitch_case(self, ctx: PinescriptParser.Switch_caseContext):
+        pattern_case = ctx.switch_pattern_case()
+        if pattern_case is not None:
+            return self.visit(pattern_case)
+        return self.visit(ctx.switch_default_case())
 
     def visitSwitch_pattern_case(self, ctx: PinescriptParser.Switch_pattern_caseContext):
-        body = ctx.local_block()
-        pattern = ctx.expression()
-        body = self.visit(body)
-        pattern = self.visit(pattern)
+        body = self.visit(ctx.local_block())
+        pats_ctx = ctx.switch_patterns()
+        exprs = [self.visit(e) for e in pats_ctx.expression()] if pats_ctx else []
+        if not exprs:
+            pattern = None
+        elif len(exprs) == 1:
+            pattern = exprs[0]
+        else:
+            pattern = ast.Tuple(elts=exprs, ctx=ast.Load())
+            self._setLocations(pattern, pats_ctx)
         case = ast.Case(
             body=body,
             pattern=pattern,
@@ -1224,6 +1230,12 @@ class PinescriptASTBuilder(
         text = ctx.getText()
         if (text.startswith('"""') and text.endswith('"""')) or (text.startswith("'''") and text.endswith("'''")):
             return text[3:-3]
+        # Fast path: simple quoted string with no backslash escapes — skip
+        # ast.literal_eval (which builds a Python AST internally).
+        if len(text) >= 2 and "\\" not in text:
+            quote = text[0]
+            if quote in "\"'" and text[-1] == quote:
+                return text[1:-1]
         return literal_eval(text)
 
     def visitLiteral_bool(self, ctx: PinescriptParser.Literal_boolContext):
@@ -1358,9 +1370,43 @@ class PinescriptASTBuilder(
         return ident
 
     def visitTemplate_spec_suffix(self, ctx: PinescriptParser.Template_spec_suffixContext):
+        rshift_args = ctx.rshift_closed_type_args()
+        if rshift_args is not None:
+            return self.visit(rshift_args)
         args = ctx.type_argument_list()
         args = args and self.visit(args)
         return args
+
+    def visitRshift_closed_type_args(self, ctx: PinescriptParser.Rshift_closed_type_argsContext):
+        """Build ``T<U`` (and leading complete args) closed by a following RSHIFT."""
+        complete = [self.visit(t) for t in ctx.type_specification()]
+        ident = self.visit(ctx.attributed_type_name())
+        type_qual = ctx.type_qualifier()
+        inner_args_ctx = ctx.type_argument_list()
+        if inner_args_ctx:
+            spec = ast.Specialize(
+                value=ident,
+                args=self.visit(inner_args_ctx),
+            )
+            self._setLocations(spec, ctx)
+            spec.lineno = ident.lineno
+            spec.col_offset = ident.col_offset
+            ident = spec
+        if type_qual:
+            ident = ast.Qualify(  # type: ignore[assignment]
+                qualifier=self.visit(type_qual),
+                value=ident,
+            )
+            self._setLocations(ident, ctx)
+        args = complete + [ident]
+        if len(args) == 1:
+            return args[0]
+        tup = ast.Tuple(
+            elts=args,
+            ctx=_LOAD,
+        )
+        self._setLocations(tup, ctx)
+        return tup
 
     def visitType_argument_list(self, ctx: PinescriptParser.Type_argument_listContext):
         args = ctx.type_specification()

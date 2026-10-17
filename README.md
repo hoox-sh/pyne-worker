@@ -3,7 +3,7 @@
 > Production **Python Cloudflare® Worker** for the **[PYNE](https://hoox.sh/pyne)** stack —
 > evaluate TradingView® Pine Script™ on the edge with the same bar-loop contract as the Pro API.
 
-**Version:** 0.6.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.4.4)
+**Version:** 0.7.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.6.12)
 
 **Website:** [hoox.sh/pyne](https://hoox.sh/pyne) · **Docs:** [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) · **Repo:** [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker)
 
@@ -101,13 +101,14 @@ Strong real-world Pine coverage via the open PYNE engine — **not** a claim of 
 - **Health** — `GET /health` (R2 + service binding checks)
 - **30s wall timeout** per `/run`
 - **R2 OHLCV** — `POST /ingest`, `data/{SYMBOL}/{TIMEFRAME}/{YYYY}.jsonl`
-- **Compile modes** — `interpret` · `compile` · `auto` on `POST /run`
+- **Compile modes** — `interpret` · `compile` · `auto` on `POST /run` (`compile` needs the numpy/numba toolchain, which the edge runtime does not ship; `auto` degrades to `interpret` with `compile_fallback_reason`)
 - **Script registry** — deploy by `script_id`, list/get/delete
 - **1m bar-close cron** — `* * * * *` + `POST /cron/run` (runs only on new bar)
 - **Live market feed** — closed klines (Bybit → R2, Binance fallback)
 - **Trade forwarding** — strategy events → trade-worker
 - **Alert engine + L2 webhooks** — `ALERT_WEBHOOK_URL` or per-job `webhook_url`
 - **Libraries** — `POST /run` `libraries: [{namespace, name, version, source}]` for `import ns/Name/ver` (AXIS git-publish emulator; pynescript 0.3.7+)
+- **Response windowing** — `from_bar` / `to_bar` trim the envelope to a visible bar range (engine still evaluates every bar; Pro API parity, pynescript 0.6.9+)
 - **Drawings / plot_meta / logs** — same evaluate-contract envelope as the Pro API
 - **$0 tier OK** for light use; Paid Workers recommended for heavy 1m cron
 
@@ -171,14 +172,15 @@ After pulling new PYNE APIs, always re-run `./scripts/sync_vendor.sh`.
 | `script` | Inline Pine source |
 | `script_id` | Load deployed script from R2 (instead of `script`) |
 | `ohlcv` / `data` | Bars; or omit and set `symbol` + `timeframe` to read R2 |
-| `mode` | `interpret` (default) · `compile` · `auto` (compile then fall back) |
+| `mode` | `interpret` (default) · `compile` (needs numpy; unavailable on edge) · `auto` (compile then fall back cleanly) |
 | `inputs` | Optional `input.*` overrides (title → value); forces interpret under `auto` |
 | `libraries` | Optional `[{namespace, name, version, source}]` — binds `import ns/Name/ver` (max 32; interpret/`auto` only) |
 | `profiler` | Per-line interpret timings (AXIS gutter) |
 | `timeout_seconds` | Wall-clock budget (default 30, max 30) |
 | `max_bars` | Tail length when loading long R2 history |
+| `from_bar` / `to_bar` | Optional inclusive response window over bars (negative = from the end; adds `window` metadata) |
 
-Also accepts `"data"` instead of `"ohlcv"` (PYNE Pro API compat). Success response includes `status`, `plots`, `series`, `plot_meta`, `alerts`, `events`, `drawings`, `inputs`, `logs`, `meta`, `count`/`bars`, and structured `error` / `error_kind` on failure.
+Also accepts `"data"` instead of `"ohlcv"` (PYNE Pro API compat). Success response includes `status`, `plots`, `series`, `plot_meta`, `alerts`, `events`, `drawings`, `inputs`, `logs`, `meta`, `count`/`bars`, and structured `error` / `error_kind` on failure. With `from_bar` / `to_bar`, bar-indexed members are trimmed and a `window` object (`from_bar`, `to_bar`, `bars`, `total_bars`) is added; `alerts` are never trimmed.
 
 Library example (`import ns/Lib/1`):
 
@@ -353,7 +355,9 @@ Without an internal key, actionable events are **not** POSTed — they fail with
 
 - **HTTPS only** (public hosts)
 - Blocks `localhost`, `*.local` / `*.internal`, private / loopback / link-local / metadata IPs
+- Blocks disguised private IPs (IPv4-mapped IPv6, 6to4, decimal/hex forms)
 - Blocks embedded credentials (`https://user:pass@…`)
+- Re-validated at POST time; redirects are not followed (pynescript 0.6.6+ hardening)
 
 R2 keys for OHLCV use sanitized `symbol` + `timeframe` only (`data/{SYMBOL}/{TF}/{YYYY}.jsonl`) to prevent path traversal.
 
@@ -410,6 +414,7 @@ locally or pass inline `"ohlcv"` / `"data"`.
 7. **`data_provider.py`** — R2 reader/writer (`data/{SYM}/{TF}/{Y}.jsonl`)  
 8. **`trade_forwarder.py`** — StrategyEvent → trade-worker WebhookPayload  
 9. **`alert_engine.py` / `alert_forwarder.py`** — last-bar filter + HTTP webhooks  
+10. **`window.py`** — `/run` response windowing (`from_bar` / `to_bar`, Pro API parity)  
 
 Vendored deploy tree: `python_modules/` (sync with `./scripts/sync_vendor.sh`).
 

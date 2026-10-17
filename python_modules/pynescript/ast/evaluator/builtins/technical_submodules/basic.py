@@ -45,6 +45,16 @@ class BasicIndicators(TechnicalHelpers):
 
     def _builtin_ta_sma(self, args: list[Any]) -> list[float | None]:
         """Simple Moving Average."""
+        # Steady bar: positive int period, incremental already resolved.
+        # Skips _expect_series / a second _use_incremental_ta. Slot is still
+        # taken inside _sma_inc_update (same order as the slow path).
+        if (
+            self._pine_ta_inc_cached is True
+            and len(args) == BINARY
+            and type(args[1]) is int
+            and args[1] > 0
+        ):
+            return self._sma_inc_update(args[0], args[1])
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
         if self._use_incremental_ta():
             return self._sma_inc_update(series, period)
@@ -52,6 +62,13 @@ class BasicIndicators(TechnicalHelpers):
 
     def _builtin_ta_ema(self, args: list[Any]) -> list[float | None]:
         """Exponential Moving Average."""
+        if (
+            self._pine_ta_inc_cached is True
+            and len(args) == BINARY
+            and type(args[1]) is int
+            and args[1] > 0
+        ):
+            return self._ema_inc_update(args[0], args[1])
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
         if self._use_incremental_ta():
             return self._ema_inc_update(series, period)
@@ -115,11 +132,13 @@ class BasicIndicators(TechnicalHelpers):
             return self._hma_inc_update(series, period)
         return self._hma(series, period)
 
-    def _builtin_ta_vwap(self, args: list[Any]) -> float | None:
+    def _builtin_ta_vwap(self, args: list[Any]) -> float | tuple[float, float, float] | None:
         """Volume Weighted Average Price.
 
         Reference Pine: ``ta.vwap(source)`` or ``ta.vwap`` (defaults to hlc3).
         Optional second arg is an anchor condition that resets the window.
+        Three-arg ``ta.vwap(source, anchor, stdev_mult)`` returns
+        ``(vwap, upper, lower)`` with volume-weighted stdev bands.
         """
         if self._use_incremental_ta():
             # O(1) cumulative — only need last price/volume samples.
@@ -133,8 +152,12 @@ class BasicIndicators(TechnicalHelpers):
             series_map = getattr(self, "current_series", None) or {}
             volume = series_map.get("volume")
             anchor = args[1] if len(args) >= 2 else None
+            stdev_mult = args[2] if len(args) >= 3 else None
             return self._vwap_inc_update(
-                source, volume if volume else None, anchor=anchor
+                source,
+                volume if volume else None,
+                anchor=anchor,
+                stdev_mult=stdev_mult,
             )
         if len(args) == 0:
             source = self._context_series("hlc3") or self._context_series("close")
@@ -215,6 +238,13 @@ class BasicIndicators(TechnicalHelpers):
 
     def _builtin_ta_highest(self, args: list[Any]) -> Any:
         """Highest value. ``ta.highest(source, length)`` or ``ta.highest(length)`` → high."""
+        if (
+            self._pine_ta_inc_cached is True
+            and len(args) == BINARY
+            and type(args[1]) is int
+            and args[1] > 0
+        ):
+            return self._highest_inc_update(args[0], args[1])
         series, period = self._expect_series(
             args,
             length=BINARY,
@@ -228,6 +258,13 @@ class BasicIndicators(TechnicalHelpers):
 
     def _builtin_ta_lowest(self, args: list[Any]) -> Any:
         """Lowest value. ``ta.lowest(source, length)`` or ``ta.lowest(length)`` → low."""
+        if (
+            self._pine_ta_inc_cached is True
+            and len(args) == BINARY
+            and type(args[1]) is int
+            and args[1] > 0
+        ):
+            return self._lowest_inc_update(args[0], args[1])
         series, period = self._expect_series(
             args,
             length=BINARY,
@@ -308,6 +345,13 @@ class BasicIndicators(TechnicalHelpers):
 
     def _builtin_ta_stdev(self, args: list[Any]) -> float | None:
         """Standard Deviation."""
+        if (
+            self._pine_ta_inc_cached is True
+            and len(args) == BINARY
+            and type(args[1]) is int
+            and args[1] > 1
+        ):
+            return self._stdev_inc_update(args[0], args[1])
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
         if self._use_incremental_ta():
             return self._stdev_inc_update(series, period)
@@ -394,8 +438,16 @@ class BasicIndicators(TechnicalHelpers):
                 else self._context_series("close")
             )
         elif len(args) == TERNARY:
-            length = self._expect_int(args[1], msg)
+            length_raw = args[1]
             multiplier = args[2]
+            if (
+                self._pine_ta_inc_cached is True
+                and type(length_raw) is int
+                and length_raw > 1
+                and (type(multiplier) is float or type(multiplier) is int)
+            ):
+                return self._bb_inc_update(args[0], length_raw, float(multiplier))
+            length = self._expect_int(length_raw, msg)
             # Inc path: last-sample only (``_series_last``). Full path needs chrono list.
             series = self._as_series_or_raw(args[0], last_sample_ok=True)
         else:
@@ -412,6 +464,13 @@ class BasicIndicators(TechnicalHelpers):
     def _builtin_ta_atr(self, args: list[Any]) -> Any:
         """Average True Range. reference Pine: ``ta.atr(length)``; also legacy 4-arg form."""
         if len(args) == 1 and self._is_period_like(args[0]):
+            if self._pine_ta_inc_cached is True and type(args[0]) is int and args[0] > 0:
+                return self._atr_inc_update(
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    self._context_source("close"),
+                    args[0],
+                )
             length = self._expect_int(args[0], "ta.atr length must be an integer")
             if self._use_incremental_ta():
                 return self._atr_inc_update(
@@ -525,6 +584,14 @@ class BasicIndicators(TechnicalHelpers):
             # na length → soft-na before materializing chart series (None so nz/na() work)
             if di_len < 1 or adx_smooth < 1:
                 return None, None, None  # type: ignore[return-value]
+            if self._use_incremental_ta():
+                return self._dmi_inc_update(
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    self._context_source("close"),
+                    di_len,
+                    adx_smooth,
+                )
             highs = self._context_series("high")
             lows = self._context_series("low")
             closes = self._context_series("close")
@@ -699,41 +766,32 @@ class BasicIndicators(TechnicalHelpers):
         # reference Pine: intercept + slope * (length - 1 - offset) with x = 0..n-1 oldest→newest
         return mean_y + slope * ((n - 1 - offset) - mean_x)
 
-    def _builtin_ta_rci(self, args: list[Any]) -> float:
-        """Rank Correlation Index (Spearman's correlation)."""
-        if len(args) != BINARY:
-            self._error("ta.rci takes source series and length")
-
-        series = self._as_series(args[0])
-        length = self._expect_int(args[1], "ta.rci takes source series and length")
-
+    def _builtin_ta_rci(self, args: list[Any]) -> float | None:
+        """Rank Correlation Index (Spearman rho of time vs value ranks)."""
+        series, length = self._expect_series(args, length=BINARY, last_sample_ok=True)
         if length < 2:
             self._error("ta.rci length must be at least 2")
+        if self._use_incremental_ta():
+            return self._rci_inc_update(series, length)
+        # Bar-mode locals (input.source) are last-sample scalars.
+        if self._bar_mode() and (not isinstance(series, list) or len(series) < length):
+            return self._rci_inc_update(series, length)
+        if not isinstance(series, list):
+            series = self._as_series(series)
         if len(series) < length:
-            return math.nan
-
-        window = series[-length:]
-        valid_values = [(i, v) for i, v in enumerate(window) if v is not None]
-
-        if len(valid_values) < 2:
-            return math.nan
-
-        ranks_idx = sorted(range(len(valid_values)), key=lambda i: i)
-        ranks_val = sorted(range(len(valid_values)), key=lambda i: valid_values[i][1])
-
-        rank_dict_idx = {idx: rank for rank, idx in enumerate(ranks_idx)}
-        rank_dict_val = {idx: rank for rank, idx in enumerate(ranks_val)}
-
-        d_squared = sum((rank_dict_idx[i] - rank_dict_val[i]) ** 2 for i in range(len(valid_values)))
-        n = len(valid_values)
-        return 1 - (6 * d_squared) / (n * (n * n - 1)) if n > 1 else math.nan
+            return None
+        return self._rci_spearman(series[-length:])
 
     def _builtin_ta_cog(self, args: list[Any]) -> float:
         """Center of Gravity oscillator."""
-        series, length = self._expect_series(args, length=BINARY)
+        series, length = self._expect_series(args, length=BINARY, last_sample_ok=True)
 
         if length < 1:
             self._error("ta.cog length must be positive")
+        if self._use_incremental_ta():
+            return self._cog_inc_update(series, length)
+        if not isinstance(series, list):
+            series = self._as_series(series)
         if len(series) < length:
             return math.nan
 
@@ -879,7 +937,11 @@ class BasicIndicators(TechnicalHelpers):
 
     def _builtin_ta_mode(self, args: list[Any]) -> float | None:
         """Mode (most frequent value) over a period."""
-        series, period = self._expect_series(args, length=2)
+        series, period = self._expect_series(args, length=2, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._mode_inc_update(series, period)
+        if not isinstance(series, list):
+            series = self._as_series(series)
         return self._mode(series, period)
 
     def _builtin_ta_percentrank(self, args: list[Any]) -> float | None:
@@ -1030,26 +1092,7 @@ class BasicIndicators(TechnicalHelpers):
         if self._use_incremental_ta():
             return self._pivothigh_inc_update(source, left_bars, right_bars)
 
-        if len(source) <= left_bars + right_bars:
-            return None
-
-        # Get current value (last in chronological series)
-        current_idx = len(source) - 1
-        current = self._pivot_scalar(source[current_idx])
-        if current is None:
-            return None
-
-        # Check left bars (strict local max)
-        for i in range(1, left_bars + 1):
-            if current_idx - i < 0:
-                return None
-            left_val = self._pivot_scalar(source[current_idx - i])
-            if left_val is not None and left_val >= current:
-                return None
-
-        # Check right bars - would need future bars
-        # For now, only check left bars
-        return current
+        return self._pivot_confirm_window(source, left_bars, right_bars, is_high=True)
 
     def _builtin_ta_pivotlow(self, args: list[Any]) -> float | None:
         """Find the lowest point (pivot low) in a window.
@@ -1078,24 +1121,7 @@ class BasicIndicators(TechnicalHelpers):
         if self._use_incremental_ta():
             return self._pivotlow_inc_update(source, left_bars, right_bars)
 
-        if len(source) <= left_bars + right_bars:
-            return None
-
-        current_idx = len(source) - 1
-        current = self._pivot_scalar(source[current_idx])
-        if current is None:
-            return None
-
-        for i in range(1, left_bars + 1):
-            if current_idx - i < 0:
-                return None
-            left_val = self._pivot_scalar(source[current_idx - i])
-            if left_val is not None and left_val <= current:
-                return None
-
-        # Check right bars - would need future bars
-        # For now, only check left bars
-        return current
+        return self._pivot_confirm_window(source, left_bars, right_bars, is_high=False)
 
     def _builtin_ta_pivot_point_levels(self, args: list[Any]) -> Any:
         """Calculate pivot point levels.

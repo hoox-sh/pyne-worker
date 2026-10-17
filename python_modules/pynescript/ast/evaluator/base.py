@@ -77,6 +77,14 @@ _MATH_CONSTANTS = {
     "text.formatting.bold": "bold",
     "text.formatting.italic": "italic",
     "text.formatting.bold_italic": "bold italic",
+    # v6 text alignment constants (table.cell / box / label halign + valign).
+    # Value is the suffix after the first dot, matching position.* convention
+    # (position.top_left -> "top_left"); AXIS matches on the suffix.
+    "text.align_left": "align_left",
+    "text.align_center": "align_center",
+    "text.align_right": "align_right",
+    "text.align_top": "align_top",
+    "text.align_bottom": "align_bottom",
     # v6 text size constants (can be used as int or str; int for points in v6)
     "size.auto": "auto",
     "size.tiny": 8,
@@ -121,11 +129,14 @@ _MATH_CONSTANTS = {
     "extend.left": "left",
     "extend.right": "right",
     "extend.both": "both",
-    "display.none": "none",
-    "display.all": "all",
-    "display.data_window": "data_window",
-    "display.price_scale": "price_scale",
-    "display.status_line": "status_line",
+    # Pine display.* is a bitfield: none=0 pane=1 data_window=2 price_scale=4
+    # status_line=8 all=15. Integers so `display.pane + display.data_window` works.
+    "display.none": 0,
+    "display.pane": 1,
+    "display.all": 15,
+    "display.data_window": 2,
+    "display.price_scale": 4,
+    "display.status_line": 8,
     "position.top_left": "top_left",
     "position.top_center": "top_center",
     "position.top_right": "top_right",
@@ -248,6 +259,23 @@ class BaseEvaluator(NodeVisitor):
         self._history_names_scanned: bool = False
         # bar_index last written for each history-tracked series (same-bar replace).
         self._series_assign_bar: dict[str, int] = {}
+        # Reused positional arg lists for visit_Call (1–3 NAME/CONST args).
+        # Unrolled plans never visit nested Calls, so overwrite is safe.
+        self._arg1: list[Any] = [None]
+        self._arg2: list[Any] = [None, None]
+        self._arg3: list[Any] = [None, None, None]
+        # Pre-bound so the bar loop can LOAD_ATTR instead of getattr().
+        # ``_pine_ta_inc_cached`` stays None until the first ta.* call resolves
+        # bar-mode + PYNE_TA_INCREMENTAL. ``_ta_key_cache`` reuses dict keys.
+        self._pine_defs_locked: bool = False
+        self._pine_line_profile: dict[int, list[float]] | None = None
+        self._hot_body: tuple[Any, ...] | None = None
+        self._pine_udf_site: int | None = None
+        self._pine_as_series_cache: dict[Any, tuple] = {}
+        self._pine_ta_inc_cached: bool | None = None
+        self._ta_call_i: int = 0
+        self._ta_inc_state: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._ta_key_cache: list[tuple[Any, ...] | None] = []
 
     def generic_visit(self, node: ast.AST):
         """Fail closed on AST node types with no ``visit_*`` implementation.

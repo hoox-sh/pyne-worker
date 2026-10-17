@@ -113,7 +113,13 @@ class CommonIndicators(TechnicalHelpers):
 
     def _builtin_ta_range(self, args: list[Any]) -> float | None:
         """Range = highest - lowest over a period."""
-        series, period = self._expect_series(args, length=BINARY)
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            highest = self._highest_inc_update(series, period)
+            lowest = self._lowest_inc_update(series, period)
+            if highest is None or lowest is None:
+                return None
+            return highest - lowest
         return self._range(series, period)
 
     def _builtin_ta_max(self, args: list[Any]) -> float | None:
@@ -122,7 +128,9 @@ class CommonIndicators(TechnicalHelpers):
             series = self._as_series(args[0])
             valid = [v for v in series if v is not None and isinstance(v, (int, float))]
             return max(valid) if valid else None
-        series, period = self._expect_series(args, length=BINARY)
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._highest_inc_update(series, period)
         return self._highest(series, period)
 
     def _builtin_ta_min(self, args: list[Any]) -> float | None:
@@ -131,7 +139,9 @@ class CommonIndicators(TechnicalHelpers):
             series = self._as_series(args[0])
             valid = [v for v in series if v is not None and isinstance(v, (int, float))]
             return min(valid) if valid else None
-        series, period = self._expect_series(args, length=BINARY)
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._lowest_inc_update(series, period)
         return self._lowest(series, period)
 
     # -- Statistical/Change functions ---------------------------------------
@@ -184,7 +194,11 @@ class CommonIndicators(TechnicalHelpers):
 
     def _builtin_ta_mode(self, args: list[Any]) -> float | None:
         """Mode (most frequent value) over a period."""
-        series, period = self._expect_series(args, length=BINARY)
+        series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if self._use_incremental_ta():
+            return self._mode_inc_update(series, period)
+        if not isinstance(series, list):
+            series = self._as_series(series)
         return self._mode(series, period)
 
     def _builtin_ta_percentrank(self, args: list[Any]) -> float | None:
@@ -545,10 +559,14 @@ class CommonIndicators(TechnicalHelpers):
 
     def _builtin_ta_cog(self, args: list[Any]) -> float:
         """Center of Gravity oscillator."""
-        series, length = self._expect_series(args, length=BINARY)
+        series, length = self._expect_series(args, length=BINARY, last_sample_ok=True)
 
         if length < 1:
             self._error("ta.cog length must be positive")
+        if self._use_incremental_ta():
+            return self._cog_inc_update(series, length)
+        if not isinstance(series, list):
+            series = self._as_series(series)
         if len(series) < length:
             return math.nan
 

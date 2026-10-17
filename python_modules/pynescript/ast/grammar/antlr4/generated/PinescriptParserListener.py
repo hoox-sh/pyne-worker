@@ -1,22 +1,3 @@
-# Copyright (C) 2024-2026 jango_blockchained
-#
-# This file is part of pynescript.
-#
-# pynescript is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# pynescript is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
-#
-# SPDX-License-Identifier: AGPL-3.0-or-later
-
 # Generated from PinescriptParser.g4 by ANTLR 4.13.2
 from antlr4 import *
 if "." in __name__:
@@ -279,6 +260,15 @@ class PinescriptParserListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by PinescriptParser#value_structure.
+    def enterValue_structure(self, ctx:PinescriptParser.Value_structureContext):
+        pass
+
+    # Exit a parse tree produced by PinescriptParser#value_structure.
+    def exitValue_structure(self, ctx:PinescriptParser.Value_structureContext):
+        pass
+
+
     # Enter a parse tree produced by PinescriptParser#structure.
     def enterStructure(self, ctx:PinescriptParser.StructureContext):
         pass
@@ -396,6 +386,24 @@ class PinescriptParserListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by PinescriptParser#once_structure.
+    def enterOnce_structure(self, ctx:PinescriptParser.Once_structureContext):
+        pass
+
+    # Exit a parse tree produced by PinescriptParser#once_structure.
+    def exitOnce_structure(self, ctx:PinescriptParser.Once_structureContext):
+        pass
+
+
+    # Enter a parse tree produced by PinescriptParser#switch_case.
+    def enterSwitch_case(self, ctx:PinescriptParser.Switch_caseContext):
+        pass
+
+    # Exit a parse tree produced by PinescriptParser#switch_case.
+    def exitSwitch_case(self, ctx:PinescriptParser.Switch_caseContext):
+        pass
+
+
     # Enter a parse tree produced by PinescriptParser#switch_cases.
     def enterSwitch_cases(self, ctx:PinescriptParser.Switch_casesContext):
         pass
@@ -411,6 +419,15 @@ class PinescriptParserListener(ParseTreeListener):
 
     # Exit a parse tree produced by PinescriptParser#switch_pattern_case.
     def exitSwitch_pattern_case(self, ctx:PinescriptParser.Switch_pattern_caseContext):
+        pass
+
+
+    # Enter a parse tree produced by PinescriptParser#switch_patterns.
+    def enterSwitch_patterns(self, ctx:PinescriptParser.Switch_patternsContext):
+        pass
+
+    # Exit a parse tree produced by PinescriptParser#switch_patterns.
+    def exitSwitch_patterns(self, ctx:PinescriptParser.Switch_patternsContext):
         pass
 
 
@@ -1014,6 +1031,15 @@ class PinescriptParserListener(ParseTreeListener):
 
     # Exit a parse tree produced by PinescriptParser#template_spec_suffix.
     def exitTemplate_spec_suffix(self, ctx:PinescriptParser.Template_spec_suffixContext):
+        pass
+
+
+    # Enter a parse tree produced by PinescriptParser#rshift_closed_type_args.
+    def enterRshift_closed_type_args(self, ctx:PinescriptParser.Rshift_closed_type_argsContext):
+        pass
+
+    # Exit a parse tree produced by PinescriptParser#rshift_closed_type_args.
+    def exitRshift_closed_type_args(self, ctx:PinescriptParser.Rshift_closed_type_argsContext):
         pass
 
 

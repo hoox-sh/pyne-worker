@@ -184,6 +184,7 @@ class ArrayBuiltinsMixin(BuiltinDispatchMixin):
         """Filter out na/None and non-numeric entries (reference skips na in avg/stdev)."""
         out: list[float] = []
         for item in sequence:
+            item = self._array_snapshot_value(item)
             if item is None:
                 continue
             if isinstance(item, bool):
@@ -191,6 +192,13 @@ class ArrayBuiltinsMixin(BuiltinDispatchMixin):
                 continue
             if isinstance(item, (int, float)):
                 out.append(float(item))
+                continue
+            try:
+                fv = float(item)
+            except (TypeError, ValueError):
+                continue
+            if fv == fv:
+                out.append(fv)
         return out
 
     def _coerce_index(self, index: Any, *, soft: bool = True) -> int | None:
@@ -349,7 +357,7 @@ class ArrayBuiltinsMixin(BuiltinDispatchMixin):
                 f"array.push takes array and value (got {self._type_name(args[0])}, expected array)",
             )
         # Pine mutates in place (void); return sequence for chaining / tests
-        sequence.append(args[1])
+        sequence.append(self._array_snapshot_value(args[1]))
         return sequence
 
     def _builtin_array_pop(self, args: list[Any]) -> Any:
@@ -404,6 +412,12 @@ class ArrayBuiltinsMixin(BuiltinDispatchMixin):
             v = value[-1]
             if v is not None:
                 return v
+        return value
+
+    def _array_snapshot_value(self, value: Any) -> Any:
+        """Store bar scalars, not live PineSeries handles, in array slots."""
+        if value is not None and hasattr(value, "current") and hasattr(value, "history"):
+            return getattr(value, "current", value)
         return value
 
     def _builtin_array_abs(self, args: list[Any]) -> list[Any] | None:
@@ -517,16 +531,26 @@ class ArrayBuiltinsMixin(BuiltinDispatchMixin):
             return None
         return numerator / denom
 
-    def _builtin_array_every(self, args: list[Any]) -> bool:
+    def _builtin_array_every(self, args: list[Any]) -> bool | None:
+        """``array.every(id, predicate)`` or unary ``id.every()`` on bool arrays.
+
+        Unary form (corpus: ``array.every(arr)`` / ``arr.every()``) treats the
+        array as a bool series and returns whether every element is truthy.
+        """
+        if len(args) == UNARY:
+            sequence = self._coerce_optional_list(args[0])
+            if sequence is None:
+                return None
+            return all(bool(item) for item in sequence)
         if len(args) != BINARY:
-            self._error("array.every takes array and predicate")
+            self._error("array.every takes array and optional predicate")
         sequence = self._expect_list(
             args[0],
             "array.every takes array and predicate",
         )
         predicate = args[1]
         if not callable(predicate):
-            self._error("array.every takes array and predicate")
+            return all(bool(item) for item in sequence)
         return all(predicate(item) for item in sequence)
 
     def _builtin_array_fill(self, args: list[Any]) -> list[Any]:
@@ -654,7 +678,7 @@ class ArrayBuiltinsMixin(BuiltinDispatchMixin):
                     f"array.insert index out of bounds: {index} (size={n})"
                 )
         # index > len appends (Python list.insert clamps); allow == len as append
-        sequence.insert(index, args[2])
+        sequence.insert(index, self._array_snapshot_value(args[2]))
         return sequence
 
     def _builtin_array_join(self, args: list[Any]) -> str | None:
@@ -1198,7 +1222,7 @@ class ArrayBuiltinsMixin(BuiltinDispatchMixin):
         sequence = self._coerce_optional_list(args[0])
         if sequence is None:
             return None
-        sequence.insert(0, args[1])
+        sequence.insert(0, self._array_snapshot_value(args[1]))
         return sequence
 
     def _binary_search(self, sequence: list[Any], value: Any, sort_field: Any = None) -> int:

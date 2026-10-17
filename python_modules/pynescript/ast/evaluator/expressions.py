@@ -38,9 +38,11 @@ from __future__ import annotations
 import operator
 
 from collections.abc import Callable
+from itertools import count
 from typing import Any
 
 from pynescript.ast import node as ast
+from pynescript.ast.evaluator.builtins.request import match_htf_offset_ast
 from pynescript.ast.evaluator.builtins.request import match_htf_simple_ta_ast
 from pynescript.ast.evaluator.names import _BARE_SERIES_BUILTINS
 from pynescript.ast.evaluator.names import ast_qualified_name
@@ -94,8 +96,72 @@ _PURE_CONST_FOLD_BUILTINS = frozenset(
     }
 )
 
-# Shared empty kwargs — never mutate (hot path avoids ``{}`` alloc).
+# Shared empty kwargs / args — never mutate (hot path avoids ``{}`` / ``[]`` alloc).
 _EMPTY_KW: dict[str, Any] = {}
+_EMPTY_ARGS: list[Any] = []
+
+# Preclassified positional arg-plan shapes (compiled once per site).
+_PS_EMPTY = 0
+_PS_N1 = 1  # Name
+_PS_C1 = 2  # Const
+_PS_NC = 3  # Name, Const  (ta.sma(close, 14))
+_PS_NN = 4  # Name, Name
+_PS_CC = 5  # Const, Const
+_PS_NCC = 6  # Name, Const, Const  (ta.bb(close, 20, 2.0))
+_PS_OTHER = 9
+
+# Calendar series materialize on first read (LazyCalendarContext). Every other
+# name is a plain dict slot — dict.__getitem__ skips that Python override.
+_CAL_ARG_NAMES = frozenset(
+    {"year", "month", "dayofmonth", "hour", "minute", "second", "dayofweek"}
+)
+
+# Script declarations — constant after bar 0 (host sets ``_pine_defs_locked``).
+_DECL_CALL_NAMES = frozenset({"indicator", "strategy", "library", "study"})
+
+# Lazy PineSeries type (avoid importing pynescript.runtime at module load —
+# that package imports NodeLiteralEvaluator and would cycle).
+_PineSeries: Any = None
+
+
+def _pineseries_type() -> Any:
+    """Return the ``PineSeries`` class, loading it once after evaluator init."""
+    global _PineSeries
+    ps = _PineSeries
+    if ps is False:
+        return None
+    if ps is None:
+        try:
+            from pynescript.runtime.series import PineSeries as _PS
+        except Exception:  # pragma: no cover
+            _PineSeries = False
+            return None
+        _PineSeries = _PS
+        return _PS
+    return ps
+
+
+# Process-wide Call identity. Stamped on the AST as ``_pine_site_id`` so
+# UDF / call-expr history keys survive CPython ``id()`` reuse after GC.
+# Do **not** scrub this on parse-cache hits — it names the node in the tree.
+_PINE_SITE_IDS = count(1)
+
+
+def pine_call_site_id(node: Any) -> int:
+    """Stable per-Call identity for history / UDF series isolation.
+
+    Unlike ``id(node)``, the stamped int stays on the tree for its lifetime
+    and is never recycled onto a different Call after the first tree is GC'd.
+    """
+    sid = getattr(node, "_pine_site_id", None)
+    if type(sid) is int and sid > 0:
+        return sid
+    sid = next(_PINE_SITE_IDS)
+    try:
+        object.__setattr__(node, "_pine_site_id", sid)
+    except (AttributeError, TypeError):
+        return id(node)
+    return sid
 
 
 def _store_call_site(node: Any, site: tuple) -> None:
@@ -113,11 +179,38 @@ def _store_call_site(node: Any, site: tuple) -> None:
 
 def _evaluator_generation(ev: Any) -> int:
     """Stable per-instance id stamped on bound call sites."""
-    gen = ev.__dict__.get("_eval_generation")
-    if gen is None:
+    try:
+        return ev._eval_generation
+    except AttributeError:
         gen = id(ev)
         ev._eval_generation = gen
-    return gen
+        return gen
+
+
+def _classify_arg_plan(plan: tuple) -> int:
+    """Map a positional-only arg plan to a shape tag (hot bars skip opcode scan)."""
+    n = len(plan)
+    if n == 0:
+        return _PS_EMPTY
+    if n == 1:
+        c0 = plan[0][0]
+        if c0 == _AP_NAME:
+            return _PS_N1
+        if c0 == _AP_CONST:
+            return _PS_C1
+        return _PS_OTHER
+    if n == 2:
+        c0, c1 = plan[0][0], plan[1][0]
+        if c0 == _AP_NAME and c1 == _AP_CONST:
+            return _PS_NC
+        if c0 == _AP_NAME and c1 == _AP_NAME:
+            return _PS_NN
+        if c0 == _AP_CONST and c1 == _AP_CONST:
+            return _PS_CC
+        return _PS_OTHER
+    if n == 3 and plan[0][0] == _AP_NAME and plan[1][0] == _AP_CONST and plan[2][0] == _AP_CONST:
+        return _PS_NCC
+    return _PS_OTHER
 
 
 def _call_site_for_evaluator(node: Any, ev: Any) -> tuple | None:
@@ -173,7 +266,12 @@ def _as_scalar_operand(value):
         return value
     if t is list or t is str or t is tuple or t is dict or t is bytes:
         return value
-    # Named series wrappers (PineSeries from backend.series, etc.)
+    # Named series wrappers — type-identity first (no __name__ / frozenset).
+    ps = _PineSeries
+    if ps is None:
+        ps = _pineseries_type()
+    if ps is not None and t is ps:
+        return value.current
     if t.__name__ in _SERIES_TYPE_NAMES:
         return value.current
     # Duck-type rare wrappers that expose .current + .history
@@ -206,7 +304,12 @@ def _switch_case_matches(has_subject: bool, subject_val: Any, pattern_val: Any) 
       ``switch na`` / ``switch float(na)`` wrongly took the first truthy arm).
     """
     if not has_subject:
+        if isinstance(pattern_val, (list, tuple)):
+            return any(bool(p) for p in pattern_val)
         return bool(pattern_val)
+    # Multi-value arm ``1, 2 => …`` — match any element.
+    if isinstance(pattern_val, (list, tuple)):
+        return any(_switch_case_matches(has_subject, subject_val, p) for p in pattern_val)
     # Subject form: na only equals na; otherwise Python equality (try-soft).
     if subject_val is None and pattern_val is None:
         return True
@@ -467,6 +570,12 @@ class ExpressionEvaluator:
         visit = self.visit
         left = visit(node.left)
         right = visit(node.right)
+        ps = _PineSeries
+        if ps is not None:
+            if type(left) is ps:
+                left = left.current
+            if type(right) is ps:
+                right = right.current
         op_t = type(node.op)
 
         # Ultra-fast path: bare numeric pair (hosts inject floats per bar)
@@ -562,6 +671,9 @@ class ExpressionEvaluator:
         """
         visit = self.visit
         left = visit(node.left)
+        ps = _PineSeries
+        if ps is not None and type(left) is ps:
+            left = left.current
         ops = node.ops
         comparators = node.comparators
         n = len(ops)
@@ -570,6 +682,8 @@ class ExpressionEvaluator:
         for i in range(n):
             op_t = type(ops[i])
             right = visit(comparators[i])
+            if ps is not None and type(right) is ps:
+                right = right.current
 
             tl = type(left)
             tr = type(right)
@@ -673,82 +787,120 @@ class ExpressionEvaluator:
         # Bound (QB/BB) sites are evaluator-specific — generation mismatch
         # (shared parse cache / multi-run) drops the site so this instance
         # re-resolves instead of calling another evaluator's handlers.
-        site = _call_site_for_evaluator(node, self)
+        #
+        # Hot path inlines site lookup (no ``_call_site_for_evaluator`` /
+        # ``_evaluator_generation`` frames) and shaped positional arg loads
+        # (no ``_eval_arg_plan`` / security-attach / empty-UDF lookup).
+        try:
+            site = node._pine_call_site
+        except AttributeError:
+            site = None
+        try:
+            ev_gen = self._eval_generation
+        except AttributeError:
+            ev_gen = _evaluator_generation(self)
+        if site is not None:
+            kind = site[0]
+            # Bound qualified builtin (ta.sma after first bar) — dominant TA path.
+            # site = (_SITE_QB, tag, handler, name, arg_plan, [shape,] eval_generation)
+            if kind == _SITE_QB:
+                if len(site) >= 6 and site[-1] == ev_gen:
+                    name = site[3]
+                    plan = site[4]
+                    shape = site[5] if len(site) > 6 else _PS_OTHER
+                    args = self._eval_shaped_args(plan, shape)
+                    if args is not None:
+                        tag, handler = site[1], site[2]
+                        if tag == 1:
+                            return handler(args)
+                        if tag == 0:
+                            return handler
+                        return handler(*args)
+                    args, kwargs = self._eval_arg_plan(plan)
+                    if name == "request.security" or name == "security":
+                        args = self._maybe_attach_security_simple_ta(name, node, args)
+                    if kwargs is not _EMPTY_KW and kwargs:
+                        return self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
+                    tag, handler = site[1], site[2]
+                    if tag == 1:
+                        return handler(args)
+                    if tag == 0:
+                        return handler
+                    return handler(*args)
+                site = None
+            # Bound bare Name builtin (plot after first bar).
+            # site = (_SITE_BB, name, tag, handler, arg_plan, [shape,] eval_generation)
+            elif kind == _SITE_BB:
+                if len(site) >= 6 and site[-1] == ev_gen:
+                    name, tag, handler, plan = site[1], site[2], site[3], site[4]
+                    # Dual namespace: skip the lookup when no UDFs are registered
+                    # (ta_combo / minimal). Prefer ``_user_functions`` so a series
+                    # local can reuse a function name without shadowing the UDF.
+                    ufuncs = self.__dict__.get("_user_functions")
+                    if ufuncs:
+                        user = ufuncs.get(name)
+                        if not callable(user):
+                            ctx_val = self.context.get(name)  # type: ignore[attr-defined]
+                            user = ctx_val if callable(ctx_val) else None
+                        if user is not None:
+                            args, kwargs = self._eval_arg_plan(plan)
+                            prev_site = getattr(self, "_pine_udf_site", None)
+                            self._pine_udf_site = pine_call_site_id(node)  # type: ignore[attr-defined]
+                            try:
+                                return user(*args, **kwargs)
+                            except TypeError as e:
+                                if _type_error_from_callee(e):
+                                    raise
+                                try:
+                                    return user(*args)
+                                except TypeError as e2:
+                                    if _type_error_from_callee(e2):
+                                        raise
+                                    return None
+                            finally:
+                                self._pine_udf_site = prev_site  # type: ignore[attr-defined]
+                    if name in _DECL_CALL_NAMES and getattr(self, "_pine_defs_locked", False):
+                        existing = getattr(self, "_script_declaration", None)
+                        if existing is not None:
+                            return existing
+                    shape = site[5] if len(site) > 6 else _PS_OTHER
+                    args = self._eval_shaped_args(plan, shape)
+                    kwargs = _EMPTY_KW
+                    if args is None:
+                        args, kwargs = self._eval_arg_plan(plan)
+                        if name == "request.security" or name == "security":
+                            args = self._maybe_attach_security_simple_ta(name, node, args)
+                    if kwargs is not _EMPTY_KW and kwargs:
+                        return self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
+                    if tag == 1:
+                        result = handler(args)
+                    elif tag == 0:
+                        result = handler
+                    else:
+                        result = handler(*args)
+                    if (
+                        name in _PURE_CONST_FOLD_BUILTINS
+                        and _arg_plan_all_literal(plan)
+                        and (kwargs is _EMPTY_KW or not kwargs)
+                    ):
+                        _store_call_site(node, (_SITE_CONST, result))
+                    return result
+                site = None
+            elif kind == _SITE_CONST:
+                return site[1]
+
         if site is None:
             site = self._resolve_call_site(node)
             _store_call_site(node, site)
-
-        kind = site[0]
-
-        # Memoized pure literal call (timestamp(2017, 2, 23, …) in hot loops).
-        # site = (_SITE_CONST, value)
-        if kind == _SITE_CONST:
-            return site[1]
-
-        # Bound qualified builtin (ta.sma after first bar) — no name lookup.
-        # site = (_SITE_QB, tag, handler, name, arg_plan, eval_generation)
-        # Dominant multi-TA path: check first.
-        if kind == _SITE_QB:
-            args, kwargs = self._eval_arg_plan(site[4])
-            args = self._maybe_attach_security_simple_ta(site[3], node, args)
-            if kwargs is not _EMPTY_KW and kwargs:
-                return self._call_builtin(site[3], args, kwargs=kwargs)  # type: ignore[attr-defined]
-            tag, handler = site[1], site[2]
-            if tag == 1:
-                return handler(args)
-            if tag == 0:
-                return handler
-            return handler(*args)
-
-        # Bound bare Name builtin (plot after first bar).
-        # site = (_SITE_BB, name, tag, handler, arg_plan, eval_generation)
-        if kind == _SITE_BB:
-            name, tag, handler, plan = site[1], site[2], site[3], site[4]
-            args, kwargs = self._eval_arg_plan(plan)
-            args = self._maybe_attach_security_simple_ta(name, node, args)
-            # Dual namespace: user ``method dmi`` / UDF stays callable after a
-            # series local reuses the bare name (``float dmi = dmi(...)``).
-            # Prefer ``_user_functions`` over context and bare ta.* aliases.
-            user = self._lookup_user_callable(name)
-            if callable(user):
-                prev_site = getattr(self, "_pine_udf_site", None)
-                self._pine_udf_site = id(node)  # type: ignore[attr-defined]
-                try:
-                    return user(*args, **kwargs)
-                except TypeError as e:
-                    if _type_error_from_callee(e):
-                        raise
-                    try:
-                        return user(*args)
-                    except TypeError as e2:
-                        if _type_error_from_callee(e2):
-                            raise
-                        return None
-                finally:
-                    self._pine_udf_site = prev_site  # type: ignore[attr-defined]
-            if kwargs is not _EMPTY_KW and kwargs:
-                return self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
-            if tag == 1:
-                result = handler(args)
-            elif tag == 0:
-                result = handler
-            else:
-                result = handler(*args)
-            # Promote pure all-literal sites after first bound invoke.
-            if (
-                name in _PURE_CONST_FOLD_BUILTINS
-                and _arg_plan_all_literal(plan)
-                and (kwargs is _EMPTY_KW or not kwargs)
-            ):
-                _store_call_site(node, (_SITE_CONST, result))
-            return result
+            kind = site[0]
 
         # Fast path: ta.*/strategy.*/math.* — resolve name once, then bind.
         # site = (_SITE_Q, name, arg_plan)
         if kind == _SITE_Q:
             name, plan = site[1], site[2]
             args, kwargs = self._eval_arg_plan(plan)
-            args = self._maybe_attach_security_simple_ta(name, node, args)
+            if name == "request.security" or name == "security":
+                args = self._maybe_attach_security_simple_ta(name, node, args)
             result = self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
             if (
                 name in _PURE_CONST_FOLD_BUILTINS
@@ -767,6 +919,7 @@ class ExpressionEvaluator:
                         bound[1],
                         name,
                         plan,
+                        _classify_arg_plan(plan),
                         _evaluator_generation(self),
                     ),
                 )
@@ -778,24 +931,30 @@ class ExpressionEvaluator:
         if kind == _SITE_B:
             name, plan = site[1], site[2]
             args, kwargs = self._eval_arg_plan(plan)
-            args = self._maybe_attach_security_simple_ta(name, node, args)
-            user = self._lookup_user_callable(name)
-            if callable(user):
-                prev_site = getattr(self, "_pine_udf_site", None)
-                self._pine_udf_site = id(node)  # type: ignore[attr-defined]
-                try:
-                    return user(*args, **kwargs)
-                except TypeError as e:
-                    if _type_error_from_callee(e):
-                        raise
+            if name == "request.security" or name == "security":
+                args = self._maybe_attach_security_simple_ta(name, node, args)
+            ufuncs = self.__dict__.get("_user_functions")
+            if ufuncs:
+                user = ufuncs.get(name)
+                if not callable(user):
+                    ctx_val = self.context.get(name)  # type: ignore[attr-defined]
+                    user = ctx_val if callable(ctx_val) else None
+                if user is not None:
+                    prev_site = getattr(self, "_pine_udf_site", None)
+                    self._pine_udf_site = pine_call_site_id(node)  # type: ignore[attr-defined]
                     try:
-                        return user(*args)
-                    except TypeError as e2:
-                        if _type_error_from_callee(e2):
+                        return user(*args, **kwargs)
+                    except TypeError as e:
+                        if _type_error_from_callee(e):
                             raise
-                        return None
-                finally:
-                    self._pine_udf_site = prev_site  # type: ignore[attr-defined]
+                        try:
+                            return user(*args)
+                        except TypeError as e2:
+                            if _type_error_from_callee(e2):
+                                raise
+                            return None
+                    finally:
+                        self._pine_udf_site = prev_site  # type: ignore[attr-defined]
             result = self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
             # Fold pure literal builtins on first eval (same bar nested loops).
             if (
@@ -815,6 +974,7 @@ class ExpressionEvaluator:
                         bound[0],
                         bound[1],
                         plan,
+                        _classify_arg_plan(plan),
                         _evaluator_generation(self),
                     ),
                 )
@@ -843,7 +1003,7 @@ class ExpressionEvaluator:
                     return None
                 return self._visit_Call_general(node, plan)
             prev_site = getattr(self, "_pine_udf_site", None)
-            self._pine_udf_site = id(node)  # type: ignore[attr-defined]
+            self._pine_udf_site = pine_call_site_id(node)  # type: ignore[attr-defined]
             try:
                 return func(*args, **kwargs)
             except TypeError as e:
@@ -871,7 +1031,7 @@ class ExpressionEvaluator:
         """Replace security expression with allowlisted ``HtfSimpleTaExpr`` when AST matches.
 
         ``request.security`` / bare ``security`` normally receive a *chart*
-        pre-evaluated third arg. For allowlisted simple ``ta.sma/ema/rsi/atr``
+        pre-evaluated third arg. For allowlisted simple ``ta.sma/ema/rsi/atr/wma/rma``
         calls we preserve the form so the HTF path can run TA on resampled
         bars instead of inventing structure from chart-TF results.
         """
@@ -883,7 +1043,9 @@ class ExpressionEvaluator:
         expr_ast = getattr(arg_nodes[2], "value", None)
         if expr_ast is None:
             return args
-        matched = match_htf_simple_ta_ast(expr_ast)
+        matched: Any = match_htf_simple_ta_ast(expr_ast)
+        if matched is None:
+            matched = match_htf_offset_ast(expr_ast)
         if matched is None:
             return args
         out = list(args)
@@ -971,6 +1133,82 @@ class ExpressionEvaluator:
                     plan.append((_AP_VISIT, val))
         return tuple(plan)
 
+    def _resolve_name_arg(self: EvaluatorProtocol, name: str) -> Any:
+        """``visit_Name`` fallback for an arg-plan Name miss (bare series / lazy id)."""
+        if name in _BARE_SERIES_BUILTINS and self._is_registered_builtin(name):
+            return self._call_builtin(name, [])  # type: ignore[attr-defined]
+        return name
+
+    def _load_plan_name(self: EvaluatorProtocol, ctx: Any, name: str) -> Any:
+        """Context lookup for a precompiled Name arg.
+
+        Calendar keys go through ``ctx[name]`` so ``LazyCalendarContext`` can
+        fill year/month/… on first read. Every other name uses
+        ``dict.__getitem__`` (same value, no Python ``__getitem__`` override).
+        """
+        try:
+            if name in _CAL_ARG_NAMES:
+                return ctx[name]
+            return dict.__getitem__(ctx, name)
+        except KeyError:
+            return self._resolve_name_arg(name)
+        except TypeError:
+            try:
+                return ctx[name]
+            except KeyError:
+                return self._resolve_name_arg(name)
+
+    def _eval_shaped_args(self: EvaluatorProtocol, plan: tuple, shape: int):
+        """Load a preclassified positional plan into the reused scratch list.
+
+        Returns ``None`` when *shape* is ``_PS_OTHER`` (caller uses
+        :meth:`_eval_arg_plan`, which may allocate kwargs).
+        """
+        ctx = self.context  # type: ignore[attr-defined]
+        if shape == _PS_NC:
+            buf = self._arg2  # type: ignore[attr-defined]
+            name = plan[0][1]
+            buf[0] = self._load_plan_name(ctx, name)
+            buf[1] = plan[1][1]
+            return buf
+        if shape == _PS_N1:
+            buf = self._arg1  # type: ignore[attr-defined]
+            buf[0] = self._load_plan_name(ctx, plan[0][1])
+            return buf
+        if shape == _PS_C1:
+            buf = self._arg1  # type: ignore[attr-defined]
+            buf[0] = plan[0][1]
+            return buf
+        if shape == _PS_NCC:
+            buf = self._arg3  # type: ignore[attr-defined]
+            buf[0] = self._load_plan_name(ctx, plan[0][1])
+            buf[1] = plan[1][1]
+            buf[2] = plan[2][1]
+            return buf
+        if shape == _PS_NN:
+            buf = self._arg2  # type: ignore[attr-defined]
+            n0, n1 = plan[0][1], plan[1][1]
+            try:
+                if n0 in _CAL_ARG_NAMES or n1 in _CAL_ARG_NAMES:
+                    buf[0] = ctx[n0]
+                    buf[1] = ctx[n1]
+                else:
+                    buf[0] = dict.__getitem__(ctx, n0)
+                    buf[1] = dict.__getitem__(ctx, n1)
+                return buf
+            except KeyError:
+                return None
+            except TypeError:
+                return None
+        if shape == _PS_CC:
+            buf = self._arg2  # type: ignore[attr-defined]
+            buf[0] = plan[0][1]
+            buf[1] = plan[1][1]
+            return buf
+        if shape == _PS_EMPTY:
+            return _EMPTY_ARGS
+        return None
+
     def _eval_arg_plan(
         self: EvaluatorProtocol,
         plan: tuple,
@@ -986,7 +1224,7 @@ class ExpressionEvaluator:
         """
         n = len(plan)
         if n == 0:
-            return [], _EMPTY_KW
+            return _EMPTY_ARGS, _EMPTY_KW
 
         ctx = self.context  # type: ignore[attr-defined]
         bare = _BARE_SERIES_BUILTINS
@@ -997,16 +1235,24 @@ class ExpressionEvaluator:
             code = op[0]
             if code == _AP_NAME:
                 name = op[1]
+                buf = self._arg1  # type: ignore[attr-defined]
                 try:
-                    return [ctx[name]], _EMPTY_KW
+                    buf[0] = ctx[name]
+                    return buf, _EMPTY_KW
                 except KeyError:
                     if name in bare and self._is_registered_builtin(name):
-                        return [self._call_builtin(name, [])], _EMPTY_KW  # type: ignore[attr-defined]
-                    return [name], _EMPTY_KW
+                        buf[0] = self._call_builtin(name, [])  # type: ignore[attr-defined]
+                        return buf, _EMPTY_KW
+                    buf[0] = name
+                    return buf, _EMPTY_KW
             if code == _AP_CONST:
-                return [op[1]], _EMPTY_KW
+                buf = self._arg1  # type: ignore[attr-defined]
+                buf[0] = op[1]
+                return buf, _EMPTY_KW
             if code == _AP_VISIT:
-                return [self.visit(op[1])], _EMPTY_KW
+                buf = self._arg1  # type: ignore[attr-defined]
+                buf[0] = self.visit(op[1])
+                return buf, _EMPTY_KW
             # single kwarg — fall through
 
         elif n == 2:
@@ -1015,32 +1261,55 @@ class ExpressionEvaluator:
             # ta.sma(close, 14) / ta.highest(high, 20)
             if c0 == _AP_NAME and c1 == _AP_CONST:
                 name = a0[1]
+                buf = self._arg2  # type: ignore[attr-defined]
                 try:
-                    return [ctx[name], a1[1]], _EMPTY_KW
+                    buf[0] = ctx[name]
+                    buf[1] = a1[1]
+                    return buf, _EMPTY_KW
                 except KeyError:
                     if name in bare and self._is_registered_builtin(name):
-                        return [self._call_builtin(name, []), a1[1]], _EMPTY_KW  # type: ignore[attr-defined]
-                    return [name, a1[1]], _EMPTY_KW
+                        buf[0] = self._call_builtin(name, [])  # type: ignore[attr-defined]
+                        buf[1] = a1[1]
+                        return buf, _EMPTY_KW
+                    buf[0] = name
+                    buf[1] = a1[1]
+                    return buf, _EMPTY_KW
             if c0 == _AP_NAME and c1 == _AP_NAME:
                 n0, n1 = a0[1], a1[1]
+                buf = self._arg2  # type: ignore[attr-defined]
                 try:
-                    return [ctx[n0], ctx[n1]], _EMPTY_KW
+                    buf[0] = ctx[n0]
+                    buf[1] = ctx[n1]
+                    return buf, _EMPTY_KW
                 except KeyError:
                     pass  # fall through to general
             if c0 == _AP_CONST and c1 == _AP_CONST:
-                return [a0[1], a1[1]], _EMPTY_KW
+                buf = self._arg2  # type: ignore[attr-defined]
+                buf[0] = a0[1]
+                buf[1] = a1[1]
+                return buf, _EMPTY_KW
 
         elif n == 3:
             a0, a1, a2 = plan[0], plan[1], plan[2]
             # ta.bb(close, 20, 2.0)
             if a0[0] == _AP_NAME and a1[0] == _AP_CONST and a2[0] == _AP_CONST:
                 name = a0[1]
+                buf = self._arg3  # type: ignore[attr-defined]
                 try:
-                    return [ctx[name], a1[1], a2[1]], _EMPTY_KW
+                    buf[0] = ctx[name]
+                    buf[1] = a1[1]
+                    buf[2] = a2[1]
+                    return buf, _EMPTY_KW
                 except KeyError:
                     if name in bare and self._is_registered_builtin(name):
-                        return [self._call_builtin(name, []), a1[1], a2[1]], _EMPTY_KW  # type: ignore[attr-defined]
-                    return [name, a1[1], a2[1]], _EMPTY_KW
+                        buf[0] = self._call_builtin(name, [])  # type: ignore[attr-defined]
+                        buf[1] = a1[1]
+                        buf[2] = a2[1]
+                        return buf, _EMPTY_KW
+                    buf[0] = name
+                    buf[1] = a1[1]
+                    buf[2] = a2[1]
+                    return buf, _EMPTY_KW
 
         # --- General opcode interpreter ---
         visit = self.visit
@@ -1156,9 +1425,7 @@ class ExpressionEvaluator:
                     if recovered is not _ATTR_CALL_MISS:
                         return recovered
                 return None
-            if type(node_func) is ast.Attribute and (
-                "." in func or not self._is_registered_builtin(func)
-            ):
+            if type(node_func) is ast.Attribute and ("." in func or not self._is_registered_builtin(func)):
                 recovered = self._recover_instance_attr_call(node_func, args, kwargs)
                 if recovered is not _ATTR_CALL_MISS:
                     return recovered
@@ -1231,7 +1498,7 @@ class ExpressionEvaluator:
         """
         arg_nodes = node.args
         if not arg_nodes:
-            return [], _EMPTY_KW
+            return _EMPTY_ARGS, _EMPTY_KW
         # Prefer precompiled plan (Name/Const skip visit frames).
         return self._eval_arg_plan(self._build_arg_plan(node))
 

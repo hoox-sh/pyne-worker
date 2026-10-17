@@ -245,7 +245,9 @@ class CompileStrategyBroker:
         default_qty_type: str = "fixed",
         default_qty_value: float = 1.0,
         avg_price_model: str = "stock",
-        leverage: float = 1.0,
+        leverage: float | None = None,
+        margin_long: float | None = None,
+        margin_short: float | None = None,
     ) -> None:
         """Construct broker state for one compiled run.
 
@@ -289,13 +291,28 @@ class CompileStrategyBroker:
             self.avg_price_model = "inverse"
         else:
             self.avg_price_model = "stock"
-        try:
-            lev = float(leverage) if leverage is not None else 1.0
-        except (TypeError, ValueError):
-            lev = 1.0
-        if lev != lev or lev <= 0:  # NaN / non-positive
-            lev = 1.0
-        self.leverage: float = 1.0 if lev < 1.0 else lev
+        self.leverage = 1.0
+        if leverage is not None:
+            try:
+                lev = float(leverage)
+            except (TypeError, ValueError):
+                lev = 1.0
+            if lev != lev or lev <= 0:
+                lev = 1.0
+            self.leverage = 1.0 if lev < 1.0 else lev
+        else:
+            sides: list[float] = []
+            for raw in (margin_long, margin_short):
+                if raw is None:
+                    continue
+                try:
+                    m = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if m > 0:
+                    sides.append(m)
+            if sides:
+                self.leverage = max(1.0, 100.0 / max(sides))
         self.position_size: float = 0.0  # signed: +long / -short
         self.position_avg_price: float = float("nan")
         self.position_entry_name: str = ""
@@ -314,6 +331,12 @@ class CompileStrategyBroker:
         self.eventrades: int = 0
         self.grossprofit: float = 0.0
         self.grossloss: float = 0.0
+        # Pine strategy.max_contracts_held_* (unsigned qty peaks; interpret parity)
+        self.max_contracts_held_all: float = 0.0
+        self.max_contracts_held_long: float = 0.0
+        self.max_contracts_held_short: float = 0.0
+        self.account_currency: str = "USD"
+        self.closedtrades_first_index: int = 0
         self.events: list[dict[str, Any]] = []
         self.pending_orders: dict[str, PendingOrder] = {}
         self._bar_index: int = 0
@@ -337,6 +360,9 @@ class CompileStrategyBroker:
         self.max_cons_loss_days: int | None = None
         # Intraday loss halt as % of initial capital (interpret stores; we enforce)
         self.max_intraday_loss: float = float("inf")
+        # Absolute-cash intraday loss cap (account currency, no FX conversion).
+        # Percent (default) and cash are mutually exclusive.
+        self.max_intraday_loss_cash: float | None = None
         # Cap filled orders per calendar-day bucket (entries + exits)
         self.max_intraday_filled_orders: int | None = None
         self.entries_blocked: bool = False  # risk halt (drawdown / cons loss / intraday)
@@ -530,10 +556,23 @@ class CompileStrategyBroker:
         fill_qty = min(fill_qty, order.remaining)
         if fill_qty <= 0:
             return
-        order.filled_qty += fill_qty
         d = order.direction
         px = self._slip(float(fill_price), d)
         fe = order.from_entry
+        if order.is_entry:
+            covering = (d == "long" and self.position_size < 0) or (d == "short" and self.position_size > 0)
+            if not covering and not self._risk_allows_entry(d):
+                self._emit(
+                    "order",
+                    id=order.order_id,
+                    direction=d,
+                    qty=0.0,
+                    order_type="market",
+                    comment="risk_blocked",
+                )
+                self.pending_orders.pop(order.order_id, None)
+                return
+        order.filled_qty += fill_qty
         # Closing opposite / reducing — honor from_entry when set (exit brackets)
         if not order.is_entry:
             # Force close in this direction (sell covers long, buy covers short)
@@ -556,7 +595,27 @@ class CompileStrategyBroker:
             else:
                 self._open_or_add(d, fill_qty, px, order.order_id, order.comment)
         else:
-            self._open_or_add(d, fill_qty, px, order.order_id, order.comment)
+            covering = (d == "long" and self.position_size < 0) or (d == "short" and self.position_size > 0)
+            if covering:
+                cover = min(fill_qty, abs(float(self.position_size)))
+                leftover = fill_qty - cover
+                if cover > 0:
+                    self.close(id=order.order_id, qty=cover, price=px, comment="reverse")
+                if leftover > 1e-12:
+                    if not self._risk_allows_entry(d):
+                        self._emit(
+                            "order",
+                            id=order.order_id,
+                            direction=d,
+                            qty=0.0,
+                            order_type="market",
+                            comment="risk_blocked",
+                        )
+                        self.pending_orders.pop(order.order_id, None)
+                    else:
+                        self._open_or_add(d, leftover, px, order.order_id, order.comment)
+            else:
+                self._open_or_add(d, fill_qty, px, order.order_id, order.comment)
 
         self._emit(
             "order",
@@ -652,6 +711,21 @@ class CompileStrategyBroker:
         """Count one filled order toward max_intraday_filled_orders."""
         self._roll_fill_day()
         self._day_filled_orders += 1
+        self._note_position_size()
+
+    def _note_position_size(self) -> None:
+        """Update ``strategy.max_contracts_held_*`` after a fill.
+
+        Compile ``position_size`` is signed; peaks are unsigned quantities
+        (same as interpret ``StrategyState.note_position_size``).
+        """
+        size = abs(float(self.position_size))
+        if size > self.max_contracts_held_all:
+            self.max_contracts_held_all = size
+        if self.position_size > 0 and size > self.max_contracts_held_long:
+            self.max_contracts_held_long = size
+        elif self.position_size < 0 and size > self.max_contracts_held_short:
+            self.max_contracts_held_short = size
 
     def _ensure_legs(self) -> None:
         """Materialise a single synthetic leg when size is open but list empty."""
@@ -680,7 +754,6 @@ class CompileStrategyBroker:
         comment: str | None,
         *,
         respect_pyramiding: bool = False,
-        replace_same_id: bool = False,
     ) -> bool:
         """Open / add / reverse a position.
 
@@ -689,11 +762,14 @@ class CompileStrategyBroker:
         Parameters
         ----------
         respect_pyramiding:
-            Market ``strategy.entry`` path: different id needs room;
-            ``replace_same_id`` replaces the open leg when ids match.
+            Market ``strategy.entry`` path: extra same-direction fills only
+            when ``open_entry_count < pyramiding + 1`` (same id or not).
+            A filled position is never overwritten — that used to reset
+            ``position_avg_price`` every bar the entry condition stayed true.
             Pending order fills keep averaging (``respect_pyramiding=False``).
             When ``pyramiding <= 0``, pending averages stay a **single** entry
             leg (``open_entry_count == 1``) with VWAP avg (F2).
+            Pending same-id replacement is the ``pending_orders[id]`` upsert.
         """
         d = direction if direction == "long" or direction == "short" else _norm_dir(direction)
         if d is None:
@@ -708,11 +784,7 @@ class CompileStrategyBroker:
         same_dir = (self.position_size > 0 and d == "long") or (self.position_size < 0 and d == "short")
         if same_dir and abs(self.position_size) > 0:
             self._ensure_legs()
-            same_id = self.position_entry_name == eid or any(leg.entry_id == eid for leg in self.open_legs)
-            if respect_pyramiding and replace_same_id and same_id:
-                # Interpret oracle: same-id re-entry overwrites without realizing PnL.
-                pass  # fall through to flat open below
-            elif respect_pyramiding and not same_id:
+            if respect_pyramiding:
                 max_entries = int(self.pyramiding) + 1 if self.pyramiding is not None else 1
                 if not (self.pyramiding > 0 and self.open_entry_count < max_entries):
                     return False  # pyramiding blocked
@@ -739,8 +811,8 @@ class CompileStrategyBroker:
                 self._update_leg_extremes()
                 self._emit("entry", id=eid, direction=d, qty=q, comment=comment)
                 return True
-            elif not (respect_pyramiding and replace_same_id and same_id):
-                # Average-add (pending order fills / non-replace path).
+            else:
+                # Average-add (pending order fills).
                 # F2: pyramiding<=0 → single leg + VWAP; pyramiding>0 appends a
                 # leg when under cap (interpret open_trades parity).
                 if self.pyramiding > 0 and len(self.open_legs) >= int(self.pyramiding) + 1:
@@ -800,7 +872,7 @@ class CompileStrategyBroker:
                 self._update_leg_extremes()
                 self._emit("entry", id=eid, direction=d, qty=q, comment=comment)
                 return True
-        # Flat open, reverse re-entry, or same-id replace overwrite
+        # Flat open or reverse re-entry (filled same-dir is handled above)
         comm = self._commission(q, px)
         signed = q if d == "long" else -q
         self.position_size = signed
@@ -1026,11 +1098,11 @@ class CompileStrategyBroker:
             return
         self.max_cons_loss_days = d
 
-    def risk_max_intraday_loss(self, percent: Any = None, **_kwargs: Any) -> None:
-        """``strategy.risk.max_intraday_loss(percent)`` — halt on day loss % of capital.
+    def risk_max_intraday_loss(self, percent: Any = None, type: Any = "percent", **_kwargs: Any) -> None:
+        """``strategy.risk.max_intraday_loss(value, type)`` — % of capital or cash.
 
-        Interpret stores the limit; compile also enforces via day PnL tracking
-        shared with :meth:`note_closed_trade_day`.
+        Percent (default) halts on day loss % of initial capital; ``cash`` /
+        ``strategy.cash`` halts on absolute account-currency loss (no FX).
         """
         raw = percent if percent is not None else _kwargs.get("percent", _kwargs.get("value"))
         if raw is None or _is_na(raw):
@@ -1041,7 +1113,17 @@ class CompileStrategyBroker:
             return
         if not math.isfinite(p) or p < 0:
             return
-        self.max_intraday_loss = p
+        risk_type = type if type is not None else _kwargs.get("type", "percent")
+        if getattr(risk_type, "_pine_qty_type", None) == "cash":
+            rt = "cash"
+        else:
+            rt = str(risk_type).replace("strategy.", "").strip().lower()
+        if rt in {"cash"}:
+            self.max_intraday_loss_cash = p
+            self.max_intraday_loss = float("inf")
+        else:
+            self.max_intraday_loss = p
+            self.max_intraday_loss_cash = None
 
     def risk_max_intraday_filled_orders(self, max_orders: Any = None, **_kwargs: Any) -> None:
         """``strategy.risk.max_intraday_filled_orders(max)`` — cap fills per day.
@@ -1050,8 +1132,10 @@ class CompileStrategyBroker:
         bucket. Further entries are blocked (``risk_blocked``) once the cap is
         hit; the counter resets when the day bucket rolls.
         """
-        raw = max_orders if max_orders is not None else _kwargs.get(
-            "max_orders", _kwargs.get("value", _kwargs.get("max"))
+        raw = (
+            max_orders
+            if max_orders is not None
+            else _kwargs.get("max_orders", _kwargs.get("value", _kwargs.get("max")))
         )
         if raw is None or _is_na(raw):
             return
@@ -1130,6 +1214,13 @@ class CompileStrategyBroker:
             if loss_pct >= float(self.max_intraday_loss):
                 self.entries_blocked = True
                 return False
+        if (
+            self.max_intraday_loss_cash is not None
+            and self._day_pnl < 0
+            and -self._day_pnl >= float(self.max_intraday_loss_cash)
+        ):
+            self.entries_blocked = True
+            return False
         # Day-scoped fill cap (resets when bar-time day bucket rolls)
         if self.max_intraday_filled_orders is not None:
             self._roll_fill_day()
@@ -1218,9 +1309,7 @@ class CompileStrategyBroker:
             px = px_hint
             if self.slippage_ticks > 0:
                 px = self._slip(px, d)
-            self._open_or_add(
-                d, q, px, str(id), comment, respect_pyramiding=True, replace_same_id=True
-            )
+            self._open_or_add(d, q, px, str(id), comment, respect_pyramiding=True)
             return
 
         ot = self._classify_order_type(limit, stop)
@@ -1253,9 +1342,7 @@ class CompileStrategyBroker:
             px = self._slip(px, d)
         else:
             px = float(px)
-        self._open_or_add(
-            d, q, px, str(id), comment, respect_pyramiding=True, replace_same_id=True
-        )
+        self._open_or_add(d, q, px, str(id), comment, respect_pyramiding=True)
 
     def _resolve_trail_params(
         self,
@@ -1341,13 +1428,9 @@ class CompileStrategyBroker:
         """
         entry_avg = self._exit_entry_avg(from_entry)
         if limit_p is None:
-            limit_p = self._tick_offset_price(
-                profit_ticks, entry_avg, is_long=is_long, is_profit=True
-            )
+            limit_p = self._tick_offset_price(profit_ticks, entry_avg, is_long=is_long, is_profit=True)
         if stop_p is None:
-            stop_p = self._tick_offset_price(
-                loss_ticks, entry_avg, is_long=is_long, is_profit=False
-            )
+            stop_p = self._tick_offset_price(loss_ticks, entry_avg, is_long=is_long, is_profit=False)
         return limit_p, stop_p
 
     def close(
@@ -1474,28 +1557,36 @@ class CompileStrategyBroker:
                     comment="invalid_qty",
                 )
                 return
-            close_qty = (
-                float(target_size) if status == "missing" else min(abs(float(parsed)), float(target_size))
-            )
+            close_qty = float(target_size) if status == "missing" else min(abs(float(parsed)), float(target_size))
         if close_qty <= 0 or not math.isfinite(close_qty):
             return
+
+        # Visitor maps strategy.exit id → comment=; use that as the order name
+        # when id is omitted so pending keys / placement events match interpret.
+        exit_oid: str | None = None
+        if is_exit:
+            if id is not None and str(id) != "":
+                exit_oid = str(id)
+            elif comment is not None and str(comment) != "":
+                exit_oid = str(comment)
 
         if is_exit:
             # Always emit exit event (placement / intent) for host parity.
             self._emit(
                 "exit",
-                id=id,
+                id=exit_oid if exit_oid is not None else id,
                 qty=close_qty,
                 comment=comment,
                 direction=None,
                 limit=limit_p,
                 stop=event_stop,
             )
+            pending_base = exit_oid if exit_oid is not None else "exit"
             # Trail always goes through pending + process (ratchet needs bar path).
             # Fixed stop/limit: fill same-bar when OHLC already touches, else pending.
             if has_trail:
                 self._place_exit_pending(
-                    base=str(id) if id is not None else "exit",
+                    base=pending_base,
                     exit_dir="short" if d == "long" else "long",
                     close_qty=close_qty,
                     limit_p=limit_p,
@@ -1515,7 +1606,7 @@ class CompileStrategyBroker:
             )
             if px is None:
                 self._place_exit_pending(
-                    base=str(id) if id is not None else "exit",
+                    base=pending_base,
                     exit_dir="short" if d == "long" else "long",
                     close_qty=close_qty,
                     limit_p=limit_p,
@@ -1666,9 +1757,7 @@ class CompileStrategyBroker:
         use_sticky = model in {"futures", "inverse"}
         sticky_avg = float(self.position_avg_price) if self.position_avg_price == self.position_avg_price else 0.0
 
-        eligible = (
-            [leg for leg in self.open_legs if leg.entry_id == fe] if fe is not None else list(self.open_legs)
-        )
+        eligible = [leg for leg in self.open_legs if leg.entry_id == fe] if fe is not None else list(self.open_legs)
         total_close = min(float(close_qty), float(sum(leg.size for leg in eligible)))
         if total_close <= 0:
             return
@@ -1942,15 +2031,19 @@ class CompileStrategyBroker:
         return self._pct_of_initial(self.grossloss)
 
     @property
-    def cash(self) -> float:
-        """Approximate free cash: equity minus margin locked (notional / leverage)."""
+    def capital_held(self) -> float:
+        """Margin locked in open positions (notional / leverage). Pine ``opentrades.capital_held``."""
         ps = self.position_size
         if ps == 0.0 or self.position_avg_price != self.position_avg_price:
-            return float(self.equity)
+            return 0.0
         notional = abs(float(self.position_avg_price) * float(ps))
         lev = float(self.leverage) if self.leverage and self.leverage > 0 else 1.0
-        held = notional / lev
-        return float(self.equity) - held
+        return notional / lev
+
+    @property
+    def cash(self) -> float:
+        """Approximate free cash: equity minus margin locked (notional / leverage)."""
+        return float(self.equity) - float(self.capital_held)
 
     @property
     def margin_liquidation_price(self) -> float:

@@ -59,13 +59,27 @@ power live evaluation, request.security simulation, or custom strategies.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
+import time
 
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
+
+from pynescript import stats as _stats
+from pynescript.debug import scope_enabled as _debug_scope
+
+
+_log = logging.getLogger(__name__)
+
+
+def _dbg(msg: str, *args: Any) -> None:
+    """Emit one datafeed debug line when ``PYNE_DEBUG`` is enabled."""
+    if _debug_scope(__name__):
+        _log.debug(msg, *args)
 
 
 class DataFeedError(Exception):
@@ -175,14 +189,26 @@ class CCXTProDataFeed(DataFeed):
         self._sandbox = sandbox
         self._options = options
         self._exchange: Any | None = None
+        _dbg(
+            "CCXTProDataFeed init exchange=%s sandbox=%s has_key=%s options=%s",
+            self._exchange_name,
+            sandbox,
+            bool(api_key),
+            sorted(options),
+        )
+        _stats.count("datafeed.feeds_created", dim="ccxtpro")
 
     async def _get_exchange(self) -> Any:
         """Lazily create the CCXT Pro exchange instance."""
         if self._exchange is None:
+            _t_ex0 = time.perf_counter()
+            _dbg("connecting ccxt.pro exchange=%s", self._exchange_name)
             try:
                 import ccxt.pro as ccxtpro  # type: ignore[import-not-found]  # noqa: PLC0415 - lazy to avoid hard dep
             except ImportError as e:
                 msg = "ccxt is required for CCXTProDataFeed. Install with: pip install ccxt"
+                _dbg("ccxt.pro unavailable: %s", e)
+                _stats.count("datafeed.errors", dim="ccxt_missing")
                 raise DataFeedError(msg) from e
 
             exchange_class = getattr(ccxtpro, self._exchange_name, None)
@@ -191,6 +217,8 @@ class CCXTProDataFeed(DataFeed):
                     f"Exchange '{self._exchange_name}' not found in ccxt.pro. "
                     "Check available exchanges with ccxt.pro.exchanges"
                 )
+                _dbg("unknown exchange=%s", self._exchange_name)
+                _stats.count("datafeed.errors", dim="unknown_exchange")
                 raise DataFeedError(msg)
 
             params: dict[str, Any] = dict(self._options)
@@ -202,10 +230,72 @@ class CCXTProDataFeed(DataFeed):
                 params["password"] = self._password
             if self._sandbox:
                 params["sandbox"] = True
+            if self._exchange_name == "binance":
+                opts = params.get("options") if isinstance(params.get("options"), dict) else {}
+                opts = {**opts, "defaultType": "spot", "fetchMarkets": ["spot"]}
+                params["options"] = opts
 
             self._exchange = exchange_class(params)
+            from pynescript.util.data import tune_ccxt_public_urls  # noqa: PLC0415
+
+            tune_ccxt_public_urls(self._exchange, self._exchange_name)
+            _dbg(
+                "ccxt.pro exchange ready exchange=%s in %.1fms sandbox=%s",
+                self._exchange_name,
+                (time.perf_counter() - _t_ex0) * 1000.0,
+                self._sandbox,
+            )
+            _stats.count("datafeed.exchanges_connected", dim=self._exchange_name)
+            _stats.latency("datafeed.connect", time.perf_counter() - _t_ex0)
 
         return self._exchange
+
+    async def supports_for_symbols(self) -> bool:
+        """True when the venue implements ``watchOHLCVForSymbols`` (fan-in)."""
+        try:
+            exchange = await self._get_exchange()
+        except Exception:  # noqa: BLE001
+            return False
+        has = getattr(exchange, "has", None)
+        if isinstance(has, dict):
+            return bool(has.get("watchOHLCVForSymbols"))
+        return hasattr(exchange, "watchOHLCVForSymbols")
+
+    async def watch_ohlcv_for_symbols(
+        self,
+        symbols: list[tuple[str, str]],
+    ) -> AsyncIterator[tuple[str, str, list[Any]]]:
+        """Fan-in stream: ``(symbol, timeframe, candles)`` per update.
+
+        Raises :class:`DataFeedError` when the venue has no
+        ``watchOHLCVForSymbols`` — callers fall back to per-series watches.
+        """
+        exchange = await self._get_exchange()
+        impl = getattr(exchange, "watchOHLCVForSymbols", None)
+        if impl is None:
+            msg = f"{self._exchange_name} has no watchOHLCVForSymbols"
+            raise DataFeedError(msg)
+        _stats.count("datafeed.streams", dim="ohlcv_for_symbols")
+        while True:
+            try:
+                grouped = await impl([[s, tf] for s, tf in symbols])
+                if isinstance(grouped, dict):
+                    for sym, per_tf in grouped.items():
+                        if isinstance(per_tf, dict):
+                            for tf, candles in per_tf.items():
+                                if candles:
+                                    yield (sym, tf, candles)
+                        elif per_tf:
+                            yield (sym, "", per_tf)
+                elif grouped:
+                    for sym, tf in symbols:
+                        yield (sym, tf, grouped)
+            except Exception as e:  # noqa: BLE001
+                if "closed" in str(e).lower() or "connection" in str(e).lower():
+                    await asyncio.sleep(1)
+                    continue
+                msg = f"watch_ohlcv_for_symbols error: {e}"
+                raise DataFeedError(msg) from e
 
     async def watch_ohlcv(
         self,
@@ -215,18 +305,44 @@ class CCXTProDataFeed(DataFeed):
     ) -> AsyncIterator[list[Any]]:
         """Stream OHLCV updates using watch_ohlcv."""
         exchange = await self._get_exchange()
+        _dbg(
+            "watch_ohlcv subscribe exchange=%s symbol=%s timeframe=%s limit=%s",
+            self._exchange_name,
+            symbol,
+            timeframe,
+            limit,
+        )
+        _stats.count("datafeed.streams", dim="ohlcv")
+        n_updates = 0
         while True:
             try:
                 ohlcv = await exchange.watch_ohlcv(symbol, timeframe, limit=limit)
                 if ohlcv:
+                    n_updates += 1
+                    if _debug_scope(__name__) and n_updates <= 3:
+                        # First few only — steady state would flood the log.
+                        _dbg(
+                            "watch_ohlcv update #%d exchange=%s symbol=%s bars=%s last_ts=%s",
+                            n_updates,
+                            self._exchange_name,
+                            symbol,
+                            len(ohlcv),
+                            ohlcv[-1][0] if ohlcv else None,
+                        )
+                    elif n_updates == 4:
+                        _dbg("watch_ohlcv further updates suppressed for %s %s", self._exchange_name, symbol)
                     yield ohlcv
             except Exception as e:  # broad to let ccxt handle reconnect logic
                 # Most pro implementations recover internally on next call
                 # Yielding error info is optional; here we just continue
                 if "closed" in str(e).lower() or "connection" in str(e).lower():
+                    _dbg("watch_ohlcv reconnect after %s", e)
+                    _stats.count("datafeed.reconnects", dim="ohlcv")
                     await asyncio.sleep(1)
                     continue
                 msg = f"watch_ohlcv error: {e}"
+                _dbg("watch_ohlcv error %s %s: %s", self._exchange_name, symbol, e)
+                _stats.count("datafeed.errors", dim="watch_ohlcv")
                 raise DataFeedError(msg) from e
 
     async def watch_trades(
@@ -236,6 +352,8 @@ class CCXTProDataFeed(DataFeed):
     ) -> AsyncIterator[dict[str, Any] | list[dict[str, Any]]]:
         """Stream trades using watch_trades."""
         exchange = await self._get_exchange()
+        _dbg("watch_trades subscribe exchange=%s symbol=%s limit=%s", self._exchange_name, symbol, limit)
+        _stats.count("datafeed.streams", dim="trades")
         while True:
             try:
                 trades = await exchange.watch_trades(symbol, limit=limit)
@@ -243,42 +361,59 @@ class CCXTProDataFeed(DataFeed):
                     yield trades
             except Exception as e:
                 if "closed" in str(e).lower() or "connection" in str(e).lower():
+                    _dbg("watch_trades reconnect after %s", e)
+                    _stats.count("datafeed.reconnects", dim="trades")
                     await asyncio.sleep(1)
                     continue
                 msg = f"watch_trades error: {e}"
+                _dbg("watch_trades error %s %s: %s", self._exchange_name, symbol, e)
+                _stats.count("datafeed.errors", dim="watch_trades")
                 raise DataFeedError(msg) from e
 
     async def watch_ticker(self, symbol: str) -> AsyncIterator[dict[str, Any]]:
         """Stream ticker updates using watch_ticker."""
         exchange = await self._get_exchange()
+        _dbg("watch_ticker subscribe exchange=%s symbol=%s", self._exchange_name, symbol)
+        _stats.count("datafeed.streams", dim="ticker")
         while True:
             try:
                 ticker = await exchange.watch_ticker(symbol)
                 yield ticker
             except Exception as e:
                 if "closed" in str(e).lower() or "connection" in str(e).lower():
+                    _dbg("watch_ticker reconnect after %s", e)
+                    _stats.count("datafeed.reconnects", dim="ticker")
                     await asyncio.sleep(1)
                     continue
                 msg = f"watch_ticker error: {e}"
+                _dbg("watch_ticker error %s %s: %s", self._exchange_name, symbol, e)
+                _stats.count("datafeed.errors", dim="watch_ticker")
                 raise DataFeedError(msg) from e
 
     async def watch_order_book(self, symbol: str, limit: int = 20) -> AsyncIterator[dict[str, Any]]:
         """Stream order book using watch_order_book."""
         exchange = await self._get_exchange()
+        _dbg("watch_order_book subscribe exchange=%s symbol=%s limit=%s", self._exchange_name, symbol, limit)
+        _stats.count("datafeed.streams", dim="order_book")
         while True:
             try:
                 ob = await exchange.watch_order_book(symbol, limit)
                 yield ob
             except Exception as e:
                 if "closed" in str(e).lower() or "connection" in str(e).lower():
+                    _dbg("watch_order_book reconnect after %s", e)
+                    _stats.count("datafeed.reconnects", dim="order_book")
                     await asyncio.sleep(1)
                     continue
                 msg = f"watch_order_book error: {e}"
+                _dbg("watch_order_book error %s %s: %s", self._exchange_name, symbol, e)
+                _stats.count("datafeed.errors", dim="watch_order_book")
                 raise DataFeedError(msg) from e
 
     async def close(self) -> None:
         """Close the exchange WebSocket connection."""
         if self._exchange is not None:
+            _dbg("closing ccxt.pro exchange=%s", self._exchange_name)
             try:
                 await self._exchange.close()
             except Exception:  # noqa: S110 - best effort shutdown
@@ -286,6 +421,7 @@ class CCXTProDataFeed(DataFeed):
             self._exchange = None
 
     async def __aenter__(self) -> CCXTProDataFeed:
+        _dbg("entering ccxt.pro feed exchange=%s", self._exchange_name)
         await self._get_exchange()
         return self
 
@@ -334,6 +470,7 @@ def get_datafeed(name: str = "ccxtpro", **kwargs: Any) -> DataFeed:
         A DataFeed instance.
     """
     if name in ("ccxtpro", "ccxt", "pro"):
+        _dbg("get_datafeed name=%s exchange=%s", name, kwargs.get("exchange", "binance"))
         return CCXTProDataFeed(
             exchange=kwargs.get("exchange", "binance"),
             api_key=kwargs.get("api_key", ""),
@@ -343,9 +480,12 @@ def get_datafeed(name: str = "ccxtpro", **kwargs: Any) -> DataFeed:
             **{k: v for k, v in kwargs.items() if k not in {"exchange", "api_key", "secret", "password", "sandbox"}},
         )
     if name == "mock":
+        _dbg("get_datafeed name=mock symbol=%s", kwargs.get("symbol", "BTC/USDT"))
         return MockDataFeed(**kwargs)
 
     msg = f"Unknown datafeed: {name}. Supported: 'ccxtpro', 'mock'"
+    _dbg("get_datafeed unknown name=%s", name)
+    _stats.count("datafeed.errors", dim="unknown_factory")
     raise DataFeedError(msg)
 
 
@@ -359,10 +499,14 @@ class MockDataFeed(DataFeed):
         self.symbol = symbol
         self.price = start_price
         self._closed = False
+        _dbg("MockDataFeed init symbol=%s start_price=%s", symbol, start_price)
+        _stats.count("datafeed.feeds_created", dim="mock")
 
     async def watch_ohlcv(
         self, symbol: str | None = None, timeframe: str = "1m", limit: int | None = None
     ) -> AsyncIterator[list[Any]]:
+        _dbg("MockDataFeed.watch_ohlcv symbol=%s timeframe=%s", symbol or self.symbol, timeframe)
+        _stats.count("datafeed.streams", dim="mock_ohlcv")
         ts = 1700000000000
         while not self._closed:
             self.price *= 1 + random.uniform(-0.001, 0.001)
@@ -436,9 +580,7 @@ class MockDataFeed(DataFeed):
             "low": float(self.price) * 0.99,
         }
 
-    def fetch_latest_ohlcv(
-        self, symbol: str | None = None, timeframe: str = "1m", limit: int = 5
-    ) -> list[list[Any]]:
+    def fetch_latest_ohlcv(self, symbol: str | None = None, timeframe: str = "1m", limit: int = 5) -> list[list[Any]]:
         _ = symbol or self.symbol
         _ = timeframe
         ts = 1_700_000_000_000
@@ -504,9 +646,7 @@ class CompositeDataFeed(DataFeed):
                     continue
         return {}
 
-    def fetch_latest_ohlcv(
-        self, symbol: str, timeframe: str = "1m", limit: int = 5
-    ) -> list[list[Any]]:
+    def fetch_latest_ohlcv(self, symbol: str, timeframe: str = "1m", limit: int = 5) -> list[list[Any]]:
         for src in (self.primary, self.fallback):
             if src is not None and hasattr(src, "fetch_latest_ohlcv"):
                 try:

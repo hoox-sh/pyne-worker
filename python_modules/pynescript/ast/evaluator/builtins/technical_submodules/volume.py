@@ -26,6 +26,7 @@ Handlers are composed into
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Any
 
 from .core import BINARY
@@ -34,6 +35,20 @@ from .core import QUINARY
 from .core import TERNARY
 from .core import UNARY
 from .core import TechnicalHelpers
+
+
+def _last_finite(ev: TechnicalHelpers, x: Any) -> float | None:
+    """Current-bar numeric sample, or ``None`` for missing / non-numeric / NaN."""
+    x = ev._series_last(x)
+    if x is None:
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    if v != v:
+        return None
+    return v
 
 
 class VolumeIndicators(TechnicalHelpers):
@@ -49,6 +64,19 @@ class VolumeIndicators(TechnicalHelpers):
         - ``ta.obv(close, volume)`` — explicit series
         """
         msg = "ta.obv expects close and volume series (or no args)"
+        if self._use_incremental_ta():
+            if len(args) == 0:
+                closes = self._context_source("close")
+                volumes = self._context_source("volume")
+                if not volumes:
+                    volumes = 0.0
+            elif len(args) == BINARY:
+                closes = self._as_series_or_raw(args[0], last_sample_ok=True)
+                volumes = self._as_series_or_raw(args[1], last_sample_ok=True)
+            else:
+                self._error(msg)
+                return None
+            return self._obv_inc_update(closes, volumes)
         if len(args) == 0:
             closes = self._context_series("close")
             volumes = self._context_series("volume")
@@ -199,13 +227,338 @@ class VolumeIndicators(TechnicalHelpers):
         st["ad"] = float(st["ad"]) + clv * vv
         return st["ad"]
 
-    def _builtin_ta_wad(self, args: list[Any]) -> list[float | None]:
+    def _obv_inc_update(self, closes: Any, volumes: Any) -> float:
+        """Incremental On-Balance Volume matching full ``_obv`` last value.
+
+        Full path returns ``0`` until 3 samples, then accumulates from index 2
+        (skips ``close[0]`` vs ``close[1]``). Safe under ``_SERIES_MAX`` caps.
+        """
+        slot = self._ta_next_slot()
+        key = ("obv", slot)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"obv": 0.0, "prev": None, "bars": 0}
+            bucket[key] = st
+
+        cf = _last_finite(self, closes)
+        vf = _last_finite(self, volumes)
+        bars = int(st["bars"]) + 1
+        st["bars"] = bars
+
+        if bars < 3:
+            st["prev"] = cf
+            st["obv"] = 0.0
+            return 0.0
+
+        prev = st["prev"]
+        if cf is not None and prev is not None and vf is not None:
+            if cf > prev:
+                st["obv"] = float(st["obv"]) + vf
+            elif cf < prev:
+                st["obv"] = float(st["obv"]) - vf
+        if cf is not None:
+            st["prev"] = cf
+        return float(st["obv"])
+
+    def _wad_inc_update(
+        self,
+        high: Any,
+        low: Any,
+        close: Any,
+        volume: Any,
+    ) -> float:
+        """Incremental Williams A/D matching full ``_wad`` last value.
+
+        First bar is ``0.0``. Later bars add ``vol*(close-low)`` on up closes
+        and subtract ``vol*(high-close)`` on down closes.
+        """
+        slot = self._ta_next_slot()
+        key = ("wad", slot)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"wad": 0.0, "prev": None, "started": False}
+            bucket[key] = st
+
+        h = _last_finite(self, high)
+        l_ = _last_finite(self, low)
+        c = _last_finite(self, close)
+        v = _last_finite(self, volume)
+        vv = 0.0 if v is None else v
+
+        if not st["started"]:
+            st["started"] = True
+            st["prev"] = c
+            st["wad"] = 0.0
+            return 0.0
+
+        prev = st["prev"]
+        if c is not None and prev is not None:
+            hi = h if h is not None else c
+            lo = l_ if l_ is not None else c
+            if c > prev:
+                st["wad"] = float(st["wad"]) + vv * (c - lo)
+            elif c < prev:
+                st["wad"] = float(st["wad"]) - vv * (hi - c)
+        if c is not None:
+            st["prev"] = c
+        return float(st["wad"])
+
+    def _wvad_inc_update(
+        self,
+        high: Any,
+        low: Any,
+        close: Any,
+        volume: Any,
+        period: int,
+    ) -> float:
+        """Incremental Williams Volume A/D: last WAD / rolling volume sum."""
+        wad = self._wad_inc_update(high, low, close, volume)
+        if period <= 0:
+            slot = self._ta_next_slot()
+            key = ("wvad", slot, 0)
+            bucket = self._ta_state_bucket()
+            bucket.setdefault(key, {"value": 0.0})
+            return 0.0
+        slot = self._ta_next_slot()
+        key = ("wvad", slot, int(period))
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"vols": deque(maxlen=period), "vol_sum": 0.0}
+            bucket[key] = st
+
+        v = _last_finite(self, volume)
+        vv = 0.0 if v is None else v
+        vols: deque[float] = st["vols"]
+        if len(vols) == period:
+            st["vol_sum"] = float(st["vol_sum"]) - float(vols[0])
+        vols.append(vv)
+        st["vol_sum"] = float(st["vol_sum"]) + vv
+        vol_sum = float(st["vol_sum"])
+        if vol_sum > 0.0 and wad is not None:
+            return float(wad) / vol_sum
+        return 0.0
+
+    def _cmf_inc_update(
+        self,
+        close: Any,
+        high: Any,
+        low: Any,
+        volume: Any,
+        period: int,
+    ) -> float | None:
+        """Incremental Chaikin Money Flow matching full ``_cmf`` last value.
+
+        Partial windows are allowed (same as the full rebuild).
+        """
+        if period <= 0:
+            slot = self._ta_next_slot()
+            key = ("cmf", slot, 0)
+            self._ta_state_bucket().setdefault(key, {"value": None})
+            return None
+        slot = self._ta_next_slot()
+        key = ("cmf", slot, int(period))
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {
+                "mf": deque(maxlen=period),
+                "vol": deque(maxlen=period),
+                "mf_sum": 0.0,
+                "vol_sum": 0.0,
+                "value": None,
+            }
+            bucket[key] = st
+
+        h = _last_finite(self, high)
+        l_ = _last_finite(self, low)
+        c = _last_finite(self, close)
+        v = _last_finite(self, volume)
+        vv = 0.0 if v is None else v
+        if h is None or l_ is None or c is None:
+            clv = 0.0
+        else:
+            rng = h - l_
+            clv = 0.0 if rng == 0.0 else ((c - l_) - (h - c)) / rng
+        mf = clv * vv
+
+        mfs: deque[float] = st["mf"]
+        vols: deque[float] = st["vol"]
+        if len(mfs) == period:
+            st["mf_sum"] = float(st["mf_sum"]) - float(mfs[0])
+            st["vol_sum"] = float(st["vol_sum"]) - float(vols[0])
+        mfs.append(mf)
+        vols.append(vv)
+        st["mf_sum"] = float(st["mf_sum"]) + mf
+        st["vol_sum"] = float(st["vol_sum"]) + vv
+        vol_sum = float(st["vol_sum"])
+        if vol_sum > 0.0:
+            st["value"] = float(st["mf_sum"]) / vol_sum
+        else:
+            st["value"] = 0.0
+        return st["value"]
+
+    def _klinger_inc_update(
+        self,
+        close: Any,
+        volume: Any,
+        fast_period: int,
+        slow_period: int,
+    ) -> float | None:
+        """Incremental Klinger: signed volume cumulant + two EMA call sites.
+
+        Matches last value of full ``_klinger`` (TRV → cumsum → EMA fast/slow).
+        """
+        slot = self._ta_next_slot()
+        key = ("klinger", slot)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"prev": None, "cum": 0.0, "started": False}
+            bucket[key] = st
+
+        c = _last_finite(self, close)
+        v = _last_finite(self, volume)
+        vv = 0.0 if v is None else v
+
+        if not st["started"]:
+            st["started"] = True
+            st["prev"] = c
+            st["cum"] = 0.0
+        else:
+            prev = st["prev"]
+            if c is not None and prev is not None:
+                if c > prev:
+                    trv = vv
+                elif c < prev:
+                    trv = -vv
+                else:
+                    trv = 0.0
+            else:
+                trv = 0.0
+            st["cum"] = float(st["cum"]) + trv
+            if c is not None:
+                st["prev"] = c
+
+        cum = float(st["cum"])
+        # Nested EMA call sites must run every bar (slot order).
+        fast_v = self._ema_inc_update(cum, fast_period)
+        slow_v = self._ema_inc_update(cum, slow_period)
+        if fast_v is None or slow_v is None:
+            return None
+        try:
+            return float(fast_v) - float(slow_v)
+        except (TypeError, ValueError):
+            return None
+
+    def _nvi_inc_update(self, closes: Any, volumes: Any) -> float:
+        """Incremental Negative Volume Index matching full ``ta.nvi`` last value.
+
+        Seed ``1000.0`` on the first bar. Later bars multiply by
+        ``(1 + close_change)`` when volume decreases. Missing / non-numeric
+        close skips the increment (not coerced to 0). Empty volume contributes 0.
+        """
+        slot = self._ta_next_slot()
+        key = ("nvi", slot)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"nvi": 1000.0, "prev_c": None, "prev_v": None, "started": False}
+            bucket[key] = st
+
+        cf = _last_finite(self, closes)
+        vf = _last_finite(self, volumes)
+        vv = 0.0 if vf is None else vf
+
+        if not st["started"]:
+            st["started"] = True
+            st["prev_c"] = cf
+            st["prev_v"] = vv
+            st["nvi"] = 1000.0
+            return 1000.0
+
+        prev_c = st["prev_c"]
+        prev_v = st["prev_v"]
+        if cf is not None and prev_c is not None:
+            if prev_c != 0.0:
+                close_change = (cf - prev_c) / prev_c
+            else:
+                close_change = 0.0
+            pv = 0.0 if prev_v is None else float(prev_v)
+            if vv < pv:
+                st["nvi"] = float(st["nvi"]) * (1.0 + close_change)
+        if cf is not None:
+            st["prev_c"] = cf
+        st["prev_v"] = vv
+        return float(st["nvi"])
+
+    def _pvi_inc_update(self, closes: Any, volumes: Any) -> float:
+        """Incremental Positive Volume Index matching full ``ta.pvi`` last value.
+
+        Seed ``1000.0`` on the first bar. Later bars multiply by
+        ``(1 + close_change)`` when volume increases. Missing / non-numeric
+        close skips the increment (not coerced to 0). Empty volume contributes 0.
+        """
+        slot = self._ta_next_slot()
+        key = ("pvi", slot)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"pvi": 1000.0, "prev_c": None, "prev_v": None, "started": False}
+            bucket[key] = st
+
+        cf = _last_finite(self, closes)
+        vf = _last_finite(self, volumes)
+        vv = 0.0 if vf is None else vf
+
+        if not st["started"]:
+            st["started"] = True
+            st["prev_c"] = cf
+            st["prev_v"] = vv
+            st["pvi"] = 1000.0
+            return 1000.0
+
+        prev_c = st["prev_c"]
+        prev_v = st["prev_v"]
+        if cf is not None and prev_c is not None:
+            if prev_c != 0.0:
+                close_change = (cf - prev_c) / prev_c
+            else:
+                close_change = 0.0
+            pv = 0.0 if prev_v is None else float(prev_v)
+            if vv > pv:
+                st["pvi"] = float(st["pvi"]) * (1.0 + close_change)
+        if cf is not None:
+            st["prev_c"] = cf
+        st["prev_v"] = vv
+        return float(st["pvi"])
+
+    def _builtin_ta_wad(self, args: list[Any]) -> Any:
         """Williams Accumulation/Distribution - volume accumulation index.
 
         Forms:
         - ``ta.wad`` / ``ta.wad()`` — chart high/low/close/volume
         - ``ta.wad(high, low, close, volume)`` — explicit series
         """
+        if self._use_incremental_ta():
+            if len(args) == 0:
+                return self._wad_inc_update(
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    self._context_source("close"),
+                    self._context_source("volume") or 0.0,
+                )
+            if len(args) >= QUATERNARY:
+                return self._wad_inc_update(
+                    self._as_series_or_raw(args[0], last_sample_ok=True),
+                    self._as_series_or_raw(args[1], last_sample_ok=True),
+                    self._as_series_or_raw(args[2], last_sample_ok=True),
+                    self._as_series_or_raw(args[3], last_sample_ok=True),
+                )
+            self._error("ta.wad() requires 0 or 4 arguments: high, low, close, volume")
+            return None
         if len(args) == 0:
             high_series = self._context_series("high")
             low_series = self._context_series("low")
@@ -222,13 +575,48 @@ class VolumeIndicators(TechnicalHelpers):
 
         return self._wad(high_series, low_series, close_series, volume_series)
 
-    def _builtin_ta_wvad(self, args: list[Any]) -> list[float | None]:
+    def _builtin_ta_wvad(self, args: list[Any]) -> Any:
         """Williams Volume Accumulation/Distribution - normalized WAD.
 
         Forms:
         - ``ta.wvad(period)`` — H/L/C/V from context
         - ``ta.wvad(high, low, close, volume, period?)``
         """
+        if self._use_incremental_ta():
+            if len(args) == UNARY and self._is_period_like(args[0]):
+                period = self._expect_int(args[0], "period must be integer")
+                return self._wvad_inc_update(
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    self._context_source("close"),
+                    self._context_source("volume") or 0.0,
+                    period,
+                )
+            if len(args) == 0:
+                return self._wvad_inc_update(
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    self._context_source("close"),
+                    self._context_source("volume") or 0.0,
+                    20,
+                )
+            if len(args) < QUATERNARY:
+                self._error(
+                    "ta.wvad() requires 0, 1, or 4+ arguments: [high, low, close, volume,] period"
+                )
+                return None
+            period = (
+                self._expect_int(args[QUATERNARY], "period must be integer")
+                if len(args) > QUATERNARY
+                else 20
+            )
+            return self._wvad_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+                period,
+            )
         if len(args) == UNARY and self._is_period_like(args[0]):
             period = self._expect_int(args[0], "period must be integer")
             high_series = self._context_series("high")
@@ -260,13 +648,36 @@ class VolumeIndicators(TechnicalHelpers):
 
         return self._wvad(high_series, low_series, close_series, volume_series, period)
 
-    def _builtin_ta_cmf(self, args: list[Any]) -> list[float | None]:
+    def _builtin_ta_cmf(self, args: list[Any]) -> Any:
         """Chaikin Money Flow indicator.
 
         Forms:
         - ``ta.cmf(period)`` — H/L/C/V from chart context
         - ``ta.cmf(close, high, low, volume, period)`` — explicit series
         """
+        if self._use_incremental_ta():
+            if len(args) == UNARY and self._is_period_like(args[0]):
+                period = self._expect_int(args[0], "ta.cmf period must be integer")
+                return self._cmf_inc_update(
+                    self._context_source("close"),
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    self._context_source("volume") or 0.0,
+                    period,
+                )
+            if len(args) < QUINARY:
+                self._error(
+                    "ta.cmf() requires 1 argument (period) or 5: close, high, low, volume, period"
+                )
+                return None
+            period = self._expect_int(args[4], "ta.cmf period must be integer")
+            return self._cmf_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+                period,
+            )
         if len(args) == UNARY and self._is_period_like(args[0]):
             period = self._expect_int(args[0], "ta.cmf period must be integer")
             high_series = self._context_series("high")
@@ -288,23 +699,30 @@ class VolumeIndicators(TechnicalHelpers):
 
         return self._cmf(close_series, high_series, low_series, volume_series, period)
 
-    def _builtin_ta_klinger(self, args: list[Any]) -> list[float | None]:
+    def _builtin_ta_klinger(self, args: list[Any]) -> Any:
         """Klinger Oscillator.
 
         ta.klinger(high, low, close, volume, fast_period, slow_period)
         Volume-based momentum oscillator.
-        Returns KO series.
+        Returns KO series (full) or last scalar (incremental bar mode).
         """
         senary = 6
         if len(args) < senary:
             msg = "ta.klinger() requires 6 arguments: high, low, close, volume, fast_period, slow_period"
             self._error(msg)
 
-        close_series = args[2] if isinstance(args[2], list) else [args[2]]
-        volume_series = args[3] if isinstance(args[3], list) else [args[3]]
         fast_period = self._expect_int(args[4], "ta.klinger fast_period must be integer")
         slow_period = self._expect_int(args[5], "ta.klinger slow_period must be integer")
+        if self._use_incremental_ta():
+            return self._klinger_inc_update(
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+                fast_period,
+                slow_period,
+            )
 
+        close_series = args[2] if isinstance(args[2], list) else [args[2]]
+        volume_series = args[3] if isinstance(args[3], list) else [args[3]]
         return self._klinger(close_series, volume_series, fast_period, slow_period)
 
     def _builtin_ta_apo(self, args: list[Any]) -> list[float | None]:
@@ -331,6 +749,12 @@ class VolumeIndicators(TechnicalHelpers):
         - ``ta.vpt`` / ``ta.pvt`` / ``ta.vpt()`` — chart close + volume
         - ``ta.vpt(series)`` — unused series arg for API compatibility (chart OHLCV used)
         """
+        if self._use_incremental_ta():
+            closes = self._context_source("close")
+            volumes = self._context_source("volume")
+            if not volumes:
+                volumes = 0.0
+            return self._vpt_inc_update(closes, volumes)
         closes = self._context_series("close")
         volumes = self._context_series("volume")
         if not volumes and closes:
@@ -340,9 +764,39 @@ class VolumeIndicators(TechnicalHelpers):
             cs = getattr(self, "current_series", None) or {}
             closes = cs.get("close", closes) or []
             volumes = cs.get("volume", volumes) or []
-        if not closes or not volumes or len(closes) < 2:
+        if not closes or not volumes:
             return None
         return self._vpt(closes, volumes)
+
+    def _vpt_inc_update(self, closes: Any, volumes: Any) -> float:
+        """Incremental cumulative VPT matching compile ``numba_pvt_inc``.
+
+        Bar 0 is ``0.0``. Later bars add ``vol * (close - prev) / prev``.
+        """
+        slot = self._ta_next_slot()
+        key = ("vpt", slot)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"vpt": 0.0, "prev_c": None, "started": False}
+            bucket[key] = st
+
+        cf = _last_finite(self, closes)
+        vf = _last_finite(self, volumes)
+        vv = 0.0 if vf is None else vf
+
+        if not st["started"]:
+            st["started"] = True
+            st["prev_c"] = cf
+            st["vpt"] = 0.0
+            return 0.0
+
+        prev_c = st["prev_c"]
+        if cf is not None and prev_c is not None and prev_c != 0.0:
+            st["vpt"] = float(st["vpt"]) + vv * ((cf - prev_c) / prev_c)
+        if cf is not None:
+            st["prev_c"] = cf
+        return float(st["vpt"])
 
     def _builtin_ta_emv(self, args: list[Any]) -> float | None:
         """Ease of Movement.
@@ -413,13 +867,26 @@ class VolumeIndicators(TechnicalHelpers):
         iii = 2 * close_f - high_f - low_f
         return iii / tr if tr != 0 else 0.0
 
-    def _builtin_ta_nvi(self, args: list[Any]) -> list[float | None]:
+    def _builtin_ta_nvi(self, args: list[Any]) -> Any:
         """Negative Volume Index - cumulative index when volume decreases.
 
         Forms:
         - ``ta.nvi`` / ``ta.nvi()`` — chart close + volume
         - ``ta.nvi(close, volume)`` — explicit series
         """
+        if self._use_incremental_ta():
+            if len(args) == 0:
+                closes = self._context_source("close")
+                volumes = self._context_source("volume")
+                if not volumes:
+                    volumes = 0.0
+            elif len(args) >= BINARY:
+                closes = self._as_series_or_raw(args[0], last_sample_ok=True)
+                volumes = self._as_series_or_raw(args[1], last_sample_ok=True)
+            else:
+                self._error("ta.nvi() requires 0 or 2+ arguments: close, volume")
+                return None
+            return self._nvi_inc_update(closes, volumes)
         if len(args) == 0:
             close_series = self._context_series("close")
             volume_series = self._context_series("volume") or [0.0] * len(close_series)
@@ -459,13 +926,26 @@ class VolumeIndicators(TechnicalHelpers):
 
         return nvi_values
 
-    def _builtin_ta_pvi(self, args: list[Any]) -> list[float | None]:
+    def _builtin_ta_pvi(self, args: list[Any]) -> Any:
         """Positive Volume Index - cumulative index when volume increases.
 
         Forms:
         - ``ta.pvi`` / ``ta.pvi()`` — chart close + volume
         - ``ta.pvi(close, volume)`` — explicit series
         """
+        if self._use_incremental_ta():
+            if len(args) == 0:
+                closes = self._context_source("close")
+                volumes = self._context_source("volume")
+                if not volumes:
+                    volumes = 0.0
+            elif len(args) >= BINARY:
+                closes = self._as_series_or_raw(args[0], last_sample_ok=True)
+                volumes = self._as_series_or_raw(args[1], last_sample_ok=True)
+            else:
+                self._error("ta.pvi() requires 0 or 2+ arguments: close, volume")
+                return None
+            return self._pvi_inc_update(closes, volumes)
         if len(args) == 0:
             close_series = self._context_series("close")
             volume_series = self._context_series("volume") or [0.0] * len(close_series)
@@ -837,19 +1317,39 @@ class VolumeIndicators(TechnicalHelpers):
         return apo_values
 
     def _vpt(self, closes: list[Any], volumes: list[Any]) -> float | None:
-        """Calculate Volume Price Trend."""
-        if len(closes) < BINARY:
+        """Cumulative Volume Price Trend (last value).
+
+        ``VPT = previous VPT + volume * (close - prev_close) / prev_close``.
+        Bar 0 is ``0.0`` (matches compile ``numba_pvt_inc``).
+        """
+        if not closes:
             return None
-
-        # VPT = Previous VPT + Volume * (Price Change / Previous Price)
-        prev_close = closes[-2] if len(closes) >= BINARY else closes[-1]
-        if prev_close == 0:
+        n = min(len(closes), len(volumes) if volumes else 0)
+        if n <= 0:
+            return None
+        vpt = 0.0
+        if n == 1:
             return 0.0
-
-        price_change_pct = (closes[-1] - prev_close) / prev_close
-        vpt_val = volumes[-1] * price_change_pct
-
-        return vpt_val
+        for i in range(1, n):
+            prev_close = closes[i - 1]
+            close = closes[i]
+            vol = volumes[i]
+            if prev_close is None or close is None:
+                continue
+            try:
+                prev_f = float(prev_close)
+                close_f = float(close)
+                vol_f = 0.0 if vol is None else float(vol)
+            except (TypeError, ValueError):
+                continue
+            if prev_f != prev_f or close_f != close_f:
+                continue
+            if prev_f == 0.0:
+                continue
+            if vol_f != vol_f:
+                vol_f = 0.0
+            vpt = vpt + vol_f * ((close_f - prev_f) / prev_f)
+        return vpt
 
     def _emv(
         self,

@@ -40,36 +40,38 @@ from lsprotocol import types as lsp
 from pynescript.ast import node as ast
 from pynescript.langserver.providers.builtin_metadata import fuzzy_filter
 from pynescript.langserver.providers.builtin_metadata import get_all_categories
+from pynescript.langserver.providers.builtin_metadata import get_fuzzy_index
 from pynescript.langserver.providers.builtin_metadata import get_metadata
 
 
 # Soft keywords and structural keywords not present in builtin metadata.
 # Lexer treats type/method/enum/as/by/to/const as identifiers outside keyword position.
 PINE_KEYWORDS: tuple[tuple[str, str], ...] = (
-    ("and", "Logical and"),
-    ("as", "Import alias / type cast"),
-    ("break", "Exit the innermost loop"),
-    ("by", "for-loop step"),
-    ("const", "Qualify a declaration as const"),
-    ("continue", "Skip to the next loop iteration"),
-    ("else", "Else branch"),
-    ("enum", "Declare a user-defined enum"),
-    ("export", "Export a library member"),
-    ("false", "Boolean false"),
-    ("for", "for / for...in loop"),
-    ("if", "Conditional"),
-    ("import", "Import a library"),
-    ("in", "for...in membership"),
-    ("method", "Declare a method"),
-    ("not", "Logical not"),
-    ("or", "Logical or"),
-    ("switch", "Switch expression"),
-    ("to", "for-loop end bound"),
-    ("true", "Boolean true"),
-    ("type", "Declare a user-defined type"),
-    ("var", "Persistent variable"),
-    ("varip", "Intrabar-persistent variable"),
-    ("while", "while loop"),
+    ("and", "Logical AND; both operands must be true."),
+    ("as", "Import alias or type cast."),
+    ("break", "Exit the innermost loop."),
+    ("by", "Step of a counted `for` loop (`for i = 0 to n by 2`)."),
+    ("const", "Qualify a declaration as a compile-time constant."),
+    ("continue", "Skip to the next loop iteration."),
+    ("else", "Alternative branch of an `if` or `switch`."),
+    ("enum", "Declare a user-defined enum."),
+    ("export", "Export a library member for use by other scripts."),
+    ("false", "Boolean false."),
+    ("for", "Counted `for` loop or `for ... in` over a collection."),
+    ("if", "Conditional branch; optional `else`."),
+    ("import", "Import a library."),
+    ("in", "Iterate a collection in a `for ... in` loop."),
+    ("method", "Declare a method on a user-defined type."),
+    ("not", "Logical NOT."),
+    ("once", "Run a block the first time its condition is true on a closed bar."),
+    ("or", "Logical OR; true if either operand is true."),
+    ("switch", "Multi-way `switch` expression."),
+    ("to", "End bound of a counted `for` loop."),
+    ("true", "Boolean true."),
+    ("type", "Declare a user-defined type."),
+    ("var", "Persistent variable; initialized once and kept across bars."),
+    ("varip", "Intrabar-persistent variable; updates on every tick."),
+    ("while", "Loop while a condition is true."),
 )
 
 
@@ -84,16 +86,18 @@ def build_completion_list(prefix: str = "", include_categories: bool = True) -> 
         LSP CompletionList with completion items.
     """
     metadata = get_metadata()
-    items = list(metadata.values())
 
     # Filter by prefix
     if prefix:
         if prefix.endswith("."):
             # Module completion (e.g., "ta.")
-            items = [i for i in items if i.get("label", "").startswith(prefix)]
+            items = [i for i in metadata.values() if i.get("label", "").startswith(prefix)]
         else:
-            # Fuzzy filter
-            items = fuzzy_filter(prefix, items)
+            # Fuzzy filter (with pre-lowered fields from the metadata cache)
+            all_items, fuzzy_fields = get_fuzzy_index()
+            items = fuzzy_filter(prefix, all_items, fields=fuzzy_fields)
+    else:
+        items = list(metadata.values())
 
     # Sort alphabetically
     items.sort(key=lambda x: x.get("label", ""))
@@ -130,18 +134,29 @@ def build_completion_list(prefix: str = "", include_categories: bool = True) -> 
     )
 
 
-def build_completion_item(info: dict, *, insert_leaf: bool = False) -> lsp.CompletionItem:
+def build_completion_item(info: dict, *, insert_leaf: bool = False, module: str = "") -> lsp.CompletionItem:
     """Build a single CompletionItem from metadata.
+
+    Results are memoized per ``(label, insert_leaf, module)`` — items are
+    immutable output of the (static) metadata, so rebuilding them per
+    keystroke is pure waste. A returned item must not be mutated by callers.
 
     Args:
         info: Metadata dict from builtin_metadata.
-        insert_leaf: When True, insert only the name after the last ``.``
-            (used after a module trigger so ``ta.`` + ``sma`` does not become
-            ``ta.ta.sma``).
+        insert_leaf: When True, insert only the name after *module* (used
+            after a module trigger so ``ta.`` + ``sma`` does not become
+            ``ta.ta.sma``). Nested paths keep intermediate segments
+            (``strategy.`` + ``risk.max_drawdown``).
+        module: Prefix being completed (``ta``, ``strategy``, ``strategy.risk``).
 
     Returns:
         LSP CompletionItem.
     """
+    label = info.get("label", "")
+    cache_key = (label, insert_leaf, module)
+    cached = _ITEM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     label = info.get("label", "")
     detail = info.get("detail", "")
     brief = info.get("brief", "")
@@ -157,13 +172,19 @@ def build_completion_item(info: dict, *, insert_leaf: bool = False) -> lsp.Compl
         insert_text = label
 
     if insert_leaf and "." in label:
-        leaf = label.rsplit(".", 1)[-1]
+        prefix = f"{module}." if module else ""
+        if prefix and label.startswith(prefix):
+            leaf = label[len(prefix) :]
+        else:
+            leaf = label.rsplit(".", 1)[-1]
         if insert_text.startswith(label):
             insert_text = leaf + insert_text[len(label) :]
+        elif prefix and insert_text.startswith(prefix):
+            insert_text = insert_text[len(prefix) :]
         elif "." in insert_text:
             insert_text = insert_text.rsplit(".", 1)[-1]
 
-    return lsp.CompletionItem(
+    item = lsp.CompletionItem(
         label=label,
         kind=lsp.CompletionItemKind.Function,
         detail=detail,
@@ -173,6 +194,10 @@ def build_completion_item(info: dict, *, insert_leaf: bool = False) -> lsp.Compl
         filter_text=" ".join(label.split(".")) + " " + brief,
         sort_text=_sort_text(label),
     )
+    if len(_ITEM_CACHE) > 4096:
+        _ITEM_CACHE.clear()
+    _ITEM_CACHE[cache_key] = item
+    return item
 
 
 def build_module_completion(module: str, member_prefix: str = "") -> lsp.CompletionList:
@@ -202,7 +227,7 @@ def build_module_completion(module: str, member_prefix: str = "") -> lsp.Complet
 
     completion_items = []
     for info in items:
-        completion_items.append(build_completion_item(info, insert_leaf=True))
+        completion_items.append(build_completion_item(info, insert_leaf=True, module=module))
 
     return lsp.CompletionList(
         is_incomplete=False,
@@ -232,8 +257,12 @@ def build_keyword_items(prefix: str = "") -> list[lsp.CompletionItem]:
     return items
 
 
+# Memoized CompletionItems (label, insert_leaf, module) → item. Bounded by the
+# metadata size in practice; cleared if it ever overflows.
+_ITEM_CACHE: dict[tuple[str, bool, str], lsp.CompletionItem] = {}
+
 _ENUM_HEADER = re.compile(r"^[ \t]*(?:export[ \t]+)?enum[ \t]+([A-Za-z_][A-Za-z0-9_]*)")
-_ENUM_MEMBER = re.compile(r"^[ \t]+([A-Za-z_][A-Za-z0-9_]*)(?:[ \t]*=[ \t]*(.+?))?[ \t]*$")
+_ENUM_MEMBER = re.compile(r"^[ \t]+([A-Za-z_][A-Za-z0-9_]*)(?:[ \t]*=[ \t]*([^\n \t]+?))?[ \t]*$")
 
 
 def collect_user_enums(tree: Any, source: str | None = None) -> dict[str, dict[str, Any]]:

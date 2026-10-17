@@ -41,13 +41,28 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 import random
+import time
 
 from abc import ABC
 from abc import abstractmethod
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
+from urllib.parse import urlparse
+
+from pynescript import stats as _stats
+from pynescript.debug import scope_enabled as _debug_scope
+
+
+_log = logging.getLogger(__name__)
+
+
+def _dbg(msg: str, *args: Any) -> None:
+    """Emit one historical-provider debug line when ``PYNE_DEBUG`` is enabled."""
+    if _debug_scope(__name__):
+        _log.debug(msg, *args)
 
 
 class DataProvider(ABC):
@@ -452,6 +467,67 @@ class AlphaVantageProvider(DataProvider):
         }
 
 
+# Spot market-data CDN. api.binance.com / fapi.binance.com return HTTP 451
+# from restricted regions (e.g. US VPS). Vision serves public klines + exchangeInfo.
+_BINANCE_PUBLIC_HOST = "https://data-api.binance.vision"
+
+
+def normalize_ccxt_symbol(exchange_name: str, symbol: str) -> str:
+    """AXIS-aligned unified-symbol aliases (Coinbase has no USDT spot book)."""
+    name = str(exchange_name or "").lower().strip()
+    s = str(symbol or "").strip()
+    if not s:
+        return s
+    if name in {"coinbase", "coinbaseexchange"}:
+        upper = s.upper()
+        if upper.endswith("/USDT"):
+            return s[: -len("USDT")] + "USD"
+        if upper.endswith("/USDC"):
+            return s[: -len("USDC")] + "USD"
+        if upper.endswith("USDT") and "/" not in s:
+            return s[: -len("USDT")] + "/USD"
+    return s
+
+
+def geo_block_message(exchange_name: str, err: BaseException) -> str | None:
+    """Short operator hint when a venue CDN refuses this host's region."""
+    text = str(err)
+    blocked = "block access from your country" in text or "restricted location" in text or "Eligibility" in text
+    if not blocked:
+        return None
+    name = str(exchange_name or "").strip() or "exchange"
+    return f"{name} public API is blocked from this host's region. Use kraken, okx, gate, or binance (spot)."
+
+
+def tune_ccxt_public_urls(exchange: Any, exchange_name: str) -> None:
+    """Retarget geo-blocked public REST hosts (Binance spot → data-api.binance.vision).
+
+    Does not touch futures (fapi/dapi) hosts. Call after constructing the CCXT
+    instance. Safe no-op for other venues.
+    """
+    name = str(exchange_name or "").lower().strip()
+    if name != "binance":
+        return
+    opts = getattr(exchange, "options", None)
+    if not isinstance(opts, dict):
+        opts = {}
+    opts["defaultType"] = "spot"
+    opts["fetchMarkets"] = ["spot"]
+    exchange.options = opts
+    urls = getattr(exchange, "urls", None)
+    if not isinstance(urls, dict):
+        return
+    api = urls.get("api")
+    if not isinstance(api, dict):
+        return
+    for key, val in list(api.items()):
+        if isinstance(val, str):
+            parsed = urlparse(val)
+            if parsed.scheme == "https" and parsed.hostname == "api.binance.com":
+                api[key] = val.replace("https://api.binance.com", _BINANCE_PUBLIC_HOST, 1)
+    urls["api"] = api
+
+
 class CCXTProvider(DataProvider):
     """CCXT crypto exchange data provider.
 
@@ -468,6 +544,8 @@ class CCXTProvider(DataProvider):
         exchange: str = "binance",
         api_key: str = "",
         secret: str = "",
+        password: str = "",
+        uid: str = "",
     ):
         """Initialize CCXT provider.
 
@@ -475,47 +553,116 @@ class CCXTProvider(DataProvider):
             exchange: Exchange name (binance, coinbase, kraken, etc.)
             api_key: API key for authenticated requests
             secret: API secret for authenticated requests
+            password: Optional passphrase (OKX, KuCoin, Coinbase)
+            uid: Optional account uid (some CCXT venues)
         """
         self._exchange_name = exchange
         self._api_key = api_key
         self._secret = secret
+        self._password = password
+        self._uid = uid
         self._exchange: Any | None = None
+        _dbg("CCXTProvider init exchange=%s has_key=%s", exchange, bool(api_key and secret))
+        _stats.count("provider.created", dim="ccxt")
 
     def _get_exchange(self):
         """Lazy import and initialize CCXT."""
         if self._exchange is None:
+            _t_ex0 = time.perf_counter()
             try:
                 import ccxt
 
                 exchange_class = getattr(ccxt, self._exchange_name.lower(), None)
                 if exchange_class is None:
                     msg = f"Exchange '{self._exchange_name}' not found in CCXT"
+                    _dbg("unknown CCXT exchange=%s", self._exchange_name)
+                    _stats.count("provider.errors", dim="unknown_exchange")
                     raise DataProviderError(msg)
 
-                params = {}
+                params: dict[str, Any] = {"enableRateLimit": True, "timeout": 20_000}
                 if self._api_key and self._secret:
                     params["apiKey"] = self._api_key
                     params["secret"] = self._secret
+                if self._password:
+                    params["password"] = self._password
+                if self._uid:
+                    params["uid"] = self._uid
+                if self._exchange_name.lower() == "binance":
+                    params["options"] = {"defaultType": "spot", "fetchMarkets": ["spot"]}
 
                 self._exchange = exchange_class(params)
+                tune_ccxt_public_urls(self._exchange, self._exchange_name)
+                _dbg(
+                    "ccxt REST exchange ready exchange=%s in %.1fms",
+                    self._exchange_name,
+                    (time.perf_counter() - _t_ex0) * 1000.0,
+                )
+                _stats.count("provider.exchanges_connected", dim=str(self._exchange_name).lower())
             except ImportError:
                 msg = "ccxt not installed. Install with: pip install ccxt"
+                _dbg("ccxt REST unavailable")
+                _stats.count("provider.errors", dim="ccxt_missing")
                 raise DataProviderError(msg)
         return self._exchange
 
     def _parse_timeframe(self, interval: str) -> str:
-        """Convert interval to CCXT timeframe."""
-        mapping = {
-            "1m": "1m",
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1h",
-            "4h": "4h",
-            "1d": "1d",
-            "1w": "1w",
-        }
-        return mapping.get(interval, "1d")
+        """Pass interval through to CCXT (unknown TFs must not silently become 1d)."""
+        raw = str(interval or "1d").strip()
+        return raw or "1d"
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1h",
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> list[list[Any]]:
+        """CCXT ``fetch_ohlcv(symbol, timeframe, since, limit)`` — raw candles.
+
+        ``since`` is milliseconds (AXIS walk-back). Each candle is
+        ``[ms, open, high, low, close, volume]``.
+        """
+        exchange = self._get_exchange()
+        tf = self._parse_timeframe(timeframe)
+        unified = normalize_ccxt_symbol(self._exchange_name, symbol)
+        _dbg(
+            "fetch_ohlcv exchange=%s symbol=%s -> %s timeframe=%s since=%s limit=%s",
+            self._exchange_name,
+            symbol,
+            unified,
+            tf,
+            since,
+            limit,
+        )
+        _t_fetch0 = time.perf_counter()
+        _stats.count("provider.fetches", dim="ccxt")
+        try:
+            raw = exchange.fetch_ohlcv(unified, tf, since, limit)
+        except Exception as e:
+            hint = geo_block_message(self._exchange_name, e)
+            msg = hint or f"Failed to fetch data from {self._exchange_name}: {e}"
+            _dbg(
+                "fetch_ohlcv FAILED exchange=%s %s in %.1fms: %s",
+                self._exchange_name,
+                unified,
+                (time.perf_counter() - _t_fetch0) * 1000.0,
+                e,
+            )
+            _stats.count("provider.fetch_errors", dim="ccxt")
+            _stats.latency("provider.fetch", time.perf_counter() - _t_fetch0)
+            raise DataProviderError(msg)
+        rows = list(raw or [])
+        _dbg(
+            "fetch_ohlcv exchange=%s %s %s -> %d bars in %.1fms",
+            self._exchange_name,
+            unified,
+            tf,
+            len(rows),
+            (time.perf_counter() - _t_fetch0) * 1000.0,
+        )
+        _stats.count("provider.bars_fetched", len(rows))
+        _stats.latency("provider.fetch", time.perf_counter() - _t_fetch0)
+        return rows
 
     def fetch(
         self,
@@ -533,8 +680,6 @@ class CCXTProvider(DataProvider):
         Returns:
             Dictionary with OHLCV data
         """
-        exchange = self._get_exchange()
-
         period_map = {
             "1d": 1,
             "1w": 7,
@@ -546,14 +691,7 @@ class CCXTProvider(DataProvider):
         }
         days = period_map.get(period, 365)
         since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-
-        timeframe = self._parse_timeframe(interval)
-
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since)
-        except Exception as e:
-            msg = f"Failed to fetch data from {self._exchange_name}: {e}"
-            raise DataProviderError(msg)
+        ohlcv = self.fetch_ohlcv(symbol, interval, since=since)
 
         return {
             "symbol": symbol,
@@ -574,11 +712,17 @@ class CCXTProvider(DataProvider):
             Dictionary with quote data
         """
         exchange = self._get_exchange()
+        unified = normalize_ccxt_symbol(self._exchange_name, symbol)
 
+        _dbg("fetch_quote exchange=%s symbol=%s -> %s", self._exchange_name, symbol, unified)
+        _stats.count("provider.fetches", dim="ccxt_quote")
         try:
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = exchange.fetch_ticker(unified)
         except Exception as e:
-            msg = f"Failed to fetch quote: {e}"
+            hint = geo_block_message(self._exchange_name, e)
+            msg = hint or f"Failed to fetch quote: {e}"
+            _dbg("fetch_quote FAILED exchange=%s %s: %s", self._exchange_name, unified, e)
+            _stats.count("provider.fetch_errors", dim="ccxt_quote")
             raise DataProviderError(msg)
 
         return {
@@ -620,15 +764,21 @@ def get_provider(name: str = "yahoo", **kwargs) -> DataProvider:
 
     if name not in providers:
         msg = f"Unknown provider: {name}. Available: {list(providers.keys())}"
+        _dbg("get_provider unknown name=%s", name)
+        _stats.count("provider.errors", dim="unknown_factory")
         raise DataProviderError(msg)
 
     provider_kwargs = {}
+    _dbg("get_provider name=%s kwargs=%s", name, sorted(kwargs))
+    _stats.count("provider.created", dim=str(name))
     if name == "alphavantage":
         provider_kwargs["api_key"] = kwargs.get("api_key", "demo")
     elif name == "ccxt":
         provider_kwargs["exchange"] = kwargs.get("exchange", "binance")
         provider_kwargs["api_key"] = kwargs.get("api_key", "")
         provider_kwargs["secret"] = kwargs.get("secret", "")
+        provider_kwargs["password"] = kwargs.get("password", "")
+        provider_kwargs["uid"] = kwargs.get("uid", "")
     elif name == "chart":
         provider_kwargs["bars"] = kwargs.get("bars", [])
         provider_kwargs["symbol"] = kwargs.get("symbol", "CHART")
@@ -659,6 +809,14 @@ def resolve_request_sources(
     opts = dict(source_options or {})
     feed = data_feed
     provider = data_provider
+    _dbg(
+        "resolve_request_sources symbol=%s data_source=%s have_feed=%s have_provider=%s chart_bars=%d",
+        symbol,
+        data_source,
+        feed is not None,
+        provider is not None,
+        len(chart_bars or []),
+    )
 
     if data_source:
         src = str(data_source).lower()
@@ -687,7 +845,14 @@ def resolve_request_sources(
 
     if provider is None and chart_bars:
         provider = ChartOHLCVProvider(chart_bars, symbol=symbol)
+        _dbg("resolve_request_sources: using ChartOHLCVProvider for %s (%d bars)", symbol, len(chart_bars))
+        _stats.count("provider.created", dim="chart")
 
+    _dbg(
+        "resolve_request_sources: resolved feed=%s provider=%s",
+        type(feed).__name__ if feed is not None else None,
+        type(provider).__name__ if provider is not None else None,
+    )
     return feed, provider
 
 
@@ -699,6 +864,9 @@ __all__ = [
     "DataProviderError",
     "MockDataProvider",
     "YahooFinanceProvider",
+    "geo_block_message",
     "get_provider",
+    "normalize_ccxt_symbol",
     "resolve_request_sources",
+    "tune_ccxt_public_urls",
 ]

@@ -81,6 +81,23 @@ if [[ -n "$PKG_VER" ]]; then
     fi
   done
   shopt -u nullglob
+  # Renaming alone leaves METADATA (and /health engine label drift) stale —
+  # keep the `Version:` line in lockstep with __about__.py.
+  for meta in "$ROOT"/python_modules/pynescript-*.dist-info/METADATA; do
+    [[ -f "$meta" ]] || continue
+    python3 - "$meta" "$PKG_VER" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+version = sys.argv[2]
+text = path.read_text()
+patched, hits = re.subn(r"(?m)^Version: .*$", f"Version: {version}", text, count=1)
+if hits and patched != text:
+    path.write_text(patched)
+PY
+  done
   echo "ok: dist-info version $PKG_VER"
 fi
 
@@ -89,6 +106,7 @@ need=(
   "$DEST/util/time_parts.py"
   "$DEST/compiler/engine.py"
   "$DEST/ast/helper.py"
+  "$DEST/runtime/host.py"
   "$DEST/__init__.py"
 )
 for f in "${need[@]}"; do

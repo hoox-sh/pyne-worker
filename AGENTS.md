@@ -1,6 +1,6 @@
 # pyne-worker — Agent Instructions
 
-Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package (engine ≥ 0.4.4: libraries, timeout, drawings).
+Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package (engine ≥ 0.6.12: libraries, timeout, drawings, windowing).
 
 ## Stack
 
@@ -56,6 +56,7 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 |---|---|
 | `src/entry.py` | Worker entry (`fetch` + `scheduled` cron) |
 | `src/handler.py` | HTTP routes: `/run`, `/scripts`, `/cron/*`, `/ingest` |
+| `src/window.py` | `/run` response windowing (`from_bar`/`to_bar`, Pro API parity) |
 | `src/scheduler.py` | Bar-close job runner |
 | `src/scripts_registry.py` | Deployed scripts + cron config in R2 |
 | `src/alert_engine.py` | Last-bar alert filter + summary helpers |
@@ -69,7 +70,7 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 - Runtime exports `alerts` on `/run` (pynescript `AlertsMixin`).
 - `POST /run` accepts `libraries: [{namespace, name, version, source}]` (pynescript 0.3.7+) so `import ns/Name/ver` resolves; also stored on deployed scripts for cron.
 - Cron keeps last closed-bar firings only; POSTs to job `webhook_url` or env `ALERT_WEBHOOK_URL`.
-- Webhook URLs must be **HTTPS public hosts** (`security.validate_webhook_url`) — private IPs / localhost rejected.
+- Webhook URLs must be **HTTPS public hosts** (`security.validate_webhook_url`) — private IPs / localhost rejected (including IPv4-mapped/6to4/decimal disguises); re-checked at POST time with redirects disabled (pynescript 0.6.6+ hardening).
 - Product docs: [hoox.sh/pyne/docs/runtime/alerts](https://hoox.sh/pyne/docs/runtime/alerts)
   (source: [hoox-sh/pyne](https://github.com/hoox-sh/pyne) → `docs/pyne/runtime/alerts.mdx`).
 

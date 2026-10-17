@@ -34,6 +34,8 @@ wire from Runtime / engine when dual-mode packing is enabled).
 
 from __future__ import annotations
 
+import math
+
 from collections import defaultdict
 from dataclasses import dataclass
 from sys import intern
@@ -46,6 +48,9 @@ from typing import Sequence
 
 from .base import BuiltinDispatchMixin
 from .base import BuiltinHandler
+from .plot_params import WIRE_PARAMS
+from .plot_params import extract_wire_meta
+
 
 # Hot-path constants (avoid attribute lookups + str() on defaults every bar)
 _LS_SOLID = "linestyle_solid"
@@ -69,7 +74,7 @@ DEFAULT_VISUAL_TITLES: dict[str, str] = {
 
 # Compile ``__drawings`` kinds that interpret exports as series + plot_meta.
 _VISUAL_SERIES_KINDS: frozenset[str] = frozenset(
-    {"bgcolor", "plotshape", "plotchar", "plotarrow"}
+    {"bgcolor", "barcolor", "plotshape", "plotchar", "plotarrow", "plotbar", "plotcandle"}
 )
 
 
@@ -166,15 +171,53 @@ def _visual_default_title(kind: str) -> str:
     return DEFAULT_VISUAL_TITLES.get(kind, kind or "plot")
 
 
+def _visual_color_str(value: Any) -> str | None:
+    """Best-effort JSON-safe color string from a compile drawing event value."""
+    cs: Any = value
+    if isinstance(value, bool):
+        cs = None
+    elif isinstance(value, int):
+        v = value & 0xFFFFFF
+        cs = f"#{v:06X}"
+    else:
+        fn = getattr(value, "to_rgba", None)
+        if callable(fn):
+            try:
+                cs = fn()
+            except Exception:
+                cs = None
+    if cs is None:
+        return None
+    s = str(cs).strip()
+    if not s or s.lower() == "nan":
+        return None
+    return s
+
+
+def _ohlc_num_cell(value: Any) -> Any:
+    """JSON-safe numeric OHLC sibling cell (NaN → None, never na→0)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(fv) else fv
+
+
 def _json_safe_visual_value(kind: str, event: Mapping[str, Any]) -> Any:
     """Extract one series cell from a compile drawing event (interpret semantics)."""
-    if kind == "bgcolor":
+    if kind in ("bgcolor", "barcolor"):
         color = event.get("color")
         if color is None:
             return None
         if isinstance(color, str):
             s = color.strip()
-            return s if s else None
+            if not s or s.lower() == "nan":
+                return None
+            return s
         # int 0xRRGGBB / objects → string when possible
         if isinstance(color, int):
             if color > 0xFFFFFF:
@@ -184,7 +227,27 @@ def _json_safe_visual_value(kind: str, event: Mapping[str, Any]) -> Any:
                 return f"#{r:02X}{g:02X}{b:02X}"
             return f"#{color & 0xFFFFFF:06X}"
         s = str(color).strip()
-        return s if s else None
+        if not s or s.lower() == "nan":
+            return None
+        return s
+
+    if kind in ("plotbar", "plotcandle"):
+        raw = event.get("close", event.get("arg3", event.get("series", event.get("value"))))
+        if raw is None:
+            return None
+        if isinstance(raw, bool):
+            return float(raw)
+        if isinstance(raw, (int, float)):
+            try:
+                fv = float(raw)
+                return None if fv != fv else fv
+            except (TypeError, ValueError):
+                return None
+        try:
+            fv = float(raw)
+            return None if fv != fv else fv
+        except (TypeError, ValueError):
+            return None
 
     # plotshape / plotchar / plotarrow — series condition / value.
     # Interpret exports True when the marker shows and None (na) when not —
@@ -306,7 +369,35 @@ def materialize_visual_series_from_drawings(
         color = ev.get("color")
         if color is not None and str(color).strip() != "":
             meta["color"] = str(color) if not isinstance(color, str) else color
-        sites.append({"key": key, "kind": kind, "meta": meta})
+        # Constant-folded wire params (compile events carry literals; dynamic
+        # per-bar values are skipped so interpret↔compile meta stay aligned).
+        wire_kw: dict[str, Any] = {}
+        for p in WIRE_PARAMS.get(kind, ()):
+            v = ev.get(p)
+            if isinstance(v, float) and (v != v or v in (math.inf, -math.inf)):
+                continue
+            if v is not None:
+                wire_kw[p] = v
+        if wire_kw:
+            meta.update(extract_wire_meta(kind, [], wire_kw))
+        site: dict[str, Any] = {"key": key, "kind": kind, "meta": meta}
+        if kind in ("plotbar", "plotcandle"):
+            # AXIS tier-2 OHLC siblings: close-primary parent + open/high/low refs
+            # (mirrors interpret capture; components never get standalone meta).
+            sibs: dict[str, str] = {}
+            for ck in ("open", "high", "low"):
+                sk = f"{key}.{ck}"
+                used.add(sk)
+                sibs[ck] = sk
+            site["siblings"] = sibs
+            meta["close"] = key
+            for ck, sk in sibs.items():
+                meta[ck] = sk
+            for cparam in ("wickcolor", "bordercolor"):
+                cs = _visual_color_str(ev.get(cparam))
+                if cs:
+                    meta[cparam] = cs
+        sites.append(site)
 
     if not sites:
         return series_map, plot_meta
@@ -314,6 +405,8 @@ def materialize_visual_series_from_drawings(
     for site in sites:
         series_map[site["key"]] = [None] * n_bars
         plot_meta[site["key"]] = dict(site["meta"])
+        for sk in site.get("siblings", {}).values():
+            series_map[sk] = [None] * n_bars
 
     # Fill columns: zip per-bar visual events with discovered sites by position
     # when counts match; otherwise match by running kind-order index.
@@ -331,6 +424,10 @@ def materialize_visual_series_from_drawings(
             ek = str(ev.get("kind") or kind)
             val = _json_safe_visual_value(ek, ev)
             series_map[site["key"]][bar] = val
+            sib = site.get("siblings")
+            if sib:
+                for ck, sk in sib.items():
+                    series_map[sk][bar] = _ohlc_num_cell(ev.get(ck))
             # Lazy first non-null color into meta
             if plot_meta[site["key"]].get("color") is None:
                 c = ev.get("color")
@@ -352,14 +449,19 @@ def merge_visual_series_from_drawings(
     Returns the same *series* mapping for chaining. When *plot_meta* is provided,
     new keys get meta entries (existing meta keys are left untouched).
     """
-    extra, meta = materialize_visual_series_from_drawings(
-        drawings, n_bars, existing_keys=series.keys()
-    )
+    extra, meta = materialize_visual_series_from_drawings(drawings, n_bars, existing_keys=series.keys())
     for key, col in extra.items():
         if key not in series:
             series[key] = col
             if plot_meta is not None and key not in plot_meta:
-                plot_meta[key] = meta[key]
+                mk_entry = meta.get(key)
+                if mk_entry is not None:
+                    plot_meta[key] = mk_entry
+        elif plot_meta is not None:
+            mk = (meta.get(key) or {}).get("kind")
+            entry = plot_meta.get(key)
+            if mk and entry is not None and entry.get("kind") in (None, "plot"):
+                entry["kind"] = mk
     return series  # type: ignore[return-value]
 
 
@@ -383,14 +485,21 @@ def _kw(
 def _as_str(v: Any, default: str = _EMPTY) -> str:
     if v is None:
         return default
-    if isinstance(v, str):
+    if type(v) is str:
         return v
     return str(v)
 
 
 def _as_int(v: Any, default: int = 0) -> int:
+    t = type(v)
+    if t is int:
+        return v
     if v is None:
         return default
+    if t is float:
+        if v != v:
+            return default
+        return int(v)
     try:
         return int(v)
     except (TypeError, ValueError):
@@ -486,6 +595,22 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
             "plot.style_circles": "style_circles",
         }
 
+    def _bar_reuse_plot(self) -> Plot | None:
+        """Return the call-site Plot on later bars, or None on first sighting.
+
+        Skips title/style/int coercions when the registry slot already exists.
+        """
+        if not getattr(self, "_pine_bar_mode", False):
+            return None
+        i = getattr(self, "_plot_call_i", 0) or 0
+        plots = PlotRegistry.plots
+        if i >= len(plots):
+            return None
+        self._plot_call_i = i + 1  # type: ignore[attr-defined]
+        p = plots[i]
+        p.deleted = False
+        return p
+
     def _upsert_simple_plot(
         self,
         series: Any,
@@ -496,9 +621,7 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
     ) -> Plot:
         """Positional ``plot()`` upsert — no per-bar kwargs dict."""
         if getattr(self, "_pine_bar_mode", False):
-            i = getattr(self, "_plot_call_i", 0)
-            if i is None:
-                i = 0
+            i = getattr(self, "_plot_call_i", 0) or 0
             self._plot_call_i = i + 1  # type: ignore[attr-defined]
             plots = PlotRegistry.plots
             if i < len(plots):
@@ -541,23 +664,24 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         so kind/title/style defaults do not need a full ``_fill_plot`` rewrite).
         """
         if getattr(self, "_pine_bar_mode", False):
-            # _plot_call_i is always an int in Runtime; avoid int() / or 0 each plot
-            i = getattr(self, "_plot_call_i", 0)
-            if i is None:
-                i = 0
+            # _plot_call_i is always an int in Runtime; avoid int() each plot
+            i = getattr(self, "_plot_call_i", 0) or 0
             self._plot_call_i = i + 1  # type: ignore[attr-defined]
             plots = PlotRegistry.plots
             if i < len(plots):
                 p = plots[i]
                 # Call-site kind/title/style are fixed after bar 0; only values change.
-                if "series" in fields:
-                    p.series = fields["series"]
-                if "color" in fields:
-                    p.color = fields["color"]
-                if "price" in fields:
-                    p.price = fields["price"]
-                    if "series" not in fields:
-                        p.series = fields["price"]
+                series = fields.get("series", _MISSING)
+                if series is not _MISSING:
+                    p.series = series
+                color = fields.get("color", _MISSING)
+                if color is not _MISSING:
+                    p.color = color
+                price = fields.get("price", _MISSING)
+                if price is not _MISSING:
+                    p.price = price
+                    if series is _MISSING:
+                        p.series = price
                 if "open" in fields:
                     p.open = fields["open"]
                     p.high = fields.get("high")
@@ -580,7 +704,27 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         return PlotRegistry.add(_fill_plot(Plot(), **fields))
 
     def _builtin_plot(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
-        """plot(series, title, color, …) → plot id (Plot object)."""
+        """plot(series, title, color, …) → plot id (Plot object).
+
+        Signature: plot(series, title, color, linewidth, style,
+            trackprice, histbase, offset, join, editable, show_last, display)
+        """
+        # Bar-mode reuse: series/color only — skip title/style/int coercions.
+        if getattr(self, "_pine_bar_mode", False):
+            i = getattr(self, "_plot_call_i", 0) or 0
+            plots = PlotRegistry.plots
+            if i < len(plots):
+                self._plot_call_i = i + 1  # type: ignore[attr-defined]
+                p = plots[i]
+                if kwargs:
+                    p.series = _kw(args, kwargs, "series", 0)
+                    p.color = _kw(args, kwargs, "color", 2)
+                else:
+                    p.series = args[0] if args else None
+                    p.color = args[2] if len(args) > 2 else None
+                p.deleted = False
+                return p
+
         # Fast path: plot(series) / plot(series, title, color, …) with no kwargs
         if not kwargs:
             series = args[0] if args else None
@@ -588,7 +732,7 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
             title = _as_str(args[1], _EMPTY) if n > 1 else _EMPTY
             color = args[2] if n > 2 else None
             style = _as_str(args[4], _EMPTY) if n > 4 else _EMPTY
-            linewidth = _as_int(args[5], 1) if n > 5 else 1
+            linewidth = _as_int(args[3], 1) if n > 3 else 1
             return self._upsert_simple_plot(series, title, color, style, linewidth)
 
         return self._plot_upsert(
@@ -597,7 +741,7 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
             title=_as_str(_kw(args, kwargs, "title", 1, _EMPTY), _EMPTY),
             color=_kw(args, kwargs, "color", 2),
             style=_as_str(_kw(args, kwargs, "style", 4, _EMPTY), _EMPTY),
-            linewidth=_as_int(_kw(args, kwargs, "linewidth", 5, 1), 1),
+            linewidth=_as_int(_kw(args, kwargs, "linewidth", 3, 1), 1),
             linestyle=_as_str(_kw(args, kwargs, "linestyle", None, _LS_SOLID), _LS_SOLID),
             text=_as_str(_kw(args, kwargs, "text", 12, _EMPTY), _EMPTY),
             text_size=_kw(args, kwargs, "text_size", 15, _AUTO),
@@ -606,6 +750,11 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_plotarrow(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.series = _kw(args, kwargs, "series", 0)
+            reused.color = _kw(args, kwargs, "color", 2)
+            return reused
         return self._plot_upsert(
             kind="plotarrow",
             series=_kw(args, kwargs, "series", 0),
@@ -616,6 +765,14 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_plotbar(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.open = _kw(args, kwargs, "open", 0)
+            reused.high = _kw(args, kwargs, "high", 1)
+            reused.low = _kw(args, kwargs, "low", 2)
+            reused.close = _kw(args, kwargs, "close", 3)
+            reused.color = _kw(args, kwargs, "color", 5)
+            return reused
         return self._plot_upsert(
             kind="plotbar",
             open=_kw(args, kwargs, "open", 0),
@@ -633,6 +790,15 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         meta = None
         if wick is not None or border is not None:
             meta = {"wickcolor": wick, "bordercolor": border}
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.open = _kw(args, kwargs, "open", 0)
+            reused.high = _kw(args, kwargs, "high", 1)
+            reused.low = _kw(args, kwargs, "low", 2)
+            reused.close = _kw(args, kwargs, "close", 3)
+            reused.color = _kw(args, kwargs, "color", 5)
+            reused.meta = meta
+            return reused
         return self._plot_upsert(
             kind="plotcandle",
             open=_kw(args, kwargs, "open", 0),
@@ -646,6 +812,16 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_plotchar(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        """Plot a character at the specified location on the chart.
+
+        Signature: plotchar(series, title, char, location, color, offset, text, text_size, editable, show_last, display)
+        """
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.series = _kw(args, kwargs, "series", 0)
+            reused.char = _as_str(_kw(args, kwargs, "char", 2, _EMPTY), _EMPTY)
+            reused.color = _kw(args, kwargs, "color", 4)
+            return reused
         return self._plot_upsert(
             kind="plotchar",
             series=_kw(args, kwargs, "series", 0),
@@ -659,6 +835,17 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_plotshape(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        """Plot shapes on the chart at the specified location.
+
+        Signature: plotshape(series, title, style, location, color,
+            offset, text, text_size, editable, show_last, display)
+        """
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.series = _kw(args, kwargs, "series", 0)
+            reused.color = _kw(args, kwargs, "color", 4)
+            reused.text = _as_str(_kw(args, kwargs, "text", None, _EMPTY), _EMPTY)
+            return reused
         return self._plot_upsert(
             kind="plotshape",
             series=_kw(args, kwargs, "series", 0),
@@ -673,6 +860,12 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_fill(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.plot1 = _kw(args, kwargs, "plot1", 0)
+            reused.plot2 = _kw(args, kwargs, "plot2", 1)
+            reused.color = _kw(args, kwargs, "color", 2)
+            return reused
         return self._plot_upsert(
             kind="fill",
             plot1=_kw(args, kwargs, "plot1", 0),
@@ -683,6 +876,14 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_bgcolor(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        """Set the chart background color.
+
+        Signature: bgcolor(color, offset, editable, show_last, title, display)
+        """
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.color = _kw(args, kwargs, "color", 0)
+            return reused
         return self._plot_upsert(
             kind="bgcolor",
             color=_kw(args, kwargs, "color", 0),
@@ -693,6 +894,14 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_barcolor(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        """Set the color of the chart bars.
+
+        Signature: barcolor(color, offset, editable, show_last, title, display)
+        """
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.color = _kw(args, kwargs, "color", 0)
+            return reused
         return self._plot_upsert(
             kind="barcolor",
             color=_kw(args, kwargs, "color", 0),
@@ -702,7 +911,17 @@ class PlottingFunctionsMixin(BuiltinDispatchMixin):
         )
 
     def _builtin_hline(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Plot:
+        """Draw a horizontal price level on the chart.
+
+        Signature: hline(price, title, color, linestyle, linewidth, editable, display)
+        """
         price = _kw(args, kwargs, "price", 0, 0.0)
+        reused = self._bar_reuse_plot()
+        if reused is not None:
+            reused.price = price
+            reused.series = price
+            reused.color = _kw(args, kwargs, "color", 2)
+            return reused
         return self._plot_upsert(
             kind="hline",
             price=price,

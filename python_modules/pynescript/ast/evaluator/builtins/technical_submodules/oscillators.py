@@ -42,6 +42,13 @@ class OscillatorIndicators(TechnicalHelpers):
 
     def _builtin_ta_rsi(self, args: list[Any]) -> float | None:
         """Relative Strength Index."""
+        if (
+            self._pine_ta_inc_cached is True
+            and len(args) == BINARY
+            and type(args[1]) is int
+            and args[1] > 0
+        ):
+            return self._rsi_inc_update(args[0], args[1])
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
         if self._use_incremental_ta():
             return self._rsi_inc_update(series, period)
@@ -57,6 +64,13 @@ class OscillatorIndicators(TechnicalHelpers):
         """
         if len(args) == UNARY and self._is_period_like(args[0]):
             length = self._expect_int(args[0], "ta.stoch length must be an integer")
+            if self._use_incremental_ta():
+                return self._stoch_k(
+                    self._context_source("close"),
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    length,
+                )
             source = self._context_series("close")
             highs = self._context_series("high")
             lows = self._context_series("low")
@@ -72,6 +86,13 @@ class OscillatorIndicators(TechnicalHelpers):
         # Two-arg community form sometimes used as (kLength, dPeriod) — return %K only
         if len(args) == BINARY and self._is_period_like(args[0]) and self._is_period_like(args[1]):
             length = self._expect_int(args[0], "ta.stoch length must be an integer")
+            if self._use_incremental_ta():
+                return self._stoch_k(
+                    self._context_source("close"),
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    length,
+                )
             source = self._context_series("close")
             highs = self._context_series("high")
             lows = self._context_series("low")
@@ -108,11 +129,13 @@ class OscillatorIndicators(TechnicalHelpers):
         if self._use_incremental_ta():
             return self._stoch_k_inc_update(source, highs, lows, length)
         n = len(source)
-        start = max(0, n - length)
+        if n < length:
+            return None
+        start = n - length
         window_h = [highs[i] for i in range(start, min(n, len(highs))) if highs[i] is not None]
         window_l = [lows[i] for i in range(start, min(n, len(lows))) if lows[i] is not None]
         c = source[-1]
-        if c is None or not window_h or not window_l:
+        if c is None or len(window_h) < length or len(window_l) < length:
             return None
         hh = max(window_h)
         ll = min(window_l)
@@ -156,16 +179,20 @@ class OscillatorIndicators(TechnicalHelpers):
         """
         if len(args) == UNARY and self._is_period_like(args[0]):
             period = self._expect_int(args[0], "ta.cci length must be int")
+            if self._use_incremental_ta():
+                highs = self._context_source("high")
+                lows = self._context_source("low")
+                closes = self._context_source("close")
+                if highs and lows and closes:
+                    return self._cci_inc_update(highs, lows, closes, period)
+                series = self._context_source("hlc3") or closes
+                return self._cci_inc_update(series, series, series, period)
             highs = self._context_series("high")
             lows = self._context_series("low")
             closes = self._context_series("close")
             if highs and lows and closes:
-                if self._use_incremental_ta():
-                    return self._cci_inc_update(highs, lows, closes, period)
                 return self._cci(highs, lows, closes, period)
             series = self._context_series("hlc3") or closes
-            if self._use_incremental_ta():
-                return self._cci_inc_update(series, series, series, period)
             return self._cci(series, series, series, period)
         if len(args) == BINARY:
             series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
@@ -195,11 +222,16 @@ class OscillatorIndicators(TechnicalHelpers):
         """Williams %R. reference Pine: ``ta.wpr(length)`` or legacy 4-arg form."""
         if len(args) == UNARY and self._is_period_like(args[0]):
             length = self._expect_int(args[0], "ta.wpr length must be int")
+            if self._use_incremental_ta():
+                return self._wpr_inc_update(
+                    self._context_source("high"),
+                    self._context_source("low"),
+                    self._context_source("close"),
+                    length,
+                )
             highs = self._context_series("high")
             lows = self._context_series("low")
             closes = self._context_series("close")
-            if self._use_incremental_ta():
-                return self._wpr_inc_update(highs, lows, closes, length)
             return self._wpr(highs, lows, closes, length)
         msg = "ta.wpr expects length (or high, low, close, length)"
         if len(args) != QUATERNARY:
@@ -223,21 +255,35 @@ class OscillatorIndicators(TechnicalHelpers):
             fast = self._expect_int(args[0], "ta.ao fast must be int")
         if len(args) >= 2 and self._is_period_like(args[1]):
             slow = self._expect_int(args[1], "ta.ao slow must be int")
-        hl2 = self._context_series("hl2")
-        if not hl2:
-            highs = self._context_series("high")
-            lows = self._context_series("low")
-            n = min(len(highs), len(lows)) if highs and lows else 0
-            hl2 = [(float(highs[i]) + float(lows[i])) / 2.0 for i in range(n)] if n else []
-        if len(hl2) < slow or slow <= 0 or fast <= 0:
+        if slow <= 0 or fast <= 0:
             return None
         if self._use_incremental_ta():
-            # Two independent SMA call sites (separate slots)
+            # Last-sample only — do not rebuild hl2 from high/low every bar.
+            hl2 = self._context_source("hl2")
+            if not hl2:
+                high_s = self._series_last(self._context_source("high"))
+                low_s = self._series_last(self._context_source("low"))
+                if high_s is None or low_s is None:
+                    return None
+                try:
+                    hl2 = (float(high_s) + float(low_s)) * 0.5
+                except (TypeError, ValueError):
+                    return None
             fast_v = self._sma_inc_update(hl2, fast)
             slow_v = self._sma_inc_update(hl2, slow)
         else:
-            fast_v = self._sma(hl2, fast)
-            slow_v = self._sma(hl2, slow)
+            hl2 = self._context_series("hl2")
+            if not hl2:
+                highs = self._context_series("high")
+                lows = self._context_series("low")
+                n = min(len(highs), len(lows)) if highs and lows else 0
+                hl2 = [(float(highs[i]) + float(lows[i])) / 2.0 for i in range(n)] if n else []
+            if len(hl2) < slow:
+                return None
+            fast_s = self._sma(hl2, fast)
+            slow_s = self._sma(hl2, slow)
+            fast_v = fast_s[-1] if fast_s else None
+            slow_v = slow_s[-1] if slow_s else None
         if fast_v is None or slow_v is None:
             return None
         try:
@@ -256,6 +302,12 @@ class OscillatorIndicators(TechnicalHelpers):
             length = self._expect_int(args[0], "ta.aroon length must be int")
         if length <= 0:
             return None
+        if self._use_incremental_ta():
+            return self._aroon_inc_update(
+                self._context_source("high"),
+                self._context_source("low"),
+                length,
+            )
         highs = self._context_series("high")
         lows = self._context_series("low")
         # Need length+1 bars of history for classic Aroon (window of length)
@@ -502,6 +554,9 @@ class OscillatorIndicators(TechnicalHelpers):
             msg = "DPO length must be >= 1"
             self._error(msg)
 
+        if self._use_incremental_ta():
+            return self._dpo_inc_update(self._context_source("close"), length)
+
         closes = (getattr(self, "current_series", None) or {}).get("close", [])
         if not closes or len(closes) < length:
             return None
@@ -529,6 +584,11 @@ class OscillatorIndicators(TechnicalHelpers):
         length2 = self._expect_int(args[1], "length2 must be integer")
         length3 = self._expect_int(args[2], "length3 must be integer")
         length4 = self._expect_int(args[3], "length4 must be integer")
+
+        if self._use_incremental_ta():
+            return self._kst_inc_update(
+                self._context_source("close"), length1, length2, length3, length4
+            )
 
         closes = (getattr(self, "current_series", None) or {}).get("close", [])
         if not closes:
@@ -562,37 +622,16 @@ class OscillatorIndicators(TechnicalHelpers):
         length2 = self._expect_int(args[1], "length2 must be integer")
         length3 = self._expect_int(args[2], "length3 must be integer")
 
-        closes = (getattr(self, "current_series", None) or {}).get("close", [])
-        highs = (getattr(self, "current_series", None) or {}).get("high", [])
-        lows = (getattr(self, "current_series", None) or {}).get("low", [])
-
-        if not closes or not highs or not lows or len(closes) < length3:
-            return None
-
-        max_len = max(length1, length2, length3)
-
-        # True Range and Buying Pressure
-        tr_sum = 0.0
-        bp_sum = 0.0
-        for i in range(len(closes) - max_len, len(closes)):
-            high_low = highs[i] - lows[i]
-            high_close = abs(highs[i] - closes[i - 1]) if i > 0 else high_low
-            low_close = abs(lows[i] - closes[i - 1]) if i > 0 else 0
-            tr = max(high_low, high_close, low_close)
-
-            bp = closes[i] - min(lows[i], closes[i - 1]) if i > 0 else 0
-            tr_sum += tr
-            bp_sum += bp
-
-        if tr_sum == 0:
-            return 0.0
-
-        avg1 = bp_sum / tr_sum
-        avg2 = bp_sum / tr_sum
-        avg3 = bp_sum / tr_sum
-
-        uo_val = 100.0 * ((avg1 * 4.0 + avg2 * 2.0 + avg3) / 7.0)
-        return uo_val
+        if self._use_incremental_ta():
+            return self._uo_inc_update(length1, length2, length3)
+        return self._uo_last(
+            self._context_series("high"),
+            self._context_series("low"),
+            self._context_series("close"),
+            length1,
+            length2,
+            length3,
+        )
 
     # Helper implementations
 
@@ -695,10 +734,10 @@ class OscillatorIndicators(TechnicalHelpers):
         lows: list[float],
         closes: list[float],
         period: int,
-    ) -> float:
+    ) -> float | None:
         """CCI calculation."""
         if period <= 0 or len(closes) < period:
-            return 0.0
+            return None
         typical_prices = [(high + low + close) / 3 for high, low, close in zip(highs, lows, closes, strict=True)]
         sma_values = self._sma(typical_prices, period)
         mean_devs: list[float | None] = []

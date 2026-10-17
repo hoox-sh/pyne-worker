@@ -65,6 +65,20 @@ def _export_num(v: Any) -> float | int | None:
         return None
 
 
+def _snapshot_scalar(v: Any) -> Any:
+    """Freeze a drawing coordinate so it does not track later-bar series.current.
+
+    ``line.new(bar_index, high, …)`` must store *this* bar's high. Leaving a
+    PineSeries / wrapper on the object makes ``export_for_api`` re-read
+    ``.current`` (last bar) and diverge from compile, which snapshots floats.
+    """
+    t = type(v)
+    if v is None or t is int or t is float or t is bool or t is str:
+        return v
+    snapped = _export_num(v)
+    return snapped if snapped is not None else v
+
+
 def _export_x_to_time(x: Any, xloc: str, times: list[int]) -> int | float | None:
     """Map drawing X to unix seconds (or bare bar_index when times unavailable).
 
@@ -187,6 +201,7 @@ class DrawingRegistry:
         cls.max_polylines_count = _DEFAULT_DRAWING_LIMIT
         # Also reset plot real effects
         from .plotting import PlotRegistry
+
         PlotRegistry.reset()
 
     @classmethod
@@ -200,21 +215,13 @@ class DrawingRegistry:
     ) -> None:
         """Set GC caps (None keeps the current value for that type)."""
         if max_lines_count is not None:
-            cls.max_lines_count = _clamp_drawing_limit(
-                max_lines_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES
-            )
+            cls.max_lines_count = _clamp_drawing_limit(max_lines_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES)
         if max_labels_count is not None:
-            cls.max_labels_count = _clamp_drawing_limit(
-                max_labels_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES
-            )
+            cls.max_labels_count = _clamp_drawing_limit(max_labels_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES)
         if max_boxes_count is not None:
-            cls.max_boxes_count = _clamp_drawing_limit(
-                max_boxes_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES
-            )
+            cls.max_boxes_count = _clamp_drawing_limit(max_boxes_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES)
         if max_polylines_count is not None:
-            cls.max_polylines_count = _clamp_drawing_limit(
-                max_polylines_count, hard_cap=_HARD_CAP_POLYLINES
-            )
+            cls.max_polylines_count = _clamp_drawing_limit(max_polylines_count, hard_cap=_HARD_CAP_POLYLINES)
         # If caps shrank, immediately collect
         cls.gc_all()
 
@@ -380,6 +387,57 @@ class DrawingRegistry:
                 deleted_ids.add(id(target))
                 target["deleted"] = True
                 continue
+            # table.cell(table_id, column, row, text, …) / table.cell_set_*
+            cell_method = method.lower().replace("table_cell_set_", "table.cell_set_")
+            cell_method = cell_method.replace("table_cell", "table.cell")
+            if cell_method == "table.cell" or "cell_set_" in cell_method:
+                cells = target.get("cells")
+                if not isinstance(cells, list):
+                    cells = []
+                    target["cells"] = cells
+
+                def _cell_int(v: Any, default: int = 0) -> int:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        return default
+
+                col = _cell_int(args[0] if len(args) > 0 else item.get("column", item.get("col", 0)))
+                row = _cell_int(args[1] if len(args) > 1 else item.get("row", 0))
+                cell: dict[str, Any] | None = None
+                for existing in cells:
+                    if not isinstance(existing, dict):
+                        continue
+                    if (
+                        _cell_int(existing.get("row", 0)) == row
+                        and _cell_int(existing.get("col", existing.get("column", 0))) == col
+                    ):
+                        cell = existing
+                        break
+                if cell is None:
+                    cell = {"row": row, "col": col, "text": ""}
+                    cells.append(cell)
+                if cell_method == "table.cell":
+                    text = args[2] if len(args) > 2 else item.get("text")
+                    if text is not None:
+                        cell["text"] = str(text)
+                    text_color = item.get("text_color")
+                    # Compile rest args omit table_id: text=2, text_color=5, bgcolor=9.
+                    if text_color is None and len(args) > 5:
+                        text_color = args[5]
+                    if text_color is not None:
+                        cell["text_color"] = text_color
+                    bgcolor = item.get("bgcolor")
+                    if bgcolor is None and len(args) > 9:
+                        bgcolor = args[9]
+                    if bgcolor is not None:
+                        cell["bgcolor"] = bgcolor
+                else:
+                    field = cell_method.split("cell_set_", 1)[-1]
+                    val = args[2] if len(args) > 2 else item.get(field)
+                    if val is not None:
+                        cell["text" if field == "text" else field] = str(val) if field == "text" else val
+                continue
             field = bare.split(".")[-1] if "." in bare else bare
             field = field.replace("set_", "")
             # Common mutators
@@ -466,9 +524,7 @@ class DrawingRegistry:
             "line": max(0, counts["line"] - int(lim.get("max_lines_count", _DEFAULT_DRAWING_LIMIT))),
             "box": max(0, counts["box"] - int(lim.get("max_boxes_count", _DEFAULT_DRAWING_LIMIT))),
             "label": max(0, counts["label"] - int(lim.get("max_labels_count", _DEFAULT_DRAWING_LIMIT))),
-            "polyline": max(
-                0, counts["polyline"] - int(lim.get("max_polylines_count", _DEFAULT_DRAWING_LIMIT))
-            ),
+            "polyline": max(0, counts["polyline"] - int(lim.get("max_polylines_count", _DEFAULT_DRAWING_LIMIT))),
         }
         if not any(skip.values()):
             return drawings
@@ -493,14 +549,7 @@ class DrawingRegistry:
         Used by Runtime to skip ``export_for_api`` and bar_times materialization.
         """
         # truthiness of a list is len != 0 — no iteration
-        return not (
-            cls.lines
-            or cls.boxes
-            or cls.labels
-            or cls.tables
-            or cls.polylines
-            or cls.linefills
-        )
+        return not (cls.lines or cls.boxes or cls.labels or cls.tables or cls.polylines or cls.linefills)
 
     @classmethod
     def export_for_api(cls, bar_times: list[int] | None = None) -> list[dict[str, Any]]:
@@ -511,14 +560,7 @@ class DrawingRegistry:
         Fast path: empty registry returns ``[]`` without allocating helpers or
         walking collections (most indicator scripts never draw).
         """
-        if not (
-            cls.lines
-            or cls.boxes
-            or cls.labels
-            or cls.tables
-            or cls.polylines
-            or cls.linefills
-        ):
+        if not (cls.lines or cls.boxes or cls.labels or cls.tables or cls.polylines or cls.linefills):
             return []
 
         out: list[dict[str, Any]] = []
@@ -580,6 +622,14 @@ class DrawingRegistry:
                     "width": int(_num(bx.border_width) or 1),
                     "text": str(bx.text or ""),
                     "force_overlay": bool(getattr(bx, "force_overlay", False)),
+                    "extend": _extend(bx.extend),
+                    "border_style": str(bx.border_style or "solid"),
+                    "text_color": _color(bx.text_color),
+                    "text_halign": str(bx.text_halign or "center"),
+                    "text_valign": str(bx.text_valign or "center"),
+                    "text_size": bx.text_size if isinstance(bx.text_size, (int, float)) else str(bx.text_size),
+                    "text_wrap": str(bx.text_wrap or "none"),
+                    "text_font_family": str(bx.text_font_family or "default"),
                 }
             )
 
@@ -611,6 +661,11 @@ class DrawingRegistry:
                     "style": str(lb.style or "label_center"),
                     "yloc": yloc_raw,
                     "size": size_raw if isinstance(size_raw, (int, float)) else str(size_raw),
+                    "tooltip": str(getattr(lb, "tooltip", "") or ""),
+                    "text_halign": str(lb.text_halign or "center"),
+                    "text_valign": str(lb.text_valign or "center"),
+                    "text_font_family": str(lb.text_font_family or "default"),
+                    "text_formatting": str(lb.text_formatting or ""),
                 }
             )
 
@@ -635,6 +690,10 @@ class DrawingRegistry:
                 pts_out.append({"time": t, "price": price})
             if len(pts_out) < 2:
                 continue
+            pl_extra: dict[str, Any] = {}
+            fill_c = getattr(pl, "fill_color", None)
+            if fill_c:
+                pl_extra["fill_color"] = _color(fill_c)
             out.append(
                 {
                     "type": "polyline",
@@ -643,6 +702,9 @@ class DrawingRegistry:
                     "color": _color(pl.color),
                     "width": int(_num(pl.width) or 1),
                     "style": str(pl.style or "solid"),
+                    "curved": bool(getattr(pl, "curved", False)),
+                    "force_overlay": bool(getattr(pl, "force_overlay", False)),
+                    **pl_extra,
                     "t1": pts_out[0]["time"],
                     "p1": pts_out[0]["price"],
                     "t2": pts_out[-1]["time"],
@@ -699,15 +761,24 @@ class DrawingRegistry:
                 continue
             cells: list[dict[str, Any]] = []
             for (row, col), cell in (getattr(tb, "cells", None) or {}).items():
-                cells.append(
-                    {
-                        "row": row,
-                        "col": col,
-                        "text": str(getattr(cell, "text", "") or ""),
-                        "text_color": _color(getattr(cell, "text_color", "#eceef4")),
-                        "bgcolor": _color(getattr(cell, "bgcolor", "transparent")),
-                    }
-                )
+                cell_out: dict[str, Any] = {
+                    "row": row,
+                    "col": col,
+                    "text": str(getattr(cell, "text", "") or ""),
+                    "text_color": _color(getattr(cell, "text_color", "#000000")),
+                    "bgcolor": _color(getattr(cell, "bgcolor", "rgba(255,255,255,255)")),
+                    "text_halign": str(getattr(cell, "text_halign", "center") or "center"),
+                    "text_valign": str(getattr(cell, "text_valign", "center") or "center"),
+                    "text_size": getattr(cell, "text_size", "auto") or "auto",
+                    "tooltip": str(getattr(cell, "tooltip", "") or ""),
+                }
+                width = getattr(cell, "width", None)
+                height = getattr(cell, "height", None)
+                if width is not None:
+                    cell_out["width"] = width
+                if height is not None:
+                    cell_out["height"] = height
+                cells.append(cell_out)
             pos = str(getattr(tb, "position", "top_right") or "top_right")
             pos = pos.replace("position.", "")
             out.append(
@@ -717,13 +788,322 @@ class DrawingRegistry:
                     "rows": int(getattr(tb, "rows", 0) or 0),
                     "columns": int(getattr(tb, "columns", 0) or 0),
                     "cells": cells,
-                    "frame_color": _color(getattr(tb, "frame_color", "#3a3d4a")),
-                    "bgcolor": _color(getattr(tb, "bgcolor", "rgba(17,18,24,0.92)")),
+                    "frame_color": _color(getattr(tb, "frame_color", "#000000")),
+                    "frame_width": int(getattr(tb, "frame_width", 1) or 1),
+                    "border_color": _color(getattr(tb, "border_color", "#000000")),
+                    "border_width": int(getattr(tb, "border_width", 1) or 1),
+                    "bgcolor": _color(getattr(tb, "bgcolor", "rgba(255,255,255,255)")),
+                    "force_overlay": bool(getattr(tb, "force_overlay", False)),
+                    "merged_cells": [[m[0], m[1], m[2], m[3]] for m in getattr(tb, "merged", ())],
                     "t1": 0,
                     "p1": 0,
-                    "color": _color(getattr(tb, "frame_color", "#939fff")),
+                    "color": _color(getattr(tb, "frame_color", "#000000")),
                 }
             )
+
+        return out
+
+    # Compile ``__drawings`` kinds that are plot/visual events, not geometry.
+    # Interpret ``export_for_api`` never emits these (they live in series).
+    _COMPILE_VISUAL_KINDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "hline",
+            "fill",
+            "bgcolor",
+            "barcolor",
+            "plotshape",
+            "plotchar",
+            "plotarrow",
+            "plotbar",
+            "plotcandle",
+            "plot",
+        }
+    )
+
+    @classmethod
+    def export_compile_events_for_api(
+        cls,
+        events: list[dict[str, Any]] | list[Any] | None,
+        bar_times: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Normalize folded compile drawing events to interpret ``export_for_api`` shape.
+
+        Drops visual/plot events (hline / fill / bgcolor / plotshape / …) so
+        Runtime ``drawings`` is geometry-only on both hosts. AXIS fields
+        (``type``, ``t1``, ``p1``, …) use the same bar-index → time mapping.
+        """
+        if not events:
+            return []
+        times = bar_times if bar_times is not None else []
+        _num = _export_num
+        _x_to_time = _export_x_to_time
+        _color = _export_color
+        _extend = _export_extend
+        out: list[dict[str, Any]] = []
+
+        def _xloc_of(item: dict[str, Any]) -> str:
+            xloc = str(item.get("xloc") or "bar_index")
+            if xloc.startswith("#") or xloc.startswith("rgb"):
+                return "bar_index"
+            return xloc.replace("xloc.", "") or "bar_index"
+
+        def _point_pair(pt: Any) -> tuple[Any, Any] | None:
+            if pt is None:
+                return None
+            if isinstance(pt, dict):
+                price = _num(pt.get("price", pt.get("y")))
+                if price is None:
+                    return None
+                if pt.get("time") is not None and _num(pt.get("time")) is not None:
+                    t = _num(pt.get("time"))
+                elif pt.get("index") is not None:
+                    t = _x_to_time(pt.get("index"), "bar_index", times)
+                elif pt.get("x") is not None:
+                    t = _x_to_time(pt.get("x"), "bar_index", times)
+                else:
+                    t = None
+                if t is None:
+                    return None
+                return t, price
+            price = _num(getattr(pt, "price", None))
+            if price is None:
+                return None
+            if getattr(pt, "time", None) is not None:
+                t = _num(pt.time)
+            elif getattr(pt, "index", None) is not None:
+                t = _x_to_time(pt.index, "bar_index", times)
+            else:
+                t = None
+            if t is None:
+                return None
+            return t, price
+
+        for item in events:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or item.get("kind") or "").lower()
+            if kind in cls._COMPILE_VISUAL_KINDS or kind in ("set", "delete"):
+                continue
+            if item.get("deleted"):
+                continue
+
+            if kind == "line":
+                xloc = _xloc_of(item)
+                t1 = _x_to_time(item.get("x1"), xloc, times)
+                t2 = _x_to_time(item.get("x2"), xloc, times)
+                y1 = _num(item.get("y1"))
+                y2 = _num(item.get("y2"))
+                if t1 is None or t2 is None or y1 is None or y2 is None:
+                    continue
+                out.append(
+                    {
+                        "type": "line",
+                        "t1": t1,
+                        "p1": y1,
+                        "t2": t2,
+                        "p2": y2,
+                        "color": _color(item.get("color") or "#000000"),
+                        "width": int(_num(item.get("width")) or 1),
+                        "style": str(item.get("style") or "solid").replace("line.style_", ""),
+                        "extend": _extend(item.get("extend")),
+                        "force_overlay": bool(item.get("force_overlay", False)),
+                    }
+                )
+                continue
+
+            if kind == "box":
+                xloc = _xloc_of(item)
+                t1 = _x_to_time(item.get("left"), xloc, times)
+                t2 = _x_to_time(item.get("right"), xloc, times)
+                top = _num(item.get("top"))
+                bottom = _num(item.get("bottom"))
+                if t1 is None or t2 is None or top is None or bottom is None:
+                    continue
+                border = item.get("border_color", item.get("color"))
+                out.append(
+                    {
+                        "type": "box",
+                        "t1": t1,
+                        "p1": top,
+                        "t2": t2,
+                        "p2": bottom,
+                        "color": _color(border),
+                        "bgcolor": _color(item.get("bgcolor")) if item.get("bgcolor") else "rgba(0,0,0,0)",
+                        "width": int(_num(item.get("border_width", item.get("width"))) or 1),
+                        "text": str(item.get("text") or ""),
+                        "force_overlay": bool(item.get("force_overlay", False)),
+                        "extend": _extend(item.get("extend")),
+                        "border_style": str(item.get("border_style", item.get("borderStyle", "solid")) or "solid"),
+                        "text_color": _color(item.get("text_color", item.get("textColor", "#000000"))),
+                        "text_halign": str(item.get("text_halign", item.get("halign", "center")) or "center"),
+                        "text_valign": str(item.get("text_valign", item.get("valign", "center")) or "center"),
+                        "text_size": item.get("text_size", item.get("textSize", "auto")) or "auto",
+                        "text_wrap": str(item.get("text_wrap", item.get("textWrap", "none")) or "none"),
+                        "text_font_family": str(
+                            item.get("text_font_family", item.get("fontFamily", "default")) or "default"
+                        ),
+                    }
+                )
+                continue
+
+            if kind == "label":
+                xloc = _xloc_of(item)
+                t = _x_to_time(item.get("x"), xloc, times)
+                y = _num(item.get("y"))
+                if t is None or y is None:
+                    continue
+                size_raw = item.get("size", item.get("text_size"))
+                if size_raw is None or size_raw == "" or size_raw == "auto":
+                    size_raw = "auto"
+                yloc_raw = str(item.get("yloc") or "price")
+                if yloc_raw.startswith("#") or yloc_raw.startswith("rgb"):
+                    yloc_raw = "price"
+                out.append(
+                    {
+                        "type": "label",
+                        "force_overlay": bool(item.get("force_overlay", False)),
+                        "t1": t,
+                        "p1": y,
+                        "text": str(item.get("text") or ""),
+                        "color": _color(item.get("color") or "#000000"),
+                        "textcolor": _color(item.get("textcolor", item.get("text_color")) or "#000000"),
+                        "style": str(item.get("style") or "label_center"),
+                        "yloc": yloc_raw,
+                        "size": size_raw if isinstance(size_raw, (int, float)) else str(size_raw),
+                        "tooltip": str(item.get("tooltip") or ""),
+                        "text_halign": str(item.get("text_halign", item.get("halign", "center")) or "center"),
+                        "text_valign": str(item.get("text_valign", item.get("valign", "center")) or "center"),
+                        "text_font_family": str(
+                            item.get("text_font_family", item.get("fontFamily", "default")) or "default"
+                        ),
+                        "text_formatting": str(item.get("text_formatting", item.get("formatting", "")) or ""),
+                    }
+                )
+                continue
+
+            if kind == "polyline":
+                xloc = _xloc_of(item)
+                raw_pts = item.get("points", item.get("arg0"))
+                pts_out: list[dict[str, float | int]] = []
+                if isinstance(raw_pts, list):
+                    for pt in raw_pts:
+                        pair = _point_pair(pt)
+                        if pair is not None:
+                            pts_out.append({"time": pair[0], "price": pair[1]})
+                if len(pts_out) < 2:
+                    continue
+                closed = item.get("closed", item.get("arg1", False))
+                out.append(
+                    {
+                        "type": "polyline",
+                        "points": pts_out,
+                        "closed": bool(closed),
+                        "color": _color(item.get("color") or "#000000"),
+                        "width": int(_num(item.get("width")) or 1),
+                        "style": str(item.get("style") or "solid"),
+                        "curved": bool(item.get("curved", False)),
+                        "force_overlay": bool(item.get("force_overlay", item.get("forceOverlay", False))),
+                        "t1": pts_out[0]["time"],
+                        "p1": pts_out[0]["price"],
+                        "t2": pts_out[-1]["time"],
+                        "p2": pts_out[-1]["price"],
+                    }
+                )
+                if item.get("fill_color"):
+                    out[-1]["fill_color"] = _color(item.get("fill_color"))
+                continue
+
+            if kind == "linefill":
+                l1 = item.get("line1", item.get("arg0"))
+                l2 = item.get("line2", item.get("arg1"))
+                if not isinstance(l1, dict) or not isinstance(l2, dict):
+                    continue
+                if l1.get("deleted") or l2.get("deleted"):
+                    continue
+                xloc1 = _xloc_of(l1)
+                xloc2 = _xloc_of(l2)
+                t1 = _x_to_time(l1.get("x1"), xloc1, times)
+                t2 = _x_to_time(l1.get("x2"), xloc1, times)
+                p1 = _num(l1.get("y1"))
+                p2 = _num(l1.get("y2"))
+                t3 = _x_to_time(l2.get("x1"), xloc2, times)
+                t4 = _x_to_time(l2.get("x2"), xloc2, times)
+                p3 = _num(l2.get("y1"))
+                p4 = _num(l2.get("y2"))
+                if None in (t1, t2, p1, p2, t3, t4, p3, p4):
+                    continue
+                fill_color = item.get("color")
+                out.append(
+                    {
+                        "type": "linefill",
+                        "t1": t1,
+                        "p1": p1,
+                        "t2": t2,
+                        "p2": p2,
+                        "t3": t3,
+                        "p3": p3,
+                        "t4": t4,
+                        "p4": p4,
+                        "color": _color(fill_color),
+                        "bgcolor": _color(fill_color),
+                    }
+                )
+                continue
+
+            if kind == "table":
+                pos = str(item.get("position", item.get("arg0", "top_right")) or "top_right")
+                pos = pos.replace("position.", "")
+                rows = item.get("rows", item.get("arg1", 0))
+                cols = item.get("columns", item.get("arg2", 0))
+                try:
+                    rows_i = int(rows or 0)
+                except (TypeError, ValueError):
+                    rows_i = 0
+                try:
+                    cols_i = int(cols or 0)
+                except (TypeError, ValueError):
+                    cols_i = 0
+                cells_raw = item.get("cells") or []
+                cells: list[dict[str, Any]] = []
+                if isinstance(cells_raw, list):
+                    for cell in cells_raw:
+                        if isinstance(cell, dict):
+                            cell_out: dict[str, Any] = {
+                                "row": cell.get("row", 0),
+                                "col": cell.get("col", cell.get("column", 0)),
+                                "text": str(cell.get("text") or ""),
+                                "text_color": _color(cell.get("text_color", cell.get("textColor", "#000000"))),
+                                "bgcolor": _color(cell.get("bgcolor", "rgba(255,255,255,255)")),
+                                "text_halign": str(cell.get("text_halign", cell.get("halign", "center")) or "center"),
+                                "text_valign": str(cell.get("text_valign", cell.get("valign", "center")) or "center"),
+                                "text_size": cell.get("text_size", cell.get("textSize", "auto")) or "auto",
+                                "tooltip": str(cell.get("tooltip") or ""),
+                            }
+                            if cell.get("width") is not None:
+                                cell_out["width"] = cell.get("width")
+                            if cell.get("height") is not None:
+                                cell_out["height"] = cell.get("height")
+                            cells.append(cell_out)
+                frame = item.get("frame_color", item.get("color", "#000000"))
+                out.append(
+                    {
+                        "type": "table",
+                        "position": pos,
+                        "rows": rows_i,
+                        "columns": cols_i,
+                        "cells": cells,
+                        "frame_color": _color(frame),
+                        "frame_width": int(item.get("frame_width", item.get("frameWidth", 1)) or 1),
+                        "border_color": _color(item.get("border_color", item.get("borderColor", "#000000"))),
+                        "border_width": int(item.get("border_width", item.get("borderWidth", 1)) or 1),
+                        "bgcolor": _color(item.get("bgcolor", "rgba(255,255,255,255)")),
+                        "force_overlay": bool(item.get("force_overlay", item.get("forceOverlay", False))),
+                        "merged_cells": list(item.get("merged_cells", item.get("mergedCells", [])) or []),
+                        "t1": 0,
+                        "p1": 0,
+                        "color": _color(frame),
+                    }
+                )
 
         return out
 
@@ -812,6 +1192,7 @@ class Table:
     bgcolor: str = "rgba(255,255,255,255)"
     force_overlay: bool = False  # v6
     cells: dict[tuple[int, int], TableCell] = field(default_factory=dict)
+    merged: list[tuple[int, int, int, int]] = field(default_factory=list)
     deleted: bool = False
 
 
@@ -997,6 +1378,7 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
             "table.set_frame_width": self._handle_table_set_frame_width,
             # Linefill
             "linefill.new": self._handle_linefill_new,
+            "line.fill": self._handle_linefill_new,
             "linefill.delete": self._handle_linefill_delete,
             "linefill.set_color": self._handle_linefill_set_color,
             "linefill.get_line1": self._handle_linefill_get_line1,
@@ -1077,7 +1459,18 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
             color = xloc
             xloc = "bar_index"
 
-        line = Line(x1, y1, x2, y2, str(xloc), color, width, style, extend, force_overlay=bool(force_overlay))
+        line = Line(
+            _snapshot_scalar(x1),
+            _snapshot_scalar(y1),
+            _snapshot_scalar(x2),
+            _snapshot_scalar(y2),
+            str(xloc),
+            color,
+            width,
+            style,
+            extend,
+            force_overlay=bool(force_overlay),
+        )
         return DrawingRegistry.add_line(line)
 
     def _handle_line_delete(self, args: list[Any]) -> None:
@@ -1100,28 +1493,28 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         """line.set_x1(line, x1)"""
         line = args[0] if len(args) > 0 else None
         if isinstance(line, Line):
-            line.x1 = args[1] if len(args) > 1 else line.x1
+            line.x1 = _snapshot_scalar(args[1]) if len(args) > 1 else line.x1
         return line
 
     def _handle_line_set_y1(self, args: list[Any]) -> Line:
         """line.set_y1(line, y1)"""
         line = args[0] if len(args) > 0 else None
         if isinstance(line, Line):
-            line.y1 = args[1] if len(args) > 1 else line.y1
+            line.y1 = _snapshot_scalar(args[1]) if len(args) > 1 else line.y1
         return line
 
     def _handle_line_set_x2(self, args: list[Any]) -> Line:
         """line.set_x2(line, x2)"""
         line = args[0] if len(args) > 0 else None
         if isinstance(line, Line):
-            line.x2 = args[1] if len(args) > 1 else line.x2
+            line.x2 = _snapshot_scalar(args[1]) if len(args) > 1 else line.x2
         return line
 
     def _handle_line_set_y2(self, args: list[Any]) -> Line:
         """line.set_y2(line, y2)"""
         line = args[0] if len(args) > 0 else None
         if isinstance(line, Line):
-            line.y2 = args[1] if len(args) > 1 else line.y2
+            line.y2 = _snapshot_scalar(args[1]) if len(args) > 1 else line.y2
         return line
 
     def _handle_line_set_extend(self, args: list[Any]) -> Line:
@@ -1209,12 +1602,17 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         force_overlay = kw.get("force_overlay", args[11] if len(args) > 11 else False)
         text = kw.get("text", "")
         text_color = kw.get("text_color", "#000000")
+        text_halign = kw.get("text_halign", "center")
+        text_valign = kw.get("text_valign", "center")
+        text_size = kw.get("text_size", "auto")
+        text_font_family = kw.get("text_font_family", "default")
+        text_wrap = kw.get("text_wrap", "none")
 
         box = Box(
-            left,
-            top,
-            right,
-            bottom,
+            _snapshot_scalar(left),
+            _snapshot_scalar(top),
+            _snapshot_scalar(right),
+            _snapshot_scalar(bottom),
             str(xloc),
             bool(closed),
             bgcolor,
@@ -1224,6 +1622,15 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
             extend,
             text=str(text) if text is not None else "",
             text_color=str(text_color) if text_color is not None else "#000000",
+            text_font_family=str(text_font_family) if text_font_family is not None else "default",
+            text_halign=str(text_halign) if text_halign is not None else "center",
+            text_valign=str(text_valign) if text_valign is not None else "center",
+            text_size=text_size
+            if isinstance(text_size, (int, float))
+            else str(text_size)
+            if text_size is not None
+            else "auto",
+            text_wrap=str(text_wrap) if text_wrap is not None else "none",
             force_overlay=bool(force_overlay),
         )
         return DrawingRegistry.add_box(box)
@@ -1258,28 +1665,28 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         """box.set_left(box, left)"""
         box = args[0] if len(args) > 0 else None
         if isinstance(box, Box):
-            box.left = args[1] if len(args) > 1 else box.left
+            box.left = _snapshot_scalar(args[1]) if len(args) > 1 else box.left
         return box
 
     def _handle_box_set_right(self, args: list[Any]) -> Box:
         """box.set_right(box, right)"""
         box = args[0] if len(args) > 0 else None
         if isinstance(box, Box):
-            box.right = args[1] if len(args) > 1 else box.right
+            box.right = _snapshot_scalar(args[1]) if len(args) > 1 else box.right
         return box
 
     def _handle_box_set_top(self, args: list[Any]) -> Box:
         """box.set_top(box, top)"""
         box = args[0] if len(args) > 0 else None
         if isinstance(box, Box):
-            box.top = args[1] if len(args) > 1 else box.top
+            box.top = _snapshot_scalar(args[1]) if len(args) > 1 else box.top
         return box
 
     def _handle_box_set_bottom(self, args: list[Any]) -> Box:
         """box.set_bottom(box, bottom)"""
         box = args[0] if len(args) > 0 else None
         if isinstance(box, Box):
-            box.bottom = args[1] if len(args) > 1 else box.bottom
+            box.bottom = _snapshot_scalar(args[1]) if len(args) > 1 else box.bottom
         return box
 
     def _handle_box_set_bgcolor(self, args: list[Any]) -> Box:
@@ -1449,8 +1856,8 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
 
         # Keyword ctor — `size` sits before `tooltip`/`style` in the dataclass.
         label = Label(
-            x=x,
-            y=y,
+            x=_snapshot_scalar(x),
+            y=_snapshot_scalar(y),
             text=str(text or ""),
             xloc=str(xloc or "bar_index"),
             yloc=str(yloc or "price"),
@@ -1506,22 +1913,22 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         """label.set_xy(label, x, y)"""
         label = args[0] if len(args) > 0 else None
         if isinstance(label, Label):
-            label.x = args[1] if len(args) > 1 else label.x
-            label.y = args[2] if len(args) > 2 else label.y
+            label.x = _snapshot_scalar(args[1]) if len(args) > 1 else label.x
+            label.y = _snapshot_scalar(args[2]) if len(args) > 2 else label.y
         return label
 
     def _handle_label_set_x(self, args: list[Any]) -> Label:
         """label.set_x(label, x)"""
         label = args[0] if len(args) > 0 else None
         if isinstance(label, Label):
-            label.x = args[1] if len(args) > 1 else label.x
+            label.x = _snapshot_scalar(args[1]) if len(args) > 1 else label.x
         return label
 
     def _handle_label_set_y(self, args: list[Any]) -> Label:
         """label.set_y(label, y)"""
         label = args[0] if len(args) > 0 else None
         if isinstance(label, Label):
-            label.y = args[1] if len(args) > 1 else label.y
+            label.y = _snapshot_scalar(args[1]) if len(args) > 1 else label.y
         return label
 
     def _handle_label_set_text(self, args: list[Any]) -> Label:
@@ -1660,22 +2067,32 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
 
     # TABLE HANDLERS
 
-    def _handle_table_new(self, args: list[Any]) -> Table:
-        """table.new(position, rows, columns, ...)"""
-        position = args[0] if len(args) > 0 else "top_left"
-        rows = args[1] if len(args) > 1 else 0
-        columns = args[2] if len(args) > 2 else 0
-        frame_color = args[3] if len(args) > 3 else "#000000"
-        frame_width = args[4] if len(args) > 4 else 1
-        border_color = args[5] if len(args) > 5 else "#000000"
-        border_width = args[6] if len(args) > 6 else 1
-        bgcolor = args[7] if len(args) > 7 else "rgba(255,255,255,255)"
-        force_overlay = args[8] if len(args) > 8 else False
+    def _handle_table_new(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Table:
+        """table.new(position, columns, rows, bgcolor, frame_color, ...).
+
+        Positional order matches Pine: columns then rows, then bgcolor.
+        """
+        kw = kwargs or {}
+        position = kw.get("position", args[0] if len(args) > 0 else "top_left")
+        columns = kw.get("columns", args[1] if len(args) > 1 else 0)
+        rows = kw.get("rows", args[2] if len(args) > 2 else 0)
+        bgcolor = kw.get("bgcolor", args[3] if len(args) > 3 else "rgba(255,255,255,255)")
+        frame_color = kw.get("frame_color", args[4] if len(args) > 4 else "#000000")
+        frame_width = kw.get("frame_width", args[5] if len(args) > 5 else 1)
+        border_color = kw.get("border_color", args[6] if len(args) > 6 else "#000000")
+        border_width = kw.get("border_width", args[7] if len(args) > 7 else 1)
+        force_overlay = kw.get("force_overlay", args[8] if len(args) > 8 else False)
 
         table = Table(
-            position, rows, columns, frame_color, frame_width,
-            border_color, border_width, bgcolor,
-            force_overlay=force_overlay
+            position,
+            rows,
+            columns,
+            frame_color,
+            frame_width,
+            border_color,
+            border_width,
+            bgcolor,
+            force_overlay=force_overlay,
         )
         return DrawingRegistry.add_table(table)
 
@@ -1697,9 +2114,19 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         column = kw.get("column", args[1] if len(args) > 1 else 0)
         row = kw.get("row", args[2] if len(args) > 2 else 0)
         text = kw.get("text", args[3] if len(args) > 3 else None)
+        # Reference order (v5 and v6 agree): width=4 height=5 text_color=6
+        # halign=7 valign=8 size=9 bgcolor=10 tooltip=11, plus v6
+        # text_font_family=12 text_formatting=13.
+        width = kw.get("width", args[4] if len(args) > 4 else None)
+        height = kw.get("height", args[5] if len(args) > 5 else None)
         text_color = kw.get("text_color", args[6] if len(args) > 6 else None)
+        text_halign = kw.get("text_halign", args[7] if len(args) > 7 else None)
+        text_valign = kw.get("text_valign", args[8] if len(args) > 8 else None)
+        text_size = kw.get("text_size", args[9] if len(args) > 9 else None)
         bgcolor = kw.get("bgcolor", args[10] if len(args) > 10 else None)
         tooltip = kw.get("tooltip", args[11] if len(args) > 11 else None)
+        text_font_family = kw.get("text_font_family", args[12] if len(args) > 12 else None)
+        text_formatting = kw.get("text_formatting", args[13] if len(args) > 13 else None)
 
         try:
             col_i = int(column)
@@ -1720,6 +2147,20 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
                 cell.bgcolor = str(bgcolor)
             if tooltip is not None:
                 cell.tooltip = str(tooltip)
+            if width is not None:
+                cell.width = width
+            if height is not None:
+                cell.height = height
+            if text_halign is not None:
+                cell.text_halign = str(text_halign)
+            if text_valign is not None:
+                cell.text_valign = str(text_valign)
+            if text_size is not None:
+                cell.text_size = text_size if isinstance(text_size, (int, float)) else str(text_size)
+            if text_font_family is not None:
+                cell.text_font_family = str(text_font_family)
+            if text_formatting is not None:
+                cell.text_formatting = str(text_formatting)
             return cell
         return TableCell()
 
@@ -1800,18 +2241,53 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
                 return table.cells[key].text
         return ""
 
+    def _table_cell_index(self, value: Any) -> int | None:
+        """Coerce a table row/column to int; ``na`` / non-numeric → ``None``."""
+        if value is None:
+            return None
+        current = getattr(value, "current", None)
+        if current is not None and not isinstance(value, (int, float, bool)):
+            value = current
+        if value is None:
+            return None
+        try:
+            if isinstance(value, float) and value != value:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _handle_table_clear(self, args: list[Any]) -> None:
         """table.clear(table, start_row, start_col, end_row, end_col)"""
         table = args[0] if len(args) > 0 else None
 
-        if isinstance(table, Table):
+        if not isinstance(table, Table):
+            return
+        if len(args) < 5:
             table.cells.clear()
+            return
+        coords = [self._table_cell_index(a) for a in args[1:5]]
+        if any(c is None for c in coords):
+            return
+        r0, c0, r1, c1 = coords
+        for key in [k for k in table.cells if r0 <= k[0] <= r1 and c0 <= k[1] <= c1]:
+            del table.cells[key]
 
     def _handle_table_merge_cells(self, args: list[Any]) -> None:
         """table.merge_cells(table, start_row, start_col, end_row, end_col)"""
-        # Mock implementation - in real Pine Script this would merge cells
-        # For now, we just register the merge without doing anything special
-        pass
+        table = args[0] if len(args) > 0 else None
+        if not isinstance(table, Table) or len(args) < 5:
+            return
+        coords = [self._table_cell_index(a) for a in args[1:5]]
+        if any(c is None for c in coords):
+            return
+        r0, c0, r1, c1 = coords
+        if r1 < r0 or c1 < c0:
+            return
+        for er0, ec0, er1, ec1 in table.merged:
+            if not (r1 < er0 or er1 < r0 or c1 < ec0 or ec1 < c0):
+                return  # overlap → soft-ignore (Pine errors; we drop silently)
+        table.merged.append((r0, c0, r1, c1))
 
     # CHART POINT HANDLERS
 
@@ -1851,9 +2327,7 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
         except (TypeError, ValueError):
             return None
 
-    def _handle_chart_point_from_time(
-        self, args: list[Any], kwargs: dict[str, Any] | None = None
-    ) -> ChartPoint | None:
+    def _handle_chart_point_from_time(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> ChartPoint | None:
         """chart.point.from_time(time, price) - Create a point from timestamp and price"""
         kw = kwargs or {}
         time = kw.get("time", args[0] if len(args) > 0 else None)
@@ -2045,12 +2519,12 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
     def _handle_line_set_xy1(self, args: list[Any]) -> None:
         line = args[0] if args else None
         if isinstance(line, Line) and len(args) >= 3:
-            line.x1, line.y1 = args[1], args[2]
+            line.x1, line.y1 = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
 
     def _handle_line_set_xy2(self, args: list[Any]) -> None:
         line = args[0] if args else None
         if isinstance(line, Line) and len(args) >= 3:
-            line.x2, line.y2 = args[1], args[2]
+            line.x2, line.y2 = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
 
     def _handle_line_set_first_point(self, args: list[Any]) -> None:
         """line.set_first_point(id, point) where point is ChartPoint."""
@@ -2070,12 +2544,12 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
     def _handle_box_set_lefttop(self, args: list[Any]) -> None:
         box = args[0] if args else None
         if isinstance(box, Box) and len(args) >= 3:
-            box.left, box.top = args[1], args[2]
+            box.left, box.top = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
 
     def _handle_box_set_rightbottom(self, args: list[Any]) -> None:
         box = args[0] if args else None
         if isinstance(box, Box) and len(args) >= 3:
-            box.right, box.bottom = args[1], args[2]
+            box.right, box.bottom = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
 
     def _handle_box_set_top_left_point(self, args: list[Any]) -> None:
         box = args[0] if args else None
@@ -2227,6 +2701,12 @@ class DrawingBuiltinsMixin(BuiltinDispatchMixin):
             table.frame_width = int(args[1])
 
     def _handle_linefill_new(self, args: list[Any]) -> LineFill:
+        """Fill the region between two lines.
+
+        Signature: linefill.new(line1, line2, color)
+
+        ``line.fill`` is an alias of ``linefill.new``.
+        """
         line1 = args[0] if len(args) > 0 else None
         line2 = args[1] if len(args) > 1 else None
         color = args[2] if len(args) > 2 else "rgba(0,0,0,0)"

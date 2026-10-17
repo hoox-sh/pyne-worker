@@ -82,12 +82,47 @@ def sanitize_timeframe(timeframe: str | None) -> str | None:
     return tf
 
 
+def _parse_literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse a hostname that is itself an IP (dotted, IPv6, or decimal IPv4).
+
+    Decimal (``2130706433``) is the spelled-out form of ``127.0.0.1`` that
+    ``urlparse``/``ip_address`` do not normalize — mirror the Pro API's
+    hardening so it cannot smuggle a private target past the literal check.
+    """
+    if not host:
+        return None
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    if not host.isdigit():
+        return None
+    try:
+        return ipaddress.IPv4Address(int(host))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _unwrap_ip(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Unwrap IPv4-mapped / 6to4 so ``::ffff:127.0.0.1`` reads as loopback."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            return mapped
+        sixtofour = ip.sixtofour
+        if sixtofour is not None:
+            return sixtofour
+    return ip
+
+
 def is_blocked_ip(host: str) -> bool:
     """True if *host* is a literal IP in a non-public range (SSRF surface)."""
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
+    ip = _parse_literal_ip(host)
+    if ip is None:
         return False
+    ip = _unwrap_ip(ip)
     return bool(
         ip.is_private
         or ip.is_loopback
@@ -107,7 +142,8 @@ def validate_webhook_url(url: str | None, *, allow_http: bool = False) -> str | 
       - Scheme ``https`` (or ``http`` only when *allow_http* — tests only)
       - No credentials in netloc (``user:pass@host``)
       - Hostname required; not a blocked name / ``*.local`` / ``*.internal``
-      - Literal private / loopback / link-local / metadata IPs rejected
+      - Literal private / loopback / link-local / metadata IPs rejected,
+        including IPv4-mapped/6to4 IPv6 and decimal IPv4 spellings
 
     Returns the stripped URL on success, else ``None``.
     """

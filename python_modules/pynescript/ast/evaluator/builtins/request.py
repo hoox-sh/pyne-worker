@@ -45,7 +45,9 @@ from .base import BuiltinDispatchMixin
 from .base import BuiltinHandler
 from .timeframe import SECONDS_PER_MONTH
 from .timeframe import _chart_period
+from .timeframe import timeframe_calendar_id
 from .timeframe import timeframe_in_seconds
+from .timeframe import timeframe_is_calendar_tf
 from .timeframe import timeframes_equivalent
 
 
@@ -96,22 +98,39 @@ _FUNDAMENTAL_TOKENS = ("DIVIDEND", "FACTSET", "EARNINGS", "ESD_")
 # Allowlisted simple ta.* forms for HTF resample (no arbitrary AST re-eval).
 # Matched only when the security expression *AST* is exactly one of these shapes
 # (visit_Call attaches :class:`HtfSimpleTaExpr` before chart pre-eval wins).
-_HTF_SIMPLE_TA_FUNCS = frozenset({"sma", "ema", "rsi", "atr"})
+_HTF_SIMPLE_TA_FUNCS = frozenset({"sma", "ema", "rsi", "atr", "wma", "rma"})
 
 _LOG = logging.getLogger("pynescript.request.security")
 
 # Static product notes exposed on Runtime ``meta.request_security``.
 _SECURITY_POLICY_NOTES: tuple[str, ...] = (
     "No multi-timeframe expression re-eval engine: HTF complex UDF/nested ta results are na.",
-    "barmerge.gaps_on / gaps_off are accepted but unused (no gap-fill / na-gap series).",
-    "barmerge.lookahead_on / lookahead_off are accepted but unused (no lookahead offset).",
+    "barmerge.gaps_on / gaps_off honored on HTF resample paths (na-gap series on bucket starts); "
+    "still unused on passthrough / provider / complex-na paths.",
+    "barmerge.lookahead_on / lookahead_off honored on HTF resample paths "
+    "(historical bars see each HTF bucket's final value from the period start); "
+    "still unused on passthrough / provider / complex-na paths.",
     "Same-symbol simple OHLCV on a coarser TF resamples chart bars by timestamp "
-    "(htf_ohlcv_resample, last completed HTF bar only — not full expression re-eval).",
-    "Same-symbol allowlisted ta.sma/ema/rsi/atr on coarser TF runs the TA helper on "
+    "(htf_ohlcv_resample, last completed HTF bar by default — not full expression re-eval).",
+    "Same-symbol allowlisted ta.sma/ema/rsi/atr/wma/rma on coarser TF runs the TA helper on "
     "resampled HTF bars (htf_simple_ta_resample) — still not a full multi-TF engine.",
-    "LTF / unparseable TF / history offsets still use chart passthrough stub when simple.",
+    "Same-symbol history offsets such as close[1] resample the previous HTF bar "
+    "(htf_ohlcv_offset); LTF / unparseable TF still use the chart passthrough stub.",
     "Foreign symbols without a multi-symbol feed hit return na (no mock invent under host chart).",
 )
+
+
+@dataclass(frozen=True)
+class HtfOffsetExpr:
+    """Bare OHLCV history offset for HTF resample (``close[1]``).
+
+    Produced by :func:`match_htf_offset_ast` when ``request.security``'s
+    expression is ``close[1]`` / ``high[1]`` / … so the offset is taken on
+    unique HTF bars rather than the chart series.
+    """
+
+    field: str
+    offset: int
 
 
 @dataclass(frozen=True)
@@ -123,7 +142,7 @@ class HtfSimpleTaExpr:
     Nested sources, UDFs, and non-constant lengths are rejected.
     """
 
-    name: str  # sma | ema | rsi | atr
+    name: str  # sma | ema | rsi | atr | wma | rma
     source: str | None  # normalized OHLCV field; None for atr (uses h/l/c)
     length: int
 
@@ -150,9 +169,9 @@ def match_htf_simple_ta_ast(expr_ast: Any) -> HtfSimpleTaExpr | None:  # noqa: P
 
     Allowed shapes (positional args only, no kwargs):
 
-    - ``ta.sma(close, 14)`` / ``ta.ema`` / ``ta.rsi`` — source is a bare OHLCV
-      name (``close``, ``open``, ``high``, ``low``, ``volume``, ``hl2``, …);
-      length is a positive integer literal.
+    - ``ta.sma(close, 14)`` / ``ta.ema`` / ``ta.rsi`` / ``ta.wma`` / ``ta.rma``
+      — source is a bare OHLCV name (``close``, ``open``, ``high``, ``low``,
+      ``volume``, ``hl2``, …); length is a positive integer literal.
     - ``ta.atr(14)`` — length-only form (uses HTF high/low/close).
 
     Nested calls (``ta.sma(ta.ema(...), n)``), multi-arg atr, variables as
@@ -174,7 +193,7 @@ def match_htf_simple_ta_ast(expr_ast: Any) -> HtfSimpleTaExpr | None:  # noqa: P
         length = _const_positive_int(arg_nodes[0].value) if len(arg_nodes) == 1 else None
         return HtfSimpleTaExpr("atr", None, length) if length else None
 
-    # sma / ema / rsi: (source_name, length)
+    # sma / ema / rsi / wma / rma: (source_name, length)
     if len(arg_nodes) != 2:  # noqa: PLR2004 - fixed allowlist arity
         return None
     src_node = arg_nodes[0].value
@@ -185,6 +204,23 @@ def match_htf_simple_ta_ast(expr_ast: Any) -> HtfSimpleTaExpr | None:  # noqa: P
     if src is None or length is None:
         return None
     return HtfSimpleTaExpr(name=fname, source=src, length=length)
+
+
+def match_htf_offset_ast(expr_ast: Any) -> HtfOffsetExpr | None:
+    """Match ``close[1]``-style OHLCV history offset for HTF resample."""
+    if type(expr_ast) is not ast_mod.Subscript:
+        return None
+    value = expr_ast.value
+    if type(value) is not ast_mod.Name:
+        return None
+    field = _OHLCV_FIELD_ALIASES.get(str(value.id).strip().lower())
+    if field is None:
+        return None
+    offset = _const_positive_int(expr_ast.slice)
+    if offset is None:
+        return None
+    return HtfOffsetExpr(field=field, offset=offset)
+
 
 @dataclass
 class VolumeRow:
@@ -662,7 +698,12 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
 
     def _infer_chart_bar_seconds(self) -> float | None:
         """Median positive delta of chart bar times (seconds), if available."""
-        times = self._series_chrono_values("time")
+        times = None
+        full = getattr(self, "_htf_full_ohlcv", None)
+        if isinstance(full, dict):
+            times = full.get("time")
+        if times is None or len(times) < 2:
+            times = self._series_chrono_values("time")
         if len(times) < 2:
             return None
         deltas: list[float] = []
@@ -688,11 +729,106 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
             return med / 1000.0
         return med
 
+    def _chart_bar_index(self) -> int:
+        """Current chart bar index from host context (0 if missing)."""
+        ctx = getattr(self, "context", None) or {}
+        try:
+            raw = ctx.get("bar_index", 0) if isinstance(ctx, dict) else 0
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _htf_timezone(self) -> object:
+        """Host ``syminfo.timezone`` for calendar HTF buckets (UTC fallback)."""
+        getter = getattr(self, "_syminfo_host", None)
+        sym = getter() if callable(getter) else None
+        if sym is None:
+            ctx = getattr(self, "context", None) or {}
+            sym = ctx.get("syminfo") if isinstance(ctx, dict) else None
+        tz = getattr(sym, "timezone", None) if sym is not None else None
+        return tz if tz else "UTC"
+
+    def _htf_tf_spec(self, timeframe: Any) -> tuple[Any, ...] | None:
+        """Resample spec: ``('cal', tf, tz)`` or ``('ms', bucket_ms)``, else None."""
+        tf_s = "" if timeframe is None else str(timeframe).strip()
+        if isinstance(timeframe, list):
+            tf_s = str(timeframe[-1]).strip() if timeframe else ""
+        if not tf_s:
+            return None
+        if timeframe_is_calendar_tf(tf_s):
+            return ("cal", tf_s, str(self._htf_timezone() or "UTC"))
+        bucket_ms = self._request_tf_bucket_ms(tf_s)
+        if bucket_ms is None:
+            return None
+        return ("ms", int(bucket_ms))
+
+    @staticmethod
+    def _htf_cache_fingerprint(  # noqa: PLR0913
+        n: int,
+        times: list[Any],
+        opens: list[Any],
+        highs: list[Any],
+        lows: list[Any],
+        closes: list[Any],
+    ) -> tuple[Any, ...]:
+        """Cache identity: length plus first/last bar so in-place ticks invalidate."""
+
+        def _at(seq: list[Any], idx: int, default: float = 0.0) -> float:
+            if not seq or idx >= len(seq) or idx < -len(seq):
+                return default
+            try:
+                return float(seq[idx])
+            except (TypeError, ValueError):
+                return default
+
+        last = n - 1
+        return (
+            n,
+            _at(times, 0),
+            _at(times, last),
+            _at(opens, last),
+            _at(highs, last),
+            _at(lows, last),
+            _at(closes, last),
+        )
+
+    def _htf_source_lists(self) -> tuple[list[Any], ...] | None:
+        """OHLCV+time lists for HTF resample (full host columns when attached)."""
+        full = getattr(self, "_htf_full_ohlcv", None)
+        if isinstance(full, dict) and full.get("open") is not None:
+            opens = full.get("open") or []
+            if not opens:
+                return None
+            n = len(opens)
+            highs = full.get("high") or []
+            lows = full.get("low") or []
+            closes = full.get("close") or []
+            volumes = full.get("volume") or []
+            times = full.get("time") or []
+            if len(times) < n:
+                base = float(times[-1]) if times else 0.0
+                times = list(times) + [base + (i + 1) * 60_000.0 for i in range(n - len(times))]
+            return opens, highs, lows, closes, volumes, times
+        opens = self._series_chrono_values("open")
+        if not opens:
+            return None
+        n = len(opens)
+        highs = self._series_chrono_values("high")
+        lows = self._series_chrono_values("low")
+        closes = self._series_chrono_values("close")
+        volumes = self._series_chrono_values("volume")
+        times = self._series_chrono_values("time")
+        if len(times) < n:
+            base = float(times[-1]) if times else 0.0
+            times = list(times) + [base + (i + 1) * 60_000.0 for i in range(n - len(times))]
+        return opens, highs[:n], lows[:n], closes[:n], volumes[:n], times[:n]
+
     def _request_tf_bucket_ms(self, timeframe: Any) -> int | None:
         """Fixed-size HTF bucket width in ms, or None if unusable for resample.
 
         Monthly (and coarser approximate) TFs are skipped — calendar months are
         not fixed-ms buckets. Empty TF means chart TF (no resample).
+        Bare ``D``/``W``/``M`` use calendar ids via :meth:`_htf_tf_spec` instead.
         """
         req_tf = timeframe
         if isinstance(req_tf, list):
@@ -710,8 +846,27 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
             return None
         return sec * 1000
 
-    def _request_is_higher_tf(self, timeframe: Any) -> bool:
+    def _request_is_higher_tf(self, timeframe: Any) -> bool:  # noqa: C901, PLR0911
         """True when *timeframe* is coarser than chart bars (inferred or declared)."""
+        tf_s = "" if timeframe is None else str(timeframe).strip()
+        if isinstance(timeframe, list):
+            tf_s = str(timeframe[-1]).strip() if timeframe else ""
+        if timeframe_is_calendar_tf(tf_s):
+            rank = {"D": 1, "1D": 1, "W": 2, "1W": 2, "M": 3, "1M": 3}
+            cal_sec = {1: 86_400.0, 2: 604_800.0, 3: 2_592_000.0}.get(rank.get(tf_s, 0), 86_400.0)
+            chart_sec = self._infer_chart_bar_seconds()
+            if chart_sec is not None and chart_sec > 0:
+                return cal_sec > chart_sec * _HTF_BAR_SEC_MARGIN
+            chart_tf = str(_chart_period(self) or "").strip()
+            if timeframe_is_calendar_tf(chart_tf):
+                return rank.get(tf_s, 0) > rank.get(chart_tf, 0)
+            try:
+                declared = float(timeframe_in_seconds(chart_tf))
+            except (TypeError, ValueError):
+                return True
+            if declared <= 0:
+                return True
+            return cal_sec > declared * _HTF_BAR_SEC_MARGIN
         bucket_ms = self._request_tf_bucket_ms(timeframe)
         if bucket_ms is None:
             return False
@@ -730,9 +885,9 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
     def _identify_simple_ohlcv_field(self, expression: Any) -> str | None:
         """Map *expression* to a bare OHLCV field name when identity-known.
 
-        Returns ``None`` for history offsets (``high[1]`` → float), complex
-        UDF results, and ambiguous scalar matches — those stay on the chart
-        passthrough stub path rather than inventing HTF structure.
+        Returns ``None`` for complex UDF results and ambiguous scalar matches.
+        History offsets such as ``close[1]`` are intercepted as ``HtfOffsetExpr``
+        before this helper sees a pre-eval float.
         """
         if isinstance(expression, str):
             return _OHLCV_FIELD_ALIASES.get(expression.strip().lower())
@@ -795,7 +950,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
             return (o + h + l + c) * 0.25
         return float("nan")
 
-    def _build_htf_completed_series(
+    def _build_htf_completed_series(  # noqa: C901, PLR0912, PLR0913, PLR0915
         self,
         bucket_ms: int,
         n: int,
@@ -805,15 +960,22 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         closes: list[Any],
         volumes: list[Any],
         times: list[Any],
-    ) -> list[dict[str, float] | None]:
+        period_id_fn: Any | None = None,
+    ) -> tuple[list[dict[str, float] | None], list[dict[str, float] | None]]:
         """Per chart bar: last *completed* HTF OHLCV agg (lookahead_off-style).
 
         Forming HTF bar is never returned. Bars before the first HTF close →
         ``None`` (caller maps to ``na``).
+
+        Returns ``(completed, forming)``: ``forming[i]`` is a snapshot copy of
+        the still-open HTF bucket as of chart bar ``i`` (``None`` before the
+        first chart bar opens a bucket). ``lookahead_on`` later copies each
+        bucket's final snapshot onto every bar in that bucket.
         """
         na_out: list[dict[str, float] | None] = [None] * n
-        if n == 0 or bucket_ms <= 0:
-            return na_out
+        forming_out: list[dict[str, float] | None] = [None] * n
+        if n == 0 or (period_id_fn is None and bucket_ms <= 0):
+            return na_out, forming_out
 
         def _f(v: Any, default: float = float("nan")) -> float:
             try:
@@ -831,11 +993,22 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                 t_ms = float(t_raw)
             except (TypeError, ValueError):
                 na_out[i] = completed
+                forming_out[i] = dict(forming) if forming is not None else None
                 continue
             # Accept Unix seconds (rare) by scaling into ms range.
             if t_ms > 0 and t_ms < 1e11:
                 t_ms *= 1000.0
-            b = int(t_ms) // bucket_ms * bucket_ms
+            if period_id_fn is not None:
+                try:
+                    b = period_id_fn(t_ms)
+                except Exception:
+                    b = None
+                if b is None:
+                    na_out[i] = completed
+                    forming_out[i] = dict(forming) if forming is not None else None
+                    continue
+            else:
+                b = int(t_ms) // bucket_ms * bucket_ms
             o = _f(opens[i] if i < len(opens) else None)
             h = _f(highs[i] if i < len(highs) else None)
             l = _f(lows[i] if i < len(lows) else None)
@@ -853,6 +1026,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                     "time": float(b),
                 }
                 na_out[i] = None
+                forming_out[i] = dict(forming)
                 continue
 
             if b == forming_bucket and forming is not None:
@@ -867,6 +1041,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                         v if v == v else 0.0
                     )
                 na_out[i] = completed
+                forming_out[i] = dict(forming)
                 continue
 
             # New HTF bucket: previous forming bar completes (lookahead_off).
@@ -881,59 +1056,194 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                 "time": float(b),
             }
             na_out[i] = completed
+            forming_out[i] = dict(forming)
 
-        return na_out
+        return na_out, forming_out
 
-    def _htf_ohlcv_series_for_tf(self, bucket_ms: int) -> list[dict[str, float] | None] | None:
-        """Cached last-completed HTF agg per chart bar for *bucket_ms*."""
-        opens = self._series_chrono_values("open")
-        if not opens:
+    @staticmethod
+    def _htf_finalize_bucket_tails(
+        forming_out: list[dict[str, float] | None],
+    ) -> list[dict[str, float] | None]:
+        """Copy each bucket's last snapshot onto every chart bar in that bucket.
+
+        Historical ``lookahead_on`` must leak the HTF bar's final value from
+        the period start (not the developing-as-of-this-bar agg).
+        """
+        n = len(forming_out)
+        i = 0
+        while i < n:
+            snap = forming_out[i]
+            if snap is None:
+                i += 1
+                continue
+            try:
+                t_key = float(snap.get("time"))
+            except (TypeError, ValueError, AttributeError):
+                i += 1
+                continue
+            j = i + 1
+            last = snap
+            while j < n:
+                nxt = forming_out[j]
+                if nxt is None:
+                    break
+                try:
+                    if float(nxt.get("time")) != t_key:
+                        break
+                except (TypeError, ValueError, AttributeError):
+                    break
+                last = nxt
+                j += 1
+            final = dict(last)
+            for k in range(i, j):
+                forming_out[k] = final
+            i = j
+        return forming_out
+
+    def _htf_ohlcv_series_for_tf(self, spec: Any) -> list[dict[str, float] | None] | None:
+        """Cached last-completed HTF agg per chart bar for *spec*."""
+        entry = self._htf_bucket_cache_entry(spec)
+        if entry is None:
             return None
-        n = len(opens)
-        highs = self._series_chrono_values("high")
-        lows = self._series_chrono_values("low")
-        closes = self._series_chrono_values("close")
-        volumes = self._series_chrono_values("volume")
-        times = self._series_chrono_values("time")
-        if len(times) < n:
-            # Pad synthetic 1m steps if time series is short (should not happen
-            # under Runtime host once bar_index advances with time_update).
-            base = float(times[-1]) if times else 0.0
-            times = list(times) + [base + (i + 1) * 60_000.0 for i in range(n - len(times))]
-        times = times[:n]
+        return entry.get("series")  # type: ignore[return-value]
 
+    def _htf_forming_series_for_tf(self, spec: Any) -> list[dict[str, float] | None] | None:
+        """Cached HTF forming series (bucket tails finalized for lookahead_on)."""
+        entry = self._htf_bucket_cache_entry(spec)
+        if entry is None:
+            return None
+        return entry.get("forming")  # type: ignore[return-value]
+
+    def _htf_bucket_cache_entry(self, spec: Any) -> dict[str, Any] | None:
+        """Shared (completed, forming) HTF bucket cache entry for *spec*."""
+        src = self._htf_source_lists()
+        if src is None:
+            return None
+        opens, highs, lows, closes, volumes, times = src
+        n = len(opens)
+        fp = self._htf_cache_fingerprint(n, times, opens, highs, lows, closes)
         cache = getattr(self, "_htf_ohlcv_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             self._htf_ohlcv_cache = cache  # type: ignore[attr-defined]
-        key = int(bucket_ms)
+        if isinstance(spec, tuple):
+            key: Any = spec
+        else:
+            try:
+                key = ("ms", int(spec))
+            except (TypeError, ValueError):
+                key = spec
         entry = cache.get(key)
-        if isinstance(entry, dict) and entry.get("n") == n and entry.get("series") is not None:
-            return entry["series"]  # type: ignore[return-value]
-        series = self._build_htf_completed_series(
-            bucket_ms, n, opens, highs, lows, closes, volumes, times
-        )
-        cache[key] = {"n": n, "series": series}
-        return series
+        if (
+            isinstance(entry, dict)
+            and entry.get("fp") == fp
+            and entry.get("series") is not None
+            and entry.get("forming") is not None
+        ):
+            return entry
+        bucket_ms = 0
+        period_id_fn = None
+        if isinstance(key, tuple) and key and key[0] == "cal":
+            tf_s = str(key[1])
+            tz = key[2] if len(key) > 2 else "UTC"
 
-    def _try_htf_ohlcv_resample(self, expression: Any, timeframe: Any) -> Any | None:
+            def period_id_fn(t_ms: float, _tf: str = tf_s, _tz: object = tz) -> int | None:
+                return timeframe_calendar_id(t_ms, _tf, _tz)
+
+        elif isinstance(key, tuple) and key and key[0] == "ms":
+            bucket_ms = int(key[1])
+        else:
+            bucket_ms = int(spec)
+        series, forming = self._build_htf_completed_series(
+            bucket_ms, n, opens, highs, lows, closes, volumes, times, period_id_fn=period_id_fn
+        )
+        self._htf_finalize_bucket_tails(forming)
+        entry = {"fp": fp, "n": n, "series": series, "forming": forming}
+        cache[key] = entry
+        return entry
+
+    def _htf_bar_is_bucket_start(
+        self,
+        series: list[dict[str, float] | None],
+        *,
+        lookahead_on: bool = False,
+        forming: list[dict[str, float] | None] | None = None,
+        index: int | None = None,
+    ) -> bool:
+        """True when the current chart bar opens a new HTF bucket.
+
+        ``lookahead_off`` uses completed-bucket starts; ``lookahead_on`` uses
+        forming-bucket starts (including bar 0 of the first period).
+        """
+        src = forming if lookahead_on and forming is not None else series
+        i = self._chart_bar_index() if index is None else int(index)
+        if i < 0 or i >= len(src):
+            return False
+        last = src[i]
+        if last is None:
+            return False
+        if i == 0:
+            return True
+        prev = src[i - 1]
+        if prev is None:
+            return True
+        try:
+            return float(prev.get("time")) != float(last.get("time"))
+        except (TypeError, ValueError, AttributeError):
+            return True
+
+    def _select_htf_agg(
+        self, spec: Any, series: list[dict[str, float] | None], *, gaps_on: bool, lookahead_on: bool
+    ) -> dict[str, float] | None:
+        """Pick the HTF agg for the current bar under the merge flags.
+
+        ``lookahead_on`` reads the bucket's final agg (historical leak from
+        period start); ``gaps_on`` keeps it only on bucket-start bars.
+        """
+        i = self._chart_bar_index()
+        agg = series[i] if series and 0 <= i < len(series) else None
+        forming = None
+        if lookahead_on:
+            forming = self._htf_forming_series_for_tf(spec)
+            if forming is not None and 0 <= i < len(forming) and forming[i] is not None:
+                agg = forming[i]
+        if gaps_on and not self._htf_bar_is_bucket_start(series, lookahead_on=lookahead_on, forming=forming, index=i):
+            agg = None
+        return agg
+
+    def _try_htf_ohlcv_resample(
+        self, expression: Any, timeframe: Any, *, gaps_on: bool = False, lookahead_on: bool = False
+    ) -> Any | None:
         """Resample chart OHLCV to HTF for simple series fields, or None.
 
-        Semantics: **last completed HTF bar only** (lookahead_off-style). Gaps
-        and lookahead args remain unused. Complex expressions are not re-eval'd.
+        Merge behavior (reference barmerge, resample paths only):
+
+        - ``lookahead_off`` (default): **last completed** HTF bar only.
+        - ``lookahead_on``: each HTF bucket's **final** agg, visible from the
+          period start on historical bars (TV lookahead bias). Unconfirmed
+          realtime ticks rebuild from the updated last bar.
+        - ``gaps_on``: value only on the first chart bar of an HTF bucket,
+          ``na`` elsewhere. Composes with ``lookahead_on`` (value on
+          forming-bucket starts, including bar 0 of the first period).
+
+        Complex expressions are not re-eval'd.
         """
+        if isinstance(expression, HtfOffsetExpr):
+            return self._try_htf_offset_resample(expression, timeframe, gaps_on=gaps_on, lookahead_on=lookahead_on)
         if not self._request_is_higher_tf(timeframe):
             return None
-        bucket_ms = self._request_tf_bucket_ms(timeframe)
-        if bucket_ms is None:
+        spec = self._htf_tf_spec(timeframe)
+        if spec is None:
             return None
         fields = self._identify_simple_ohlcv_fields(expression)
         if not fields:
             return None
-        series = self._htf_ohlcv_series_for_tf(bucket_ms)
+        series = self._htf_ohlcv_series_for_tf(spec)
         if not series:
             return None
-        agg = series[-1] if series else None
+        agg = self._select_htf_agg(spec, series, gaps_on=gaps_on, lookahead_on=lookahead_on)
+        if gaps_on or lookahead_on:
+            self._mark_security_merge_applied(gaps_on=gaps_on, lookahead_on=lookahead_on)
         na = float("nan")
         if len(fields) == 1 and not isinstance(expression, (list, tuple)):
             if agg is None:
@@ -946,15 +1256,55 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         vals = [self._htf_agg_field(agg, f) for f in fields]
         return vals if isinstance(expression, list) else tuple(vals)
 
-    def _htf_unique_and_map(
-        self, bucket_ms: int
-    ) -> tuple[list[dict[str, float]], list[int | None]] | None:
-        """Unique completed HTF bars + per-chart-bar index into that list.
+    def _try_htf_offset_resample(
+        self,
+        expression: HtfOffsetExpr,
+        timeframe: Any,
+        *,
+        gaps_on: bool = False,
+        lookahead_on: bool = False,
+    ) -> Any | None:
+        """Resample ``close[1]`` (etc.) on unique HTF bars, not the chart series."""
+        if not self._request_is_higher_tf(timeframe):
+            return None
+        spec = self._htf_tf_spec(timeframe)
+        if spec is None:
+            return None
+        built = self._htf_unique_and_map(spec, lookahead_on=lookahead_on)
+        if built is None:
+            return None
+        unique, chart_to_htf = built
+        i = self._chart_bar_index()
+        if i < 0 or i >= len(chart_to_htf):
+            return None
+        hidx = chart_to_htf[i]
+        na = float("nan")
+        if gaps_on and not self._htf_ta_is_bucket_start(chart_to_htf, index=i):
+            self._mark_security_merge_applied(gaps_on=True, lookahead_on=lookahead_on)
+            return na
+        if hidx is None:
+            if gaps_on or lookahead_on:
+                self._mark_security_merge_applied(gaps_on=gaps_on, lookahead_on=lookahead_on)
+            return na
+        src_idx = int(hidx) - int(expression.offset)
+        if src_idx < 0 or src_idx >= len(unique):
+            if gaps_on or lookahead_on:
+                self._mark_security_merge_applied(gaps_on=gaps_on, lookahead_on=lookahead_on)
+            return na
+        if gaps_on or lookahead_on:
+            self._mark_security_merge_applied(gaps_on=gaps_on, lookahead_on=lookahead_on)
+        return self._htf_agg_field(unique[src_idx], expression.field)
 
-        Index ``None`` means no completed HTF bar yet at that chart bar
-        (lookahead_off forming bucket).
+    def _htf_unique_and_map(
+        self, spec: Any, *, lookahead_on: bool = False
+    ) -> tuple[list[dict[str, float]], list[int | None]] | None:
+        """Unique HTF bars + per-chart-bar index into that list.
+
+        ``lookahead_off`` uses last-completed aggs. ``lookahead_on`` uses
+        finalized forming buckets so every bar in a period maps to that
+        period's final HTF bar. Index ``None`` means no HTF bar yet.
         """
-        series = self._htf_ohlcv_series_for_tf(bucket_ms)
+        series = self._htf_forming_series_for_tf(spec) if lookahead_on else self._htf_ohlcv_series_for_tf(spec)
         if not series:
             return None
         unique: list[dict[str, float]] = []
@@ -977,9 +1327,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
             chart_to_htf.append(idx)
         return unique, chart_to_htf
 
-    def _htf_source_series(
-        self, unique: list[dict[str, float]], field: str
-    ) -> list[float | None]:
+    def _htf_source_series(self, unique: list[dict[str, float]], field: str) -> list[float | None]:
         """Extract one OHLCV/derived field from unique HTF aggs (chronological)."""
         out: list[float | None] = []
         for agg in unique:
@@ -990,9 +1338,35 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                 out.append(v)
         return out
 
-    def _htf_rsi_full_series(
-        self, closes: list[float | None], period: int
-    ) -> list[float | None]:
+    @staticmethod
+    def _htf_wma_full_series(src: list[float | None], period: int) -> list[float | None]:
+        """Full-list WMA matching interpret ``_wma`` (strict window, last-value formula)."""
+        n = len(src)
+        out: list[float | None] = [None] * n
+        if n == 0 or period <= 0:
+            return out
+        denom = period * (period + 1) / 2.0
+        for i in range(period - 1, n):
+            window = src[i - period + 1 : i + 1]
+            acc = 0.0
+            ok = True
+            for j, v in enumerate(window):
+                if v is None:
+                    ok = False
+                    break
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    ok = False
+                    break
+                if fv != fv:
+                    ok = False
+                    break
+                acc += fv * (j + 1)
+            out[i] = acc / denom if ok else None
+        return out
+
+    def _htf_rsi_full_series(self, closes: list[float | None], period: int) -> list[float | None]:
         """Full-list RSI on *closes* (Wilder RMA of gains/losses), bar-aligned."""
         n = len(closes)
         out: list[float | None] = [None] * n
@@ -1045,16 +1419,14 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                 out[i] = 100.0 - (100.0 / (1.0 + rs))
         return out
 
-    def _htf_ta_values_on_unique(
-        self, expr: HtfSimpleTaExpr, unique: list[dict[str, float]]
-    ) -> list[float | None]:
+    def _htf_ta_values_on_unique(self, expr: HtfSimpleTaExpr, unique: list[dict[str, float]]) -> list[float | None]:
         """Run allowlisted TA full-list helpers on unique HTF bars."""
         n = len(unique)
         if n == 0 or expr.length <= 0:
             return []
         name = expr.name
         period = int(expr.length)
-        if name in ("sma", "ema", "rsi"):
+        if name in ("sma", "ema", "rsi", "wma", "rma"):
             field = expr.source or "close"
             src = self._htf_source_series(unique, field)
             if name == "sma":
@@ -1070,6 +1442,14 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                     return [None] * n
                 raw = ema_fn(src, period)
                 return list(raw) if raw is not None else [None] * n
+            if name == "rma":
+                rma_fn = getattr(self, "_rma", None)
+                if not callable(rma_fn):
+                    return [None] * n
+                raw = rma_fn(src, period)
+                return list(raw) if raw is not None else [None] * n
+            if name == "wma":
+                return self._htf_wma_full_series(src, period)
             return self._htf_rsi_full_series(src, period)
 
         # atr: length-only; uses HTF high/low/close.
@@ -1100,22 +1480,25 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         return out
 
     def _try_htf_simple_ta_resample(
-        self, expression: HtfSimpleTaExpr, timeframe: Any
+        self, expression: HtfSimpleTaExpr, timeframe: Any, *, gaps_on: bool = False, lookahead_on: bool = False
     ) -> Any | None:
         """Run allowlisted ta.* on resampled HTF bars; map last completed to chart.
 
-        Semantics match OHLCV HTF resample: **last completed** HTF bar only
-        (lookahead_off-style). Full-list TA on the unique HTF series is cached
-        per (bucket, ta name, source, length, chart n).
+        Default semantics match OHLCV HTF resample: **last completed** HTF bar
+        only (lookahead_off-style). ``lookahead_on`` maps each chart bar to TA
+        computed on unique HTF buckets including the current period's final
+        agg (historical leak from the period start). ``gaps_on`` delivers a
+        value only on bucket-start bars. Full-list TA on the unique HTF series
+        is cached per (spec, ta identity, fingerprint).
         """
         if not isinstance(expression, HtfSimpleTaExpr):
             return None
         if not self._request_is_higher_tf(timeframe):
             return None
-        bucket_ms = self._request_tf_bucket_ms(timeframe)
-        if bucket_ms is None:
+        spec = self._htf_tf_spec(timeframe)
+        if spec is None:
             return None
-        built = self._htf_unique_and_map(bucket_ms)
+        built = self._htf_unique_and_map(spec, lookahead_on=lookahead_on)
         if built is None:
             return None
         unique, chart_to_htf = built
@@ -1123,17 +1506,23 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         if n_chart == 0:
             return None
 
+        src = self._htf_source_lists()
+        fp: tuple[Any, ...] = (n_chart, len(unique))
+        if src is not None:
+            opens, highs, lows, closes, _volumes, times = src
+            fp = self._htf_cache_fingerprint(len(opens), times, opens, highs, lows, closes)
+
         cache = getattr(self, "_htf_simple_ta_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             self._htf_simple_ta_cache = cache  # type: ignore[attr-defined]
         ckey = (
-            int(bucket_ms),
+            spec,
             expression.name,
             expression.source or "",
             int(expression.length),
-            n_chart,
-            len(unique),
+            bool(lookahead_on),
+            fp,
         )
         entry = cache.get(ckey)
         if isinstance(entry, dict) and entry.get("chart_vals") is not None:
@@ -1148,8 +1537,12 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                     chart_vals[i] = ta_on_htf[hidx]
             cache[ckey] = {"chart_vals": chart_vals}
 
-        # Current chart bar → last sample (Runtime advances series in lockstep).
-        last = chart_vals[-1] if chart_vals else None
+        i = self._chart_bar_index()
+        last = chart_vals[i] if 0 <= i < len(chart_vals) else None
+        if gaps_on and not self._htf_ta_is_bucket_start(chart_to_htf, index=i):
+            last = None
+        if gaps_on or lookahead_on:
+            self._mark_security_merge_applied(gaps_on=gaps_on, lookahead_on=lookahead_on)
         if last is None:
             return float("nan")
         try:
@@ -1157,6 +1550,55 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         except (TypeError, ValueError):
             return float("nan")
         return fv if fv == fv else float("nan")
+
+    def _htf_ta_is_bucket_start(self, chart_to_htf: list[int | None], *, index: int | None = None) -> bool:
+        """True when the current chart bar opens a new HTF bucket."""
+        i = self._chart_bar_index() if index is None else int(index)
+        if i < 0 or i >= len(chart_to_htf):
+            return False
+        hidx = chart_to_htf[i]
+        if hidx is None:
+            return False
+        if i == 0:
+            return True
+        return chart_to_htf[i - 1] != hidx
+
+    def _mark_security_merge_applied(self, *, gaps_on: bool, lookahead_on: bool) -> None:
+        """Record that gaps/lookahead args took effect on a resample path."""
+        state = self._security_policy_state()
+        if gaps_on:
+            state["gaps_supported"] = True
+            self._note_security_policy("gaps_applied")
+        if lookahead_on:
+            state["lookahead_supported"] = True
+            self._note_security_policy("lookahead_applied")
+
+    def _chart_ohlcv_at_offset(self, field: str, offset: int) -> Any:
+        """Pine history offset on a chart OHLCV field (0 = current, 1 = previous)."""
+        na = float("nan")
+        if offset < 0:
+            return na
+        ctx = getattr(self, "context", {}) or {}
+        series = ctx.get(field) if isinstance(ctx, dict) else None
+        hist = getattr(series, "history", None) if series is not None else None
+        if hist is not None:
+            try:
+                if offset < len(hist):
+                    v = hist[offset]
+                    if v is None:
+                        return na
+                    fv = float(v)
+                    return fv if fv == fv else na
+            except (TypeError, ValueError, IndexError):
+                pass
+        chrono = self._series_chrono_values(field)
+        if not chrono or offset >= len(chrono):
+            return na
+        try:
+            fv = float(chrono[-1 - offset])
+        except (TypeError, ValueError, IndexError):
+            return na
+        return fv if fv == fv else na
 
     def _chart_simple_ta_last(self, expression: HtfSimpleTaExpr) -> Any:
         """Same-TF allowlisted ta.* on chart series (last sample)."""
@@ -1214,6 +1656,12 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         elif name == "ema":
             fn = getattr(self, "_ema", None)
             raw = fn(src, period) if callable(fn) else None
+        elif name == "rma":
+            fn = getattr(self, "_rma", None)
+            raw = fn(src, period) if callable(fn) else None
+        elif name == "wma":
+            last = self._htf_wma_full_series(src, period)
+            raw = last
         elif name == "rsi":
             cleaned: list[float | None] = []
             for v in src:
@@ -1455,8 +1903,9 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
           still use legacy mock prices for bare string series names.
         - **Same-symbol + simple OHLCV** on a **coarser** TF with bar times →
           timestamp resample of chart OHLCV (``htf_ohlcv_resample``): last
-          completed HTF bar only (lookahead_off-style; gaps/lookahead unused).
-        - **Same-symbol + allowlisted simple ta.*** (``ta.sma/ema/rsi/atr`` with
+          completed HTF bar by default; ``gaps_on`` / ``lookahead_on`` honored
+          on this path (bucket-start na-gaps / historical final-from-period-start).
+        - **Same-symbol + allowlisted simple ta.*** (``ta.sma/ema/rsi/atr/wma/rma`` with
           bare OHLCV source + const length) on a **coarser** TF → run the
           interpret TA helper on resampled HTF bars (``htf_simple_ta_resample``).
         - **Same-symbol + simple OHLCV** otherwise → chart passthrough /
@@ -1466,9 +1915,11 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         - **Same-symbol + complex pre-eval** (UDF / nested / multi-arg ta) on a
           **different** TF → ``na`` without full multi-TF re-eval.
         - **Same-symbol + same TF** pre-eval → chart eval is correct; allow.
-        - **gaps / lookahead** (``barmerge.*``) are accepted for API shape but
-          **unused** (no gap-fill series, no lookahead offset). Recorded in
-          policy metadata rather than silently affecting values.
+        - **gaps / lookahead** (``barmerge.*``) are honored on the HTF resample
+          paths above and accepted-but-unused elsewhere (passthrough, provider
+          series, complex/foreign na). Presence vs effect is recorded in policy
+          metadata (``gaps_lookahead_provided`` vs ``gaps_applied`` /
+          ``lookahead_applied``) rather than silently affecting values.
         """
         ticker_arg = args[0] if len(args) > 0 else "AAPL"
         is_ha = bool(getattr(ticker_arg, "heikinashi_applied", False))
@@ -1484,13 +1935,23 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         if isinstance(timeframe, list):
             timeframe = timeframe[-1] if timeframe else "D"
 
-        # Accept gaps/lookahead for signature compatibility; never apply them.
+        # barmerge.gaps_on / lookahead_on evaluate to True (gaps_off / off → False).
+        gaps_on = bool(gaps_arg) if gaps_provided else False
+        lookahead_on = bool(lookahead_arg) if lookahead_provided else False
+
+        # Presence marker: merge args were supplied. When a resample path below
+        # honors them it additionally notes gaps_applied / lookahead_applied
+        # (and flips gaps_supported / lookahead_supported); presence without an
+        # applied marker means the call fell through to a path where they are
+        # still unused (passthrough, complex/foreign na, provider series).
         if gaps_provided or lookahead_provided:
             self._note_security_policy(
-                "gaps_lookahead_unused",
+                "gaps_lookahead_provided",
                 gaps_provided=gaps_provided,
                 lookahead_provided=lookahead_provided,
-                gaps_value=gaps_arg if isinstance(gaps_arg, (bool, int, float, str)) or gaps_arg is None else str(gaps_arg),
+                gaps_value=gaps_arg
+                if isinstance(gaps_arg, (bool, int, float, str)) or gaps_arg is None
+                else str(gaps_arg),
                 lookahead_value=(
                     lookahead_arg
                     if isinstance(lookahead_arg, (bool, int, float, str)) or lookahead_arg is None
@@ -1522,18 +1983,18 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
             if not chart_sym or is_ha:
                 return None
             if isinstance(expr, HtfSimpleTaExpr):
-                return self._try_htf_simple_ta_resample(expr, timeframe)
+                return self._try_htf_simple_ta_resample(expr, timeframe, gaps_on=gaps_on, lookahead_on=lookahead_on)
+            if isinstance(expr, HtfOffsetExpr):
+                return self._try_htf_offset_resample(expr, timeframe, gaps_on=gaps_on, lookahead_on=lookahead_on)
             if not self._expression_is_simple_ohlcv_value(expr):
                 return None
-            return self._try_htf_ohlcv_resample(expr, timeframe)
+            return self._try_htf_ohlcv_resample(expr, timeframe, gaps_on=gaps_on, lookahead_on=lookahead_on)
 
         def _handle_simple_ta_expr(expr: HtfSimpleTaExpr) -> Any:
             """Same-symbol allowlisted ta.* — HTF resample, same-TF chart, else na."""
             if not chart_sym:
-                return self._security_return(
-                    na, "foreign_na", symbol=str(symbol), reason="foreign_simple_ta"
-                )
-            htf_val = self._try_htf_simple_ta_resample(expr, timeframe)
+                return self._security_return(na, "foreign_na", symbol=str(symbol), reason="foreign_simple_ta")
+            htf_val = self._try_htf_simple_ta_resample(expr, timeframe, gaps_on=gaps_on, lookahead_on=lookahead_on)
             if htf_val is not None:
                 return self._security_return(
                     htf_val,
@@ -1583,8 +2044,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                     )
                 if isinstance(expression, list):
                     if len(expression) == 1 and (
-                        expression[0] is None
-                        or isinstance(expression[0], (int, float, bool))
+                        expression[0] is None or isinstance(expression[0], (int, float, bool))
                     ):
                         return self._security_return(
                             self._remap_preeval_ohlcv_to_ha(expression[0], ha),
@@ -1603,9 +2063,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                         timeframe=tf_s,
                     )
                 return self._security_return(
-                    self._remap_preeval_ohlcv_to_ha(
-                        self._unwrap_preeval_scalar(expression), ha
-                    ),
+                    self._remap_preeval_ohlcv_to_ha(self._unwrap_preeval_scalar(expression), ha),
                     "heikinashi_chart_transform",
                     timeframe=tf_s,
                 )
@@ -1615,62 +2073,60 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
 
         def _deny_preeval() -> Any:
             if chart_sym and not same_tf:
-                return self._security_return(
-                    na, "complex_htf_na", timeframe=tf_s, reason="no_htf_reeval"
-                )
-            return self._security_return(
-                na, "foreign_na", symbol=str(symbol), reason="foreign_or_complex"
-            )
+                return self._security_return(na, "complex_htf_na", timeframe=tf_s, reason="no_htf_reeval")
+            return self._security_return(na, "foreign_na", symbol=str(symbol), reason="foreign_or_complex")
 
-        # Allowlisted simple ta.* marker (attached at visit_Call before chart pre-eval).
+        # Allowlisted simple ta.* / OHLCV offset markers (attached at visit_Call).
         if isinstance(expression, HtfSimpleTaExpr):
             return _handle_simple_ta_expr(expression)
+        if isinstance(expression, HtfOffsetExpr):
+            htf_off = self._try_htf_offset_resample(expression, timeframe, gaps_on=gaps_on, lookahead_on=lookahead_on)
+            if htf_off is not None:
+                return self._security_return(
+                    htf_off,
+                    "htf_ohlcv_offset",
+                    timeframe=tf_s,
+                    field=expression.field,
+                    offset=expression.offset,
+                )
+            if chart_sym and not self._request_is_higher_tf(timeframe):
+                tag = "same_tf_chart_eval" if same_tf else "chart_passthrough_htf_stub"
+                return self._security_return(
+                    self._chart_ohlcv_at_offset(expression.field, expression.offset),
+                    tag,
+                    timeframe=tf_s,
+                    field=expression.field,
+                    offset=expression.offset,
+                )
+            return self._security_return(na, "complex_htf_na", timeframe=tf_s, reason="offset_not_htf")
 
         if isinstance(expression, list):
-            if len(expression) == 1 and (
-                expression[0] is None or isinstance(expression[0], (int, float, bool))
-            ):
+            if len(expression) == 1 and (expression[0] is None or isinstance(expression[0], (int, float, bool))):
                 expression = expression[0]
             elif chart_sym:
                 htf_val = _maybe_htf_resample(expression)
                 if htf_val is not None:
-                    tag = (
-                        "htf_simple_ta_resample"
-                        if isinstance(expression, HtfSimpleTaExpr)
-                        else "htf_ohlcv_resample"
-                    )
+                    tag = "htf_simple_ta_resample" if isinstance(expression, HtfSimpleTaExpr) else "htf_ohlcv_resample"
                     return self._security_return(htf_val, tag, timeframe=tf_s)
                 if self._allow_same_symbol_preeval(expression, timeframe):
-                    return self._security_return(
-                        expression, _same_symbol_preeval_tag(), timeframe=tf_s
-                    )
+                    return self._security_return(expression, _same_symbol_preeval_tag(), timeframe=tf_s)
                 return _deny_preeval()
             else:
-                return self._security_return(
-                    na, "foreign_na", symbol=str(symbol), reason="foreign_list"
-                )
+                return self._security_return(na, "foreign_na", symbol=str(symbol), reason="foreign_list")
         if isinstance(expression, tuple):
             if chart_sym:
                 htf_val = _maybe_htf_resample(expression)
                 if htf_val is not None:
-                    return self._security_return(
-                        htf_val, "htf_ohlcv_resample", timeframe=tf_s
-                    )
+                    return self._security_return(htf_val, "htf_ohlcv_resample", timeframe=tf_s)
             if chart_sym and self._allow_same_symbol_preeval(expression, timeframe):
-                return self._security_return(
-                    expression, _same_symbol_preeval_tag(), timeframe=tf_s
-                )
+                return self._security_return(expression, _same_symbol_preeval_tag(), timeframe=tf_s)
             return _deny_preeval()
 
         if not isinstance(expression, str):
             if chart_sym:
                 htf_val = _maybe_htf_resample(expression)
                 if htf_val is not None:
-                    tag = (
-                        "htf_simple_ta_resample"
-                        if isinstance(expression, HtfSimpleTaExpr)
-                        else "htf_ohlcv_resample"
-                    )
+                    tag = "htf_simple_ta_resample" if isinstance(expression, HtfSimpleTaExpr) else "htf_ohlcv_resample"
                     # `_try_htf_simple_ta_resample` already returns only for higher TF;
                     # tag OHLCV vs simple-ta explicitly for meta honesty.
                     if tag == "htf_simple_ta_resample":
@@ -1679,9 +2135,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
                             tag,
                             timeframe=tf_s,
                         )
-                    return self._security_return(
-                        htf_val, "htf_ohlcv_resample", timeframe=tf_s
-                    )
+                    return self._security_return(htf_val, "htf_ohlcv_resample", timeframe=tf_s)
             if chart_sym and self._allow_same_symbol_preeval(expression, timeframe):
                 # Bare `close` / PineSeries → current scalar for plot/assign paths.
                 return self._security_return(
@@ -1699,19 +2153,13 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         if chart_sym:
             htf_val = _maybe_htf_resample(expression)
             if htf_val is not None:
-                return self._security_return(
-                    htf_val, "htf_ohlcv_resample", timeframe=tf_s
-                )
+                return self._security_return(htf_val, "htf_ohlcv_resample", timeframe=tf_s)
 
         # Try real data provider (historical or live) via shared helpers.
         # ChartOHLCVProvider ignores interval → still chart bars (not HTF resample).
         closes = self._ohlcv_closes(symbol, str(timeframe), limit=REQUEST_OHLCV_LIMIT)
         if closes:
-            tag = (
-                "provider_ohlcv"
-                if same_tf or not chart_sym
-                else "provider_ohlcv_chart_stub"
-            )
+            tag = "provider_ohlcv" if same_tf or not chart_sym else "provider_ohlcv_chart_stub"
             return self._security_return(
                 self._get_expression_prices(str(expression), closes),
                 tag,
@@ -1721,9 +2169,7 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         last = self._ticker_last(symbol)
         if last is not None:
             return self._security_return(
-                self._get_expression_prices(
-                    str(expression), [float(last)] * REQUEST_OHLCV_LIMIT
-                ),
+                self._get_expression_prices(str(expression), [float(last)] * REQUEST_OHLCV_LIMIT),
                 "provider_ticker_last",
                 timeframe=tf_s,
                 symbol=symbol_str,
@@ -1731,16 +2177,12 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
 
         # Fundamental / non-equity prefixes — never invent OHLCV.
         if any(tok in symbol_str for tok in _FUNDAMENTAL_TOKENS):
-            return self._security_return(
-                na, "fundamental_na", symbol=symbol_str, reason="fundamental_token"
-            )
+            return self._security_return(na, "fundamental_na", symbol=symbol_str, reason="fundamental_token")
 
         # Foreign under a host chart with no multi-symbol feed hit → na.
         # Aligns interpret with compile foreign-na (no mock UPVOL/MSFT prices).
         if not chart_sym and self._host_has_chart_identity():
-            return self._security_return(
-                na, "foreign_na", symbol=symbol_str, reason="no_multisymbol_feed"
-            )
+            return self._security_return(na, "foreign_na", symbol=symbol_str, reason="no_multisymbol_feed")
 
         # Fallback mock data for bare string series names only (legacy demos /
         # standalone evaluator without a wired chart identity).
@@ -1766,9 +2208,19 @@ class RequestBuiltinsMixin(BuiltinDispatchMixin):
         Request lower timeframe data within the current timeframe.
         Now supports data_feed / data_provider when wired (reuses latest for demo).
         """
-        symbol = args[0] if len(args) > 0 else "AAPL"
+        ticker_arg = args[0] if len(args) > 0 else "AAPL"
+        symbol = self._resolve_symbol(ticker_arg)
         timeframe = args[1] if len(args) > 1 else "5m"
         expression = args[2] if len(args) > 2 else "close"  # noqa: PLR2004 - arg count check
+
+        # Foreign under a host chart: honest na (no mock intrabar invent).
+        if not self._is_chart_symbol(str(symbol)) and self._host_has_chart_identity():
+            return self._security_return(
+                float("nan"),
+                "foreign_na",
+                symbol=str(symbol),
+                reason="lower_tf_no_multisymbol_feed",
+            )
 
         # Try data feed/provider for consistency with request.security
         data_feed, data_provider = self._get_request_data()

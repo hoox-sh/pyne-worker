@@ -1,22 +1,3 @@
-# Copyright (C) 2024-2026 jango_blockchained
-#
-# This file is part of pynescript.
-#
-# pynescript is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# pynescript is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
-#
-# SPDX-License-Identifier: AGPL-3.0-or-later
-
 # Generated from PinescriptParser.g4 by ANTLR 4.13.2
 from antlr4 import *
 if "." in __name__:
@@ -168,6 +149,11 @@ class PinescriptParserVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by PinescriptParser#value_structure.
+    def visitValue_structure(self, ctx:PinescriptParser.Value_structureContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by PinescriptParser#structure.
     def visitStructure(self, ctx:PinescriptParser.StructureContext):
         return self.visitChildren(ctx)
@@ -233,6 +219,16 @@ class PinescriptParserVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by PinescriptParser#once_structure.
+    def visitOnce_structure(self, ctx:PinescriptParser.Once_structureContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by PinescriptParser#switch_case.
+    def visitSwitch_case(self, ctx:PinescriptParser.Switch_caseContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by PinescriptParser#switch_cases.
     def visitSwitch_cases(self, ctx:PinescriptParser.Switch_casesContext):
         return self.visitChildren(ctx)
@@ -240,6 +236,11 @@ class PinescriptParserVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by PinescriptParser#switch_pattern_case.
     def visitSwitch_pattern_case(self, ctx:PinescriptParser.Switch_pattern_caseContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by PinescriptParser#switch_patterns.
+    def visitSwitch_patterns(self, ctx:PinescriptParser.Switch_patternsContext):
         return self.visitChildren(ctx)
 
 
@@ -575,6 +576,11 @@ class PinescriptParserVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by PinescriptParser#template_spec_suffix.
     def visitTemplate_spec_suffix(self, ctx:PinescriptParser.Template_spec_suffixContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by PinescriptParser#rshift_closed_type_args.
+    def visitRshift_closed_type_args(self, ctx:PinescriptParser.Rshift_closed_type_argsContext):
         return self.visitChildren(ctx)
 
 

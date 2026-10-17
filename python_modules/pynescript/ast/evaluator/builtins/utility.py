@@ -51,6 +51,19 @@ from .base import BuiltinDispatchMixin
 from .base import BuiltinHandler
 
 
+def _timestamp_to_ms(ts: float) -> float:
+    """Unix seconds (< 1e11) become milliseconds. Millisecond stamps pass through.
+
+    Chart hosts often store bar opens in seconds. ``hour(time)`` divides by
+    1000, so a seconds stamp collapses a multi-day chart into one clock hour.
+    """
+    if ts != ts:  # NaN
+        return ts
+    if abs(ts) < 1.0e11:
+        return ts * 1000.0
+    return ts
+
+
 def _normalize_year_month(year: int | float, month: int | float) -> tuple[int, int]:
     """Normalize year/month for ``datetime`` construction (shared by timestamp).
 
@@ -200,6 +213,7 @@ class UtilityFunctionsMixin(BuiltinDispatchMixin):
             "last_bar_index": self._builtin_last_bar_index,
             "last_bar_time": self._builtin_last_bar_time,
             "timenow": self._builtin_timenow,
+            "timeframe.change": self._builtin_timeframe_change,
             "max_bars_back": self._builtin_max_bars_back,
             # Community / v3-style series shift (Ichimoku lead lines, etc.)
             "offset": self._builtin_offset,
@@ -431,12 +445,71 @@ class UtilityFunctionsMixin(BuiltinDispatchMixin):
         """Current bar open/close time from context (ms), falling back to *time*."""
         ctx = getattr(self, "context", {}) or {}
         if key in ctx:
-            return int(self._coerce_ctx_number(key, 0))
-        return int(self._coerce_ctx_number("time", 0))
+            return int(_timestamp_to_ms(int(self._coerce_ctx_number(key, 0))))
+        return int(_timestamp_to_ms(int(self._coerce_ctx_number("time", 0))))
 
-    def _resolve_timestamp_arg(
-        self, args: list[Any], *, name: str
-    ) -> tuple[float | None, Any]:
+    def _prev_bar_time_ms(self) -> int | None:
+        """Previous bar open time from ``time`` series history, or None on bar 0."""
+        ctx = getattr(self, "context", None) or {}
+        ts = ctx.get("time")
+        hist = getattr(ts, "history", None)
+        if hist is None:
+            return None
+        try:
+            if len(hist) < 2:
+                return None
+            prev = hist[1]
+        except TypeError:
+            return None
+        if prev is None:
+            return None
+        try:
+            return int(float(prev))
+        except (TypeError, ValueError):
+            return None
+
+    def _builtin_timeframe_change(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> bool:
+        """``timeframe.change(tf)`` — true on the first bar of a new *tf* period.
+
+        Bare ``D`` / ``W`` / ``M`` resolve on the exchange calendar in
+        ``syminfo.timezone`` (UTC when the host leaves it unset); all other
+        frames keep fixed-width UTC buckets. Bar 0 is a new period.
+        Missing times / unusable tf → False.
+        """
+        kw = kwargs or {}
+        raw = args[0] if args else kw.get("timeframe", kw.get("tf"))
+        if raw is None:
+            return False
+        current = getattr(raw, "current", None)
+        if current is not None and not isinstance(raw, (int, float, bool, str)):
+            raw = current
+        tf = str(raw).strip()
+        if not tf:
+            return False
+        from .timeframe import timeframe_period_changed
+
+        ctx = getattr(self, "context", None) or {}
+        ts = ctx.get("time")
+        if ts is None:
+            return False
+        curr = getattr(ts, "current", ts)
+        if curr is None:
+            return False
+        bar_index = None
+        if "bar_index" in ctx:
+            bar_index = int(self._coerce_ctx_number("bar_index", 0))
+        tz = None
+        sym = self._syminfo_host()
+        if sym is not None:
+            raw_tz = getattr(sym, "timezone", None)
+            if raw_tz:
+                try:
+                    tz = _parse_pine_timezone(raw_tz)
+                except Exception:
+                    tz = None
+        return timeframe_period_changed(curr, self._prev_bar_time_ms(), tf, bar_index=bar_index, tz=tz)
+
+    def _resolve_timestamp_arg(self, args: list[Any], *, name: str) -> tuple[float | None, Any]:
         """Resolve optional timestamp + timezone; bare form uses chart ``time``.
 
         Forms (reference):
@@ -479,7 +552,7 @@ class UtilityFunctionsMixin(BuiltinDispatchMixin):
                 ts = float(ts)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return None, tzinfo
-        return float(ts), tzinfo
+        return float(_timestamp_to_ms(ts)), tzinfo
 
     def _dt_from_ts(self, ts: float | None, tzinfo: Any = None):
         """datetime from ms timestamp in *tzinfo* (default UTC), or None if na."""

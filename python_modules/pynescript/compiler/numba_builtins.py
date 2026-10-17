@@ -38,9 +38,11 @@ Layers (what this module “registers” for the compile path)
 
 3. **Object-mode coercion / safety** (pure Python, never under njit):
    ``safe_float``, ``safe_int``, ``safe_period``, ``safe_len``, ``safe_iter``,
-   ``safe_sum`` / ``safe_max`` / ``safe_min``, ``na_num`` (None→nan for
-   arithmetic), ``nz_py`` (unicode-safe nz), ``store_src_py``, ``udt_index``,
-   ``pine_raise``, list/matrix mutators (``safe_list_*``, ``matrix_*``),
+   ``safe_iter_pairs``, ``safe_sum`` / ``safe_max`` / ``safe_min``, ``na_num``
+   (None→nan for arithmetic), ``nz_py`` (unicode-safe nz), ``store_src_py``,
+   ``udt_index``, ``pine_raise``, ``pine_int`` / ``pine_bool`` / ``pine_string``
+   (Pine ``int()``/``bool()``/``string()`` casts; ``safe_int`` stays NaN→0),
+   list/matrix mutators (``safe_list_*``, ``matrix_set``, ``matrix_*``),
    array stats (``array_mode``, ``array_range``, …).
 
 Numba constraints
@@ -48,6 +50,9 @@ Numba constraints
 - nopython kernels use only float64 series + scalars; no dicts/lists/str.
 - Object mode reuses the same import * and may call both njit and Python
   helpers (Numba dispatches Python callables when not nested inside njit).
+- Scalar math wrappers (``numba_max`` / ``numba_min`` / ``numba_abs`` / …)
+  coerce Python ``None`` (object-mode UDT fields / stub getters) to ``nan``
+  before the ``@njit(cache=True)`` inner so nopython helpers never see ``none``.
 - Prefer matching interpret-path seeding (EMA/ATR notes on individual kernels).
 
 Matrix / na
@@ -58,8 +63,10 @@ Matrices are list-of-lists handles. ``na_num`` / ``safe_float`` map Pine
 
 from __future__ import annotations
 
-import numpy as np
+import re
+
 import numba
+import numpy as np
 
 
 @numba.njit(cache=True)
@@ -373,9 +380,9 @@ def numba_kc(src, high, low, close, period, mult, i):
 def numba_macd(arr, fast, slow, signal, i):
     """Return (macd, signal, hist) at bar ``i`` in a single O(i) pass.
 
-    Fast/slow EMAs use SMA seed (same as ``numba_ema``). Signal uses
-    first-value seed on the MACD line. Must not nest per-bar EMA rebuilds
-    (that was O(n³) and hung multi-thousand-bar compiles).
+    Fast/slow/signal EMAs all use SMA seed (interpret ``_ema`` / ``_macd_inc``).
+    Signal seeds on the first ``signal`` finite MACD samples (from ``slow-1``).
+    Warm-up returns nan (never 0). Must not nest per-bar EMA rebuilds.
     """
     fast = int(fast)
     slow = int(slow)
@@ -401,40 +408,113 @@ def numba_macd(arr, fast, slow, signal, i):
     for j in range(fast, slow):
         ema_f = alpha_f * arr[j] + (1.0 - alpha_f) * ema_f
 
+    seed_sum = 0.0
+    seed_n = 0
+    sig = np.nan
     macd_val = ema_f - ema_s
-    sig = macd_val  # first-value seed at first valid MACD bar
-
-    for j in range(slow, i + 1):
-        ema_f = alpha_f * arr[j] + (1.0 - alpha_f) * ema_f
-        ema_s = alpha_s * arr[j] + (1.0 - alpha_s) * ema_s
+    for j in range(slow - 1, i + 1):
+        if j >= slow:
+            ema_f = alpha_f * arr[j] + (1.0 - alpha_f) * ema_f
+            ema_s = alpha_s * arr[j] + (1.0 - alpha_s) * ema_s
         macd_val = ema_f - ema_s
-        sig = alpha_sig * macd_val + (1.0 - alpha_sig) * sig
+        if seed_n < signal:
+            seed_sum += macd_val
+            seed_n += 1
+            if seed_n == signal:
+                sig = seed_sum / signal
+        else:
+            sig = alpha_sig * macd_val + (1.0 - alpha_sig) * sig
 
+    if seed_n < signal:
+        return macd_val, np.nan, np.nan
     return macd_val, sig, macd_val - sig
 
 
+def _is_plain_float(x):
+    """True for CPython ``float`` / ``np.float64`` (skip ``safe_float``)."""
+    t = type(x)
+    return t is float or t is np.float64
+
+
+def _as_njit_float(x):
+    """Coerce to float64 for njit scalars; ``None``/NA/handles → nan."""
+    return x if _is_plain_float(x) else safe_float(x)
+
+
+def _register_njit_overload(py_fn, jit_fn):
+    """Keep nopython callers on the jit inner (Python path is the None-safe wrap)."""
+    n = py_fn.__code__.co_argcount
+
+    if n == 1:
+
+        def ol(val):  # noqa: ARG001
+            def impl(val):
+                return jit_fn(val)
+
+            return impl
+    else:
+
+        def ol(a, b):  # noqa: ARG001
+            def impl(a, b):
+                return jit_fn(a, b)
+
+            return impl
+
+    numba.extending.overload(py_fn)(ol)
+
+
 @numba.njit(cache=True)
-def numba_nz(val, replacement):
+def _numba_nz_jit(val, replacement):
     """nopython ``nz`` / ``fixnan``: replace float NaN only (not unicode-safe)."""
     if np.isnan(val):
         return replacement
     return val
 
 
+def numba_nz(val, replacement):
+    """``nz``; None/NA → nan then replace (object-mode UDT fields)."""
+    fv = _as_njit_float(val)
+    fr = _as_njit_float(replacement)
+    return _numba_nz_jit(fv, fr)
+
+
+_register_njit_overload(numba_nz, _numba_nz_jit)
+
+
 @numba.njit(cache=True)
-def numba_safe_div(a, b):
+def _numba_safe_div_jit(a, b):
     """Pine division: zero / non-finite divisor → na. Single-eval of both args."""
     if b == 0.0 or np.isnan(b):
         return np.nan
     return a / b
 
 
+def numba_safe_div(a, b):
+    """Pine division; None/NA → nan (object-mode UDT fields)."""
+    fa = _as_njit_float(a)
+    fb = _as_njit_float(b)
+    return _numba_safe_div_jit(fa, fb)
+
+
+_register_njit_overload(numba_safe_div, _numba_safe_div_jit)
+
+
 @numba.njit(cache=True)
-def numba_safe_mod(a, b):
+def _numba_safe_mod_jit(a, b):
     """Pine modulo: zero / non-finite divisor → na. Single-eval of both args."""
     if b == 0.0 or np.isnan(b):
         return np.nan
     return np.fmod(a, b)
+
+
+def numba_safe_mod(a, b):
+    """Pine modulo; None/NA → nan (object-mode UDT fields)."""
+    fa = _as_njit_float(a)
+    fb = _as_njit_float(b)
+    return _numba_safe_mod_jit(fa, fb)
+
+
+_register_njit_overload(numba_safe_mod, _numba_safe_mod_jit)
 
 
 @numba.njit(cache=True)
@@ -501,6 +581,7 @@ def nz_py(val, replacement=0.0):
         return replacement
     return val
 
+
 @numba.njit(cache=True)
 def numba_store(arr, i, value):
     """Write ``value`` into ``arr[i]`` and return it.
@@ -529,27 +610,68 @@ def numba_store_src(dst, val, i):
 
 
 @numba.njit(cache=True)
-def numba_abs(val):
+def _numba_abs_jit(val):
     """Absolute value of a scalar (nopython ``math.abs``)."""
     if val < 0.0:
         return -val
     return val
 
 
+def numba_abs(val):
+    """Scalar abs; None/NA → nan (object-mode UDT fields)."""
+    fv = safe_float(val) if not _is_plain_float(val) else val
+    return _numba_abs_jit(fv)
+
+
+_register_njit_overload(numba_abs, _numba_abs_jit)
+
+
 @numba.njit(cache=True)
-def numba_max(a, b):
-    """Scalar maximum of two values (nopython ``math.max``)."""
+def _numba_max_jit(a, b):
+    """Scalar maximum; na/NaN args are skipped (Pine ``math.max``)."""
+    a_nan = np.isnan(a)
+    b_nan = np.isnan(b)
+    if a_nan:
+        return b
+    if b_nan:
+        return a
     if a > b:
         return a
     return b
 
 
+def numba_max(a, b):
+    """Scalar max; None/NA skipped like interpret ``math.max`` (all-na → nan)."""
+    fa = safe_float(a) if not _is_plain_float(a) else a
+    fb = safe_float(b) if not _is_plain_float(b) else b
+    return _numba_max_jit(fa, fb)
+
+
+_register_njit_overload(numba_max, _numba_max_jit)
+
+
 @numba.njit(cache=True)
-def numba_min(a, b):
-    """Scalar minimum of two values (nopython ``math.min``)."""
+def _numba_min_jit(a, b):
+    """Scalar minimum; na/NaN args are skipped (Pine ``math.min``)."""
+    a_nan = np.isnan(a)
+    b_nan = np.isnan(b)
+    if a_nan:
+        return b
+    if b_nan:
+        return a
     if a < b:
         return a
     return b
+
+
+def numba_min(a, b):
+    """Scalar min; None/NA skipped like interpret ``math.min`` (all-na → nan)."""
+    fa = safe_float(a) if not _is_plain_float(a) else a
+    fb = safe_float(b) if not _is_plain_float(b) else b
+    return _numba_min_jit(fa, fb)
+
+
+_register_njit_overload(numba_min, _numba_min_jit)
 
 
 @numba.njit(cache=True)
@@ -627,8 +749,53 @@ def numba_cum_expr(state_arr, val, i):
     return s
 
 
+def _is_f64_1d(a):
+    """True for C-contiguous-or-not 1d float64 series (nopython valuewhen path)."""
+    return isinstance(a, np.ndarray) and a.ndim == 1 and a.dtype == np.float64
+
+
+def _valuewhen_cond_true(c):
+    """Object-mode condition: na/0/False skip; never ``isnan`` on unicode."""
+    if c is None:
+        return False
+    if isinstance(c, (str, bytes, dict, list, tuple, set)):
+        return bool(c)
+    try:
+        f = float(c)
+    except (TypeError, ValueError):
+        return bool(c)
+    return not np.isnan(f) and f != 0.0
+
+
+def _valuewhen_py(cond_arr, src_arr, occ, i):
+    """Python occ-th true scan; ``src`` may be string/color/UDT object cells."""
+    try:
+        occ_i = int(occ)
+        idx = int(i)
+    except (TypeError, ValueError):
+        return np.nan
+    if occ_i < 0 or idx < 0:
+        return np.nan
+    try:
+        n = min(len(cond_arr), len(src_arr))
+    except TypeError:
+        return np.nan
+    if n <= 0:
+        return np.nan
+    if idx >= n:
+        idx = n - 1
+    left = occ_i
+    for j in range(idx, -1, -1):
+        if not _valuewhen_cond_true(cond_arr[j]):
+            continue
+        if left == 0:
+            return src_arr[j]
+        left -= 1
+    return np.nan
+
+
 @numba.njit(cache=True)
-def numba_valuewhen(cond_arr, src_arr, occ, i):
+def _numba_valuewhen_jit(cond_arr, src_arr, occ, i):
     """Return source at the ``occ``-th most recent true condition (0 = latest)."""
     occ = int(occ)
     if occ < 0:
@@ -644,8 +811,25 @@ def numba_valuewhen(cond_arr, src_arr, occ, i):
     return np.nan
 
 
+def numba_valuewhen(cond_arr, src_arr, occ, i):
+    """valuewhen; object-dtype series use a Python scan (not njit pyobject)."""
+    if _is_f64_1d(cond_arr) and _is_f64_1d(src_arr):
+        return _numba_valuewhen_jit(cond_arr, src_arr, occ, i)
+    return _valuewhen_py(cond_arr, src_arr, occ, i)
+
+
+def _ol_numba_valuewhen(cond_arr, src_arr, occ, i):  # noqa: ARG001
+    def impl(cond_arr, src_arr, occ, i):
+        return _numba_valuewhen_jit(cond_arr, src_arr, occ, i)
+
+    return impl
+
+
+numba.extending.overload(numba_valuewhen)(_ol_numba_valuewhen)
+
+
 @numba.njit(cache=True)
-def numba_pivothigh(arr, left, right, i):
+def _numba_pivothigh_jit(arr, left, right, i):
     """Pivot high confirmed at bar ``i`` (center = i - right)."""
     left = int(left)
     right = int(right)
@@ -665,8 +849,29 @@ def numba_pivothigh(arr, left, right, i):
     return val
 
 
+def numba_pivothigh(arr, left, right, i):
+    """Pivot high; NaN/None lengths → na (not ``int(nan)``)."""
+    fl = pine_int(left)
+    fr = pine_int(right)
+    if fl != fl or fr != fr:
+        return np.nan
+    if not _is_f64_1d(arr):
+        return np.nan
+    return _numba_pivothigh_jit(arr, int(fl), int(fr), i)
+
+
+def _ol_numba_pivothigh(arr, left, right, i):  # noqa: ARG001
+    def impl(arr, left, right, i):
+        return _numba_pivothigh_jit(arr, left, right, i)
+
+    return impl
+
+
+numba.extending.overload(numba_pivothigh)(_ol_numba_pivothigh)
+
+
 @numba.njit(cache=True)
-def numba_pivotlow(arr, left, right, i):
+def _numba_pivotlow_jit(arr, left, right, i):
     """Pivot low confirmed at bar ``i`` (center = i - right)."""
     left = int(left)
     right = int(right)
@@ -686,23 +891,51 @@ def numba_pivotlow(arr, left, right, i):
     return val
 
 
+def numba_pivotlow(arr, left, right, i):
+    """Pivot low; NaN/None lengths → na (not ``int(nan)``)."""
+    fl = pine_int(left)
+    fr = pine_int(right)
+    if fl != fl or fr != fr:
+        return np.nan
+    if not _is_f64_1d(arr):
+        return np.nan
+    return _numba_pivotlow_jit(arr, int(fl), int(fr), i)
+
+
+def _ol_numba_pivotlow(arr, left, right, i):  # noqa: ARG001
+    def impl(arr, left, right, i):
+        return _numba_pivotlow_jit(arr, left, right, i)
+
+    return impl
+
+
+numba.extending.overload(numba_pivotlow)(_ol_numba_pivotlow)
+
+
 @numba.njit(cache=True)
 def numba_stoch(source, high, low, length, i):
-    """Stochastic %K: (src - lowest(low)) / (highest(high) - lowest(low)) * 100."""
+    """Stochastic %K: (src - lowest(low)) / (highest(high) - lowest(low)) * 100.
+
+    Full ``length`` window of finite high/low required (na poisons, like
+    ``ta.highest`` / ``ta.lowest``). Nested ``ta.stoch(rsi, …)`` stays na
+    until RSI itself is fully warmed.
+    """
     length = int(length)
     if length <= 0 or i < length - 1:
         return np.nan
     hh = high[i]
     ll = low[i]
+    if np.isnan(hh) or np.isnan(ll) or np.isnan(source[i]):
+        return np.nan
     for j in range(1, length):
         h = high[i - j]
         l = low[i - j]
-        if h > hh or np.isnan(hh):
+        if np.isnan(h) or np.isnan(l):
+            return np.nan
+        if h > hh:
             hh = h
-        if l < ll or np.isnan(ll):
+        if l < ll:
             ll = l
-    if np.isnan(hh) or np.isnan(ll) or np.isnan(source[i]):
-        return np.nan
     if hh == ll:
         return 50.0
     return 100.0 * (source[i] - ll) / (hh - ll)
@@ -1041,6 +1274,7 @@ def numba_lowestbars(arr, length, i):
         return -1.0
     return float(-(i - best_idx))
 
+
 @numba.njit(cache=True)
 def numba_percentrank(arr, length, i):
     """Percentrank matching interpret ``_percentrank`` (strict ``<`` / valid-only).
@@ -1071,16 +1305,87 @@ def numba_percentrank(arr, length, i):
 
 @numba.njit(cache=True)
 def numba_obv(close, vol, i):
-    """On-Balance Volume rebuilt as a running sum from bar 0..i."""
-    if i < 0:
-        return np.nan
+    """On-Balance Volume matching interpret ``_obv``.
+
+    Returns 0 until 3 samples; accumulates from index 2 (skips
+    ``close[0]`` vs ``close[1]``).
+    """
+    if i < 2:
+        return 0.0
     obv = 0.0
-    for j in range(1, i + 1):
+    for j in range(2, i + 1):
         if close[j] > close[j - 1]:
             obv += vol[j]
         elif close[j] < close[j - 1]:
             obv -= vol[j]
     return obv
+
+
+@numba.njit(cache=True)
+def numba_ao(high, low, fast, slow, i):
+    """Awesome Oscillator: SMA(hl2, fast) - SMA(hl2, slow). Default 5 / 34.
+
+    Warm-up (``i < slow - 1``) is nan. Matches interpret ``_builtin_ta_ao``.
+    """
+    fast = int(fast)
+    slow = int(slow)
+    if fast <= 0 or slow <= 0 or i < slow - 1:
+        return np.nan
+    sf = 0.0
+    ss = 0.0
+    for j in range(slow):
+        hl2 = 0.5 * (high[i - j] + low[i - j])
+        if np.isnan(hl2):
+            return np.nan
+        if j < fast:
+            sf += hl2
+        ss += hl2
+    return sf / fast - ss / slow
+
+
+@numba.njit(cache=True)
+def numba_aroon(high, low, length, i):
+    """Aroon pair ``(down, up)`` matching interpret ``_builtin_ta_aroon``.
+
+    Window is ``length + 1`` bars ending at ``i``. Ties keep the oldest
+    extreme (Python ``max``/``min`` on range). Warm-up → (nan, nan).
+    """
+    length = int(length)
+    window = length + 1
+    if length <= 0 or i < length:
+        return np.nan, np.nan
+    hh = high[i - length]
+    ll = low[i - length]
+    hh_k = 0
+    ll_k = 0
+    for k in range(window):
+        idx = i - length + k
+        h = high[idx]
+        lo = low[idx]
+        if np.isnan(h) or np.isnan(lo):
+            return np.nan, np.nan
+        if h > hh:
+            hh = h
+            hh_k = k
+        if lo < ll:
+            ll = lo
+            ll_k = k
+    bars_since_hh = (window - 1) - hh_k
+    bars_since_ll = (window - 1) - ll_k
+    up = 100.0 * (length - bars_since_hh) / length
+    down = 100.0 * (length - bars_since_ll) / length
+    return down, up
+
+
+@numba.njit(cache=True)
+def numba_aroon_up_down(high, low, length, i):
+    """TradingView/ta ``aroon`` tuple: ``(Aroon-Up, Aroon-Down)``.
+
+    Built-in ``ta.aroon`` is ``(down, up)``; the published library swaps that
+    order (see library docs: returns Aroon-Up then Aroon-Down).
+    """
+    down, up = numba_aroon(high, low, length, i)
+    return up, down
 
 
 @numba.njit(cache=True)
@@ -1479,6 +1784,17 @@ def numba_tsi(arr, short_len, long_len, i):
 # Object-mode coercion helpers (pure Python; never called under njit)
 # ---------------------------------------------------------------------------
 
+
+def pine_add(a, b):
+    """Pine ``+``: numeric add, or string concat when either side is text."""
+    if isinstance(a, str) or isinstance(b, str):
+        return str(a) + str(b)
+    try:
+        return a + b
+    except TypeError:
+        return str(a) + str(b)
+
+
 def safe_float(x):
     """Best-effort float cast for plot/series stores in object mode.
 
@@ -1516,9 +1832,7 @@ def safe_float(x):
             # Reject pure words (Round, Neutral, small, tiny, …)
             if any(c.isalpha() for c in s) and not any(c.isdigit() for c in s):
                 return np.nan
-            if s.count(".") > 1 or not (
-                s[0].isdigit() or s[0] in "+-" or s[0] == "."
-            ):
+            if s.count(".") > 1 or not (s[0].isdigit() or s[0] in "+-" or s[0] == "."):
                 return np.nan
             return float(s)
         # array-like with shape (e.g. some matrix stubs)
@@ -1555,6 +1869,7 @@ def na_num(x):
         return float(x)
     return safe_float(x)
 
+
 def safe_int(x):
     """Best-effort int cast; NaN/invalid → 0 (Pine-ish fallback)."""
     try:
@@ -1564,6 +1879,60 @@ def safe_int(x):
         return int(f)
     except Exception:
         return 0
+
+
+@numba.njit(cache=True)
+def _pine_int_jit(x):
+    """nopython Pine ``int()``: NaN/inf → nan; finite truncate toward zero."""
+    if x != x or not np.isfinite(x):
+        return np.nan
+    return float(int(x))
+
+
+def pine_int(x):
+    """Pine ``int()``: None/NaN/inf → nan; finite floats truncate toward zero.
+
+    Distinct from :func:`safe_int`, which maps NaN → 0 for lengths / indexes.
+    Python ``int(nan)`` raises ``ValueError``; Pine ``int(na)`` is ``na``.
+    """
+    fv = x if _is_plain_float(x) else safe_float(x)
+    return _pine_int_jit(fv)
+
+
+_register_njit_overload(pine_int, _pine_int_jit)
+
+
+@numba.njit(cache=True)
+def _pine_bool_jit(x):
+    """nopython Pine ``bool()``: NaN → False; else nonzero."""
+    if x != x:
+        return False
+    return x != 0.0
+
+
+def pine_bool(x):
+    """Pine ``bool()``: None/NaN → False (Python ``bool(nan)`` is True)."""
+    if x is None:
+        return False
+    if isinstance(x, str):
+        return bool(x)
+    fv = x if _is_plain_float(x) else safe_float(x)
+    return _pine_bool_jit(fv)
+
+
+_register_njit_overload(pine_bool, _pine_bool_jit)
+
+
+def pine_string(x):
+    """Pine ``string()``: None/NaN → ``na``; bools ``true``/``false``."""
+    if x is None:
+        return "na"
+    if isinstance(x, bool):
+        return "true" if x else "false"
+    if isinstance(x, (float, np.floating)) and x != x:
+        return "na"
+    return str(x)
+
 
 def safe_period(x, default: int = 0) -> int:
     """Coerce a TA length / for-loop bound to a plain int.
@@ -1612,6 +1981,42 @@ def safe_iter(x):
     except TypeError:
         return ()
 
+
+def safe_iter_pairs(x):
+    """Iterate ``(key, value)`` / ``(index, value)`` pairs; non-iterable → empty.
+
+    dict → ``.items()``; list/tuple of 2-seqs as-is; other sequences →
+    ``enumerate``; scalars / str / None → empty. Does not change ``safe_iter``.
+    """
+    if x is None:
+        return ()
+    if isinstance(x, dict):
+        return x.items()
+    if isinstance(x, (list, tuple)):
+        if x and all(isinstance(e, (list, tuple)) and len(e) == 2 for e in x):
+            return x
+        return enumerate(x)
+    if isinstance(x, np.ndarray):
+        if x.ndim == 0:
+            return ()
+        if x.ndim == 2 and x.shape[1] == 2:
+            return x
+        return enumerate(x)
+    if isinstance(x, (str, bytes, float, int, bool, complex, np.floating, np.integer, np.bool_)):
+        return ()
+    items = getattr(x, "items", None)
+    if callable(items):
+        try:
+            return items()
+        except Exception:
+            return ()
+    try:
+        iter(x)
+        return enumerate(x)
+    except TypeError:
+        return ()
+
+
 def safe_sum(x):
     """Sum numeric elements of a collection; skip str/dict/None (no TypeError)."""
     if x is None:
@@ -1635,6 +2040,17 @@ def safe_sum(x):
             total += f
             n += 1
     return total
+
+
+def array_copy_value(x):
+    """``array.copy`` — shallow copy of a list/tuple/ndarray, else ``[]``.
+
+    Keeps the None/na case total: Pine's ``array.copy(na)`` yields an empty
+    array rather than raising, matching the runtime's NA-as-empty semantics.
+    """
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return list(x)
+    return []
 
 
 def safe_max(x):
@@ -1676,6 +2092,17 @@ def safe_min(x):
     return best
 
 
+def udt_get_field(obj, key, default=np.nan):
+    """Read ``obj[key]`` when *obj* is a UDT dict; else *default*.
+
+    Evaluates *obj* once (call arg), so it is safe in list-comprehension
+    iterables where a walrus bind is a SyntaxError.
+    """
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
+
+
 def udt_index(obj, idx):
     """Index a Pine UDT dict or list/array: dict uses ordered values, list uses int."""
     try:
@@ -1711,6 +2138,55 @@ def udt_set_field(obj, key, val):
     return val
 
 
+@numba.njit(cache=True)
+def numba_timeframe_change(time_arr, i, bucket_ms):
+    """True when bar ``i`` opens a new fixed-width UTC bucket.
+
+    ``bucket_ms`` is the timeframe width in milliseconds. Seconds-scale
+    timestamps (< 1e11) are scaled to ms. Bar 0 is a new period.
+    NaN current is False; NaN prev after bar 0 is False.
+    """
+    if bucket_ms <= 0.0:
+        return False
+    if i < 0:
+        return False
+    t0 = time_arr[i]
+    if t0 != t0:
+        return False
+    if i <= 0:
+        return True
+    t1 = time_arr[i - 1]
+    if t1 != t1:
+        return False
+    if t0 < 1.0e11:
+        t0 = t0 * 1000.0
+    if t1 < 1.0e11:
+        t1 = t1 * 1000.0
+    return (t0 // bucket_ms) != (t1 // bucket_ms)
+
+
+def timeframe_change_at(time_arr, i, timeframe_str, tz=None):
+    """Object-mode ``timeframe.change`` for a (possibly dynamic) TF string."""
+    from pynescript.ast.evaluator.builtins.timeframe import timeframe_period_changed
+
+    try:
+        idx = int(i)
+    except (TypeError, ValueError):
+        return False
+    if idx < 0:
+        return False
+    try:
+        n = len(time_arr)
+    except TypeError:
+        return False
+    if idx >= n:
+        return False
+    curr = time_arr[idx]
+    prev = time_arr[idx - 1] if idx > 0 else None
+    zone = tz if tz is not None else chart_timezone()
+    return timeframe_period_changed(curr, prev, timeframe_str, bar_index=idx, tz=zone)
+
+
 def pine_raise(msg) -> None:
     """Expression-safe ``runtime.error`` for generated code.
 
@@ -1722,6 +2198,203 @@ def pine_raise(msg) -> None:
     (used by compiled prologs) exports it.
     """
     raise RuntimeError(str(msg))
+
+
+# Host chart identity for compile-mode ``syminfo.ticker`` / ``tickerid`` / ``prefix``.
+# Runtime sets these before ``CompiledScript.run`` so error strings and ticker
+# concatenation match interpret (``:PARITY`` vs hardcoded ``SYMBOL``).
+_CHART_TICKER = "SYMBOL"
+_CHART_TICKERID = "SYMBOL"
+_CHART_PREFIX = ""
+_CHART_TIMEZONE = "UTC"
+
+
+def set_chart_identity(ticker="SYMBOL", tickerid=None, prefix="", timezone="UTC"):
+    """Install chart ticker identity for the next compiled run (object mode)."""
+    global _CHART_TICKER, _CHART_TICKERID, _CHART_PREFIX, _CHART_TIMEZONE
+    t = "SYMBOL" if ticker is None else str(ticker)
+    _CHART_TICKER = t
+    _CHART_TICKERID = t if tickerid is None else str(tickerid)
+    _CHART_PREFIX = "" if prefix is None else str(prefix)
+    z = "UTC" if timezone is None else str(timezone).strip()
+    _CHART_TIMEZONE = z or "UTC"
+
+
+def chart_ticker():
+    """Pine ``syminfo.ticker`` (bare ticker)."""
+    return _CHART_TICKER
+
+
+def chart_tickerid():
+    """Pine ``syminfo.tickerid`` (prefix:ticker or bare)."""
+    return _CHART_TICKERID
+
+
+def chart_prefix():
+    """Pine ``syminfo.prefix`` (exchange / empty)."""
+    return _CHART_PREFIX
+
+
+def chart_timezone():
+    """Pine ``syminfo.timezone`` (IANA name; UTC default)."""
+    return _CHART_TIMEZONE
+
+
+_RGBA_RE = re.compile(
+    r"^rgba?\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*,"
+    r"\s*([+-]?\d+(?:\.\d+)?)"
+    r"(?:\s*,\s*([+-]?\d+(?:\.\d+)?))?\s*\)$",
+    re.IGNORECASE,
+)
+_STR_FORMAT_PLACEHOLDER_RE = re.compile(r"\{([^{}]+)\}")
+
+
+def _parse_color_rgba(base):
+    """Return ``(r, g, b, a_0_255)`` or None from a compile color payload."""
+    if base is None:
+        return None
+    if isinstance(base, (float, np.floating)) and base != base:
+        return None
+    if isinstance(base, str):
+        s = base.strip()
+        if not s:
+            return None
+        m = _RGBA_RE.match(s)
+        if m is not None:
+            r = int(float(m.group(1)))
+            g = int(float(m.group(2)))
+            b = int(float(m.group(3)))
+            if m.group(4) is None:
+                a = 255
+            else:
+                af = float(m.group(4))
+                a = int(af) if af > 1.0 else int(round(af * 255.0))
+            return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)), max(0, min(255, a)))
+        if s[0] == "#":
+            h = s[1:]
+        else:
+            h = s
+        if len(h) == 6:
+            try:
+                r = int(h[0:2], 16)
+                g = int(h[2:4], 16)
+                b = int(h[4:6], 16)
+            except ValueError:
+                return None
+            return (r, g, b, 255)
+        if len(h) == 8:
+            try:
+                r = int(h[0:2], 16)
+                g = int(h[2:4], 16)
+                b = int(h[4:6], 16)
+                a = int(h[6:8], 16)
+            except ValueError:
+                return None
+            return (r, g, b, a)
+        return None
+    to_rgba = getattr(base, "to_rgba", None)
+    if callable(to_rgba):
+        try:
+            return _parse_color_rgba(str(to_rgba()))
+        except Exception:
+            return None
+    return None
+
+
+def pine_color_new(base, transp=None):
+    """Pine ``color.new(base, transp)`` → interpret-style ``rgba(r, g, b, a)``.
+
+    ``transp`` is 0–100 (100 = fully transparent). Alpha uses the interpret
+    contract ``int(255 * (1 - transp/100))`` so bgcolor series match.
+    """
+    parsed = _parse_color_rgba(base)
+    if parsed is None:
+        return None if base is None else base
+    r, g, b, a = parsed
+    if transp is None:
+        return (
+            f"rgba({r}, {g}, {b}, {a / 255.0})"
+            if a != 255
+            else (base if isinstance(base, str) else f"#{r:02X}{g:02X}{b:02X}")
+        )
+    try:
+        if isinstance(transp, (float, np.floating)) and transp != transp:
+            return f"rgba({r}, {g}, {b}, {a / 255.0})"
+        tv = int(transp)
+    except (TypeError, ValueError):
+        return base if isinstance(base, str) else f"#{r:02X}{g:02X}{b:02X}"
+    tv = max(0, min(100, tv))
+    a = int(255 * (1.0 - tv / 100.0))
+    return f"rgba({r}, {g}, {b}, {a / 255.0})"
+
+
+def pine_str_format(fmt, *args):
+    """Pine ``str.format(fmt, ...)`` MessageFormat-ish ``{0}`` placeholders."""
+    if fmt is None:
+        return "NaN"
+    if isinstance(fmt, (float, np.floating)) and fmt != fmt:
+        return "NaN"
+    value = str(fmt)
+    fmt_args = list(args)
+
+    def _replace(match: re.Match) -> str:
+        body = match.group(1)
+        parts = [p.strip() for p in body.split(",")]
+        try:
+            idx = int(parts[0])
+        except (TypeError, ValueError):
+            return match.group(0)
+        if idx < 0 or idx >= len(fmt_args):
+            return ""
+        arg = fmt_args[idx]
+        if arg is None:
+            return "NaN"
+        if isinstance(arg, (float, np.floating)) and arg != arg:
+            return "NaN"
+        kind = parts[1].lower() if len(parts) > 1 else ""
+        pattern = parts[2] if len(parts) > 2 else ""
+        if kind in {"", "string"}:
+            return str(arg)
+        if kind == "number":
+            try:
+                num = float(arg)
+            except (TypeError, ValueError):
+                return str(arg)
+            if pattern:
+                if "." in pattern:
+                    decimals = len(pattern.split(".", 1)[1])
+                    return f"{num:.{decimals}f}"
+                try:
+                    return str(int(num))
+                except (TypeError, ValueError):
+                    return f"{num:g}"
+            return f"{num:g}"
+        if kind == "integer":
+            try:
+                return str(int(float(arg)))
+            except (TypeError, ValueError):
+                return str(arg)
+        return str(arg)
+
+    try:
+        return _STR_FORMAT_PLACEHOLDER_RE.sub(_replace, value)
+    except Exception:
+        try:
+            return value.format(*fmt_args)
+        except Exception:
+            return value + "".join(str(a) for a in fmt_args)
+
+
+def safe_contains(container, value) -> bool:
+    """Pine ``array.includes`` / ``x in y`` that never TypeErrors on scalars."""
+    if container is None:
+        return False
+    if isinstance(container, (float, int, bool, complex, np.floating, np.integer, np.bool_)):
+        return False
+    try:
+        return value in container
+    except TypeError:
+        return False
 
 
 def str_split(value, sep=None):
@@ -1784,6 +2457,7 @@ def safe_list_set(arr, index, value):
     if idx < len(arr):
         arr[idx] = value
     return arr
+
 
 def safe_list_append(arr, value):
     """Append to a real list; no-op when *arr* is float/None (misclassified series)."""
@@ -1923,12 +2597,7 @@ def array_fill(arr, value, index_from=None, index_to=None):
     if not isinstance(arr, list):
         return arr
     # Matrix (list-of-lists) full fill when no range
-    if (
-        arr
-        and isinstance(arr[0], list)
-        and index_from is None
-        and index_to is None
-    ):
+    if arr and isinstance(arr[0], list) and index_from is None and index_to is None:
         for row in arr:
             if isinstance(row, list):
                 for c in range(len(row)):
@@ -2188,6 +2857,10 @@ def array_binary_search_rightmost(arr, value, sort_field=None):
 
 
 def _matrix_ncols(m) -> int:
+    if m is None or isinstance(
+        m, (bool, np.bool_, str, bytes, dict, set, float, int, complex, np.floating, np.integer)
+    ):
+        return 0
     if not m:
         return 0
     try:
@@ -2197,8 +2870,16 @@ def _matrix_ncols(m) -> int:
 
 
 def _matrix_ensure(m):
-    """Coerce *m* to a mutable list-of-lists matrix handle."""
-    if m is None:
+    """Coerce *m* to a mutable list-of-lists matrix handle.
+
+    Numpy/Python scalars are not matrices — return ``[]`` rather than calling
+    ``len()`` (TypeError: object of type 'numpy.float64' has no len()).
+    """
+    if m is None or isinstance(
+        m, (bool, np.bool_, str, bytes, dict, set, float, int, complex, np.floating, np.integer)
+    ):
+        return []
+    if isinstance(m, np.ndarray) and m.ndim == 0:
         return []
     if isinstance(m, list):
         return m
@@ -2206,6 +2887,24 @@ def _matrix_ensure(m):
         return [list(row) for row in m]
     except TypeError:
         return []
+
+
+def matrix_set(m, row, col, value):
+    """Set ``m[row][col] = value``; return *m*. Soft no-op on bad index/handle."""
+    if not isinstance(m, list):
+        return m
+    try:
+        r = int(row)
+        c = int(col)
+    except (TypeError, ValueError):
+        return m
+    if r < 0 or c < 0 or r >= len(m):
+        return m
+    row_data = m[r]
+    if not isinstance(row_data, list) or c >= len(row_data):
+        return m
+    row_data[c] = value
+    return m
 
 
 def matrix_add_row(m, *rest):
@@ -2359,9 +3058,7 @@ def matrix_reshape(m, rows, cols):
         flat = flat + [np.nan] * (need - len(flat))
     else:
         flat = flat[:need]
-    new_data = [
-        [flat[r * cols_i + c] for c in range(cols_i)] for r in range(rows_i)
-    ]
+    new_data = [[flat[r * cols_i + c] for c in range(cols_i)] for r in range(rows_i)]
     m.clear()
     m.extend(new_data)
     return m
@@ -2436,6 +3133,7 @@ def sequence_from_series(src, length=None, shift=0, direction_forward=True, i=No
 # ---------------------------------------------------------------------------
 # Incremental TA (``*_inc``) — fixed-size ``st`` vectors from CompilerVisitor
 # ---------------------------------------------------------------------------
+
 
 @numba.njit(cache=True)
 def numba_ema_inc(arr, period, i, st):
@@ -2612,9 +3310,10 @@ def numba_atr_inc(high, low, close, period, i, st):
 
 @numba.njit(cache=True)
 def numba_macd_inc(arr, fast, slow, signal, i, st):
-    """Incremental MACD. ``st``: [ema_f, ema_s, sig, last_i].
+    """Incremental MACD. ``st``: [ema_f, ema_s, sig, last_i, seed_n, seed_sum].
 
-    Amortized O(1) per sequential bar; matches ``numba_macd`` values.
+    SMA seed on fast/slow/signal (matches ``numba_macd`` / interpret).
+    ``st`` must have length >= 6.
     """
     fast = int(fast)
     slow = int(slow)
@@ -2631,6 +3330,8 @@ def numba_macd_inc(arr, fast, slow, signal, i, st):
         st[0] = np.nan
         st[1] = np.nan
         st[2] = np.nan
+        st[4] = np.nan
+        st[5] = np.nan
 
     alpha_f = 2.0 / (fast + 1.0)
     alpha_s = 2.0 / (slow + 1.0)
@@ -2639,6 +3340,8 @@ def numba_macd_inc(arr, fast, slow, signal, i, st):
     ema_f = st[0]
     ema_s = st[1]
     sig = st[2]
+    seed_n = 0 if np.isnan(st[4]) else int(st[4])
+    seed_sum = 0.0 if np.isnan(st[5]) else st[5]
 
     for j in range(last + 1, i + 1):
         # Fast EMA: seed at fast-1, advance on later bars (including through slow-1)
@@ -2650,29 +3353,39 @@ def numba_macd_inc(arr, fast, slow, signal, i, st):
         elif j >= fast:
             ema_f = alpha_f * arr[j] + (1.0 - alpha_f) * ema_f
 
-        # Slow EMA + signal: seed at slow-1, then joint advance
         if j == slow - 1:
             sum_s = 0.0
             for k in range(slow):
                 sum_s += arr[k]
             ema_s = sum_s / slow
-            macd_val = ema_f - ema_s
-            sig = macd_val
         elif j >= slow:
-            # ema_f already advanced above for this j
             ema_s = alpha_s * arr[j] + (1.0 - alpha_s) * ema_s
-            macd_val = ema_f - ema_s
-            sig = alpha_sig * macd_val + (1.0 - alpha_sig) * sig
+
+        if j >= slow - 1 and not np.isnan(ema_f) and not np.isnan(ema_s):
+            macd_j = ema_f - ema_s
+            if seed_n < signal:
+                seed_sum += macd_j
+                seed_n += 1
+                if seed_n == signal:
+                    sig = seed_sum / signal
+            else:
+                sig = alpha_sig * macd_j + (1.0 - alpha_sig) * sig
 
     st[0] = ema_f
     st[1] = ema_s
     st[2] = sig
     st[3] = float(i)
+    st[4] = float(seed_n)
+    st[5] = seed_sum
 
     if i < slow - 1:
         return np.nan, np.nan, np.nan
     macd_val = ema_f - ema_s
+    if seed_n < signal:
+        return macd_val, np.nan, np.nan
     return macd_val, sig, macd_val - sig
+
+
 @numba.njit(cache=True)
 def numba_cum_inc(arr, i, st):
     """Incremental cum. ``st``: [sum, last_i]."""
@@ -2693,8 +3406,10 @@ def numba_cum_inc(arr, i, st):
     st[0] = s
     st[1] = float(i)
     return s
+
+
 @numba.njit(cache=True)
-def numba_pine_eq(a, b):
+def _numba_pine_eq_jit(a, b):
     """Pine ``==``: ``na==na`` is True; any other comparison with ``na`` is False."""
     a_na = a != a  # NaN
     b_na = b != b
@@ -2705,12 +3420,32 @@ def numba_pine_eq(a, b):
     return a == b
 
 
+def numba_pine_eq(a, b):
+    """Pine ``==``; None/NA → nan (object-mode UDT fields)."""
+    fa = _as_njit_float(a)
+    fb = _as_njit_float(b)
+    return _numba_pine_eq_jit(fa, fb)
+
+
+_register_njit_overload(numba_pine_eq, _numba_pine_eq_jit)
+
+
 @numba.njit(cache=True)
-def numba_pine_ne(a, b):
+def _numba_pine_ne_jit(a, b):
     """Pine ``!=``: any comparison involving ``na`` is False (incl. ``na!=na``)."""
     if a != a or b != b:  # either NaN
         return False
     return a != b
+
+
+def numba_pine_ne(a, b):
+    """Pine ``!=``; None/NA → nan (object-mode UDT fields)."""
+    fa = _as_njit_float(a)
+    fb = _as_njit_float(b)
+    return _numba_pine_ne_jit(fa, fb)
+
+
+_register_njit_overload(numba_pine_ne, _numba_pine_ne_jit)
 
 
 @numba.njit(cache=True)
@@ -2782,19 +3517,74 @@ def numba_vwap_anchor_inc(src, vol, anchor, i, st):
 
 
 @numba.njit(cache=True)
+def numba_vwap_bands_inc(src, vol, anchor, mult, i, st):
+    """Anchored VWAP plus volume-weighted stdev bands.
+
+    ``st``: [cum_pv, cum_v, cum_p2v, last_i]. Returns ``(vwap, upper, lower)``
+    matching reference ``ta.vwap(source, anchor, stdev_mult)``.
+    Variance is ``E[x^2] - E[x]^2`` over the current anchor window (volume
+    weights). Single-sample windows have stdev 0 so bands equal VWAP.
+    """
+    if i < 0:
+        return np.nan, np.nan, np.nan
+    if np.isnan(st[3]):
+        last = -1
+    else:
+        last = int(st[3])
+    if i < last:
+        last = -1
+        st[0] = 0.0
+        st[1] = 0.0
+        st[2] = 0.0
+    cum_pv = 0.0 if last < 0 or np.isnan(st[0]) else st[0]
+    cum_v = 0.0 if last < 0 or np.isnan(st[1]) else st[1]
+    cum_p2v = 0.0 if last < 0 or np.isnan(st[2]) else st[2]
+    for j in range(last + 1, i + 1):
+        a = anchor[j]
+        if not np.isnan(a) and a != 0.0:
+            cum_pv = 0.0
+            cum_v = 0.0
+            cum_p2v = 0.0
+        p = src[j]
+        v = vol[j]
+        if np.isnan(p) or np.isnan(v):
+            continue
+        cum_pv += p * v
+        cum_v += v
+        cum_p2v += p * p * v
+    st[0] = cum_pv
+    st[1] = cum_v
+    st[2] = cum_p2v
+    st[3] = float(i)
+    if cum_v == 0.0:
+        return np.nan, np.nan, np.nan
+    vwap = cum_pv / cum_v
+    var = cum_p2v / cum_v - vwap * vwap
+    if var < 0.0:
+        var = 0.0
+    sd = np.sqrt(var)
+    m = float(mult)
+    return vwap, vwap + sd * m, vwap - sd * m
+
+
+@numba.njit(cache=True)
 def numba_obv_inc(close, vol, i, st):
-    """Incremental OBV. ``st``: [obv, last_i]."""
+    """Incremental OBV. ``st``: [obv, last_i]. Matches ``numba_obv``."""
     if i < 0:
         return np.nan
+    if i < 2:
+        st[0] = 0.0
+        st[1] = float(i)
+        return 0.0
     if np.isnan(st[1]):
-        last = 0
+        last = 1
     else:
         last = int(st[1])
     if i < last:
-        last = 0
+        last = 1
         st[0] = 0.0
-    obv = 0.0 if last <= 0 or np.isnan(st[0]) else st[0]
-    start = 1 if last < 1 else last + 1
+    obv = 0.0 if last < 2 or np.isnan(st[0]) else st[0]
+    start = 2 if last < 2 else last + 1
     for j in range(start, i + 1):
         if close[j] > close[j - 1]:
             obv += vol[j]
@@ -2803,6 +3593,110 @@ def numba_obv_inc(close, vol, i, st):
     st[0] = obv
     st[1] = float(i)
     return obv
+
+
+@numba.njit(cache=True)
+def numba_nvi_inc(close, vol, i, st):
+    """Incremental NVI. ``st``: [nvi, prev_c, prev_v, last_i].
+
+    Seed 1000 on bar 0. Later bars multiply by ``(1 + close_change)`` when
+    volume decreases. Matches interpret ``_nvi_inc_update``.
+    """
+    if i < 0:
+        return np.nan
+    if i == 0:
+        st[0] = 1000.0
+        st[1] = close[0]
+        st[2] = vol[0] if not np.isnan(vol[0]) else 0.0
+        st[3] = 0.0
+        return 1000.0
+    prev_i = int(st[3]) if not np.isnan(st[3]) else -1
+    if prev_i == i:
+        return st[0]
+    if prev_i != i - 1:
+        nvi = 1000.0
+        for j in range(1, i + 1):
+            c0 = close[j - 1]
+            c1 = close[j]
+            v0 = vol[j - 1]
+            v1 = vol[j]
+            vv0 = 0.0 if np.isnan(v0) else v0
+            vv1 = 0.0 if np.isnan(v1) else v1
+            if not (np.isnan(c0) or np.isnan(c1)):
+                ch = 0.0 if c0 == 0.0 else (c1 - c0) / c0
+                if vv1 < vv0:
+                    nvi = nvi * (1.0 + ch)
+        st[0] = nvi
+        st[1] = close[i]
+        st[2] = vol[i] if not np.isnan(vol[i]) else 0.0
+        st[3] = float(i)
+        return nvi
+    nvi = st[0] if not np.isnan(st[0]) else 1000.0
+    c0 = st[1]
+    c1 = close[i]
+    vv0 = 0.0 if np.isnan(st[2]) else st[2]
+    vv1 = 0.0 if np.isnan(vol[i]) else vol[i]
+    if not (np.isnan(c0) or np.isnan(c1)):
+        ch = 0.0 if c0 == 0.0 else (c1 - c0) / c0
+        if vv1 < vv0:
+            nvi = nvi * (1.0 + ch)
+        st[1] = c1
+    st[0] = nvi
+    st[2] = vv1
+    st[3] = float(i)
+    return nvi
+
+
+@numba.njit(cache=True)
+def numba_pvi_inc(close, vol, i, st):
+    """Incremental PVI. ``st``: [pvi, prev_c, prev_v, last_i].
+
+    Seed 1000 on bar 0. Later bars multiply by ``(1 + close_change)`` when
+    volume increases. Matches interpret ``_pvi_inc_update``.
+    """
+    if i < 0:
+        return np.nan
+    if i == 0:
+        st[0] = 1000.0
+        st[1] = close[0]
+        st[2] = vol[0] if not np.isnan(vol[0]) else 0.0
+        st[3] = 0.0
+        return 1000.0
+    prev_i = int(st[3]) if not np.isnan(st[3]) else -1
+    if prev_i == i:
+        return st[0]
+    if prev_i != i - 1:
+        pvi = 1000.0
+        for j in range(1, i + 1):
+            c0 = close[j - 1]
+            c1 = close[j]
+            v0 = vol[j - 1]
+            v1 = vol[j]
+            vv0 = 0.0 if np.isnan(v0) else v0
+            vv1 = 0.0 if np.isnan(v1) else v1
+            if not (np.isnan(c0) or np.isnan(c1)):
+                ch = 0.0 if c0 == 0.0 else (c1 - c0) / c0
+                if vv1 > vv0:
+                    pvi = pvi * (1.0 + ch)
+        st[0] = pvi
+        st[1] = close[i]
+        st[2] = vol[i] if not np.isnan(vol[i]) else 0.0
+        st[3] = float(i)
+        return pvi
+    pvi = st[0] if not np.isnan(st[0]) else 1000.0
+    c0 = st[1]
+    c1 = close[i]
+    vv0 = 0.0 if np.isnan(st[2]) else st[2]
+    vv1 = 0.0 if np.isnan(vol[i]) else vol[i]
+    if not (np.isnan(c0) or np.isnan(c1)):
+        ch = 0.0 if c0 == 0.0 else (c1 - c0) / c0
+        if vv1 > vv0:
+            pvi = pvi * (1.0 + ch)
+        st[1] = c1
+    st[0] = pvi
+    st[2] = vv1
+    st[3] = float(i)
+    return pvi
 
 
 @numba.njit(cache=True)
@@ -3487,7 +4381,11 @@ def numba_stoch_inc(source, high, low, length, i, st):
     st[4] = float(i)
     if i < length - 1:
         return np.nan
-    if np.isnan(hh) or np.isnan(ll) or np.isnan(source[i]):
+    start = i - length + 1
+    for k in range(start, i + 1):
+        if np.isnan(high[k]) or np.isnan(low[k]):
+            return np.nan
+    if np.isnan(source[i]) or np.isnan(hh) or np.isnan(ll):
         return np.nan
     if hh == ll:
         return 50.0
@@ -4255,13 +5153,13 @@ def numba_falling_inc(arr, length, i, st):
 
 
 @numba.njit(cache=True)
-def numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):
+def _numba_valuewhen_inc_jit(cond_arr, src_arr, occ, i, st):
     """Amortized-O(1) valuewhen via ring of recent true bar indices.
 
     ``st`` layout (size >= 3 + occ + 1):
       [n_found, head, last_i, hist_0, ..., hist_occ]
     ``hist`` is a ring of bar indices (write at ``head % cap``).
-    Matches ``numba_valuewhen`` for sequential / gap / rewind bars.
+    Matches ``_numba_valuewhen_jit`` for sequential / gap / rewind bars.
     """
     occ = int(occ)
     if occ < 0 or i < 0:
@@ -4269,7 +5167,7 @@ def numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):
     cap = occ + 1
     # Require packed hist after the 3 control slots
     if len(st) < 3 + cap:
-        return numba_valuewhen(cond_arr, src_arr, occ, i)
+        return _numba_valuewhen_jit(cond_arr, src_arr, occ, i)
 
     if np.isnan(st[2]):
         last = -1
@@ -4303,8 +5201,25 @@ def numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):
     return src_arr[bar_i]
 
 
+def numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):
+    """Incremental valuewhen; object-dtype cond/src fall back to Python scan."""
+    if _is_f64_1d(cond_arr) and _is_f64_1d(src_arr) and _is_f64_1d(st):
+        return _numba_valuewhen_inc_jit(cond_arr, src_arr, occ, i, st)
+    return numba_valuewhen(cond_arr, src_arr, occ, i)
+
+
+def _ol_numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):  # noqa: ARG001
+    def impl(cond_arr, src_arr, occ, i, st):
+        return _numba_valuewhen_inc_jit(cond_arr, src_arr, occ, i, st)
+
+    return impl
+
+
+numba.extending.overload(numba_valuewhen_inc)(_ol_numba_valuewhen_inc)
+
+
 @numba.njit(cache=True)
-def numba_running_max_inc(arr, i, st):
+def _numba_running_max_inc_jit(arr, i, st):
     """O(1) all-time max of ``arr[0..i]``. ``st``: [max_val, last_i].
 
     Matches ``numba_highest(arr, i+1, i)`` (NaN ignored when a finite exists).
@@ -4328,8 +5243,69 @@ def numba_running_max_inc(arr, i, st):
     return m
 
 
+def _running_ext_py(arr, i, st, *, want_max: bool):
+    """Object-array running max/min; never njit ``array(pyobject)``."""
+    try:
+        idx = int(i)
+    except (TypeError, ValueError):
+        return np.nan
+    if idx < 0:
+        return np.nan
+    m = np.nan
+    last = -1
+    try:
+        if st is not None and len(st) >= 2:
+            m = safe_float(st[0])
+            lf = safe_float(st[1])
+            last = -1 if lf != lf else int(lf)
+    except TypeError:
+        m = np.nan
+        last = -1
+    if idx < last:
+        last = -1
+        m = np.nan
+    try:
+        n = len(arr)
+    except TypeError:
+        return np.nan
+    end = min(idx + 1, n)
+    start = 0 if last < -1 else last + 1
+    if start < 0:
+        start = 0
+    for j in range(start, end):
+        v = safe_float(arr[j])
+        if m != m:
+            m = v
+        elif v == v and ((want_max and v > m) or (not want_max and v < m)):
+            m = v
+    try:
+        if st is not None and len(st) >= 2:
+            st[0] = m
+            st[1] = float(idx)
+    except TypeError:
+        pass
+    return m
+
+
+def numba_running_max_inc(arr, i, st):
+    """Running max; object-dtype buffers use a Python scan."""
+    if _is_f64_1d(arr) and _is_f64_1d(st):
+        return _numba_running_max_inc_jit(arr, i, st)
+    return _running_ext_py(arr, i, st, want_max=True)
+
+
+def _ol_numba_running_max_inc(arr, i, st):  # noqa: ARG001
+    def impl(arr, i, st):
+        return _numba_running_max_inc_jit(arr, i, st)
+
+    return impl
+
+
+numba.extending.overload(numba_running_max_inc)(_ol_numba_running_max_inc)
+
+
 @numba.njit(cache=True)
-def numba_running_min_inc(arr, i, st):
+def _numba_running_min_inc_jit(arr, i, st):
     """O(1) all-time min of ``arr[0..i]``. ``st``: [min_val, last_i].
 
     Matches ``numba_lowest(arr, i+1, i)``.
@@ -4351,6 +5327,23 @@ def numba_running_min_inc(arr, i, st):
     st[0] = m
     st[1] = float(i)
     return m
+
+
+def numba_running_min_inc(arr, i, st):
+    """Running min; object-dtype buffers use a Python scan."""
+    if _is_f64_1d(arr) and _is_f64_1d(st):
+        return _numba_running_min_inc_jit(arr, i, st)
+    return _running_ext_py(arr, i, st, want_max=False)
+
+
+def _ol_numba_running_min_inc(arr, i, st):  # noqa: ARG001
+    def impl(arr, i, st):
+        return _numba_running_min_inc_jit(arr, i, st)
+
+    return impl
+
+
+numba.extending.overload(numba_running_min_inc)(_ol_numba_running_min_inc)
 
 
 @numba.njit(cache=True)
@@ -4602,6 +5595,7 @@ def numba_tema_inc(arr, period, i, st, e1_raw, e2_raw):
 # ---------------------------------------------------------------------------
 # Round 6: ADX / DMI / Supertrend / ALMA_inc (match current interpret oracle)
 # ---------------------------------------------------------------------------
+
 
 @numba.njit(cache=True)
 def _rma_step4(st, base, x, period):
@@ -5204,6 +6198,39 @@ def numba_median(arr, length, i):
     return 0.5 * (window[mid - 1] + window[mid])
 
 
+@numba.njit(cache=False)
+def numba_median_inc(arr, length, i, st):
+    """Rolling median using preallocated *st* (no per-bar ``np.empty``).
+
+    *st* must have length ``>= length``. Same last-value contract as
+    :func:`numba_median` / interpret ``_median_inc_update``.
+    """
+    length = int(length)
+    if length <= 0 or i < length - 1:
+        return np.nan
+    if len(st) < length:
+        return numba_median(arr, length, i)
+    count = 0
+    for j in range(length):
+        v = arr[i - j]
+        if not np.isnan(v):
+            st[count] = v
+            count += 1
+    if count == 0:
+        return np.nan
+    for a in range(1, count):
+        key = st[a]
+        b = a - 1
+        while b >= 0 and st[b] > key:
+            st[b + 1] = st[b]
+            b -= 1
+        st[b + 1] = key
+    if count % 2 == 1:
+        return st[count // 2]
+    mid = count // 2
+    return 0.5 * (st[mid - 1] + st[mid])
+
+
 @numba.njit(cache=True)
 def numba_wpr(high, low, close, period, i):
     """Williams %R at bar ``i`` (reference ``ta.wpr``).
@@ -5230,6 +6257,55 @@ def numba_wpr(high, low, close, period, i):
 
 
 @numba.njit(cache=True)
+def _numba_uo_avg(high, low, close, length, i):
+    """Buying-pressure / true-range average over ``length`` bars ending at ``i``.
+
+    Williams true range: ``max(high, prev_close) - min(low, prev_close)``.
+    Returns NaN when the window is short, contains NaN, or true-range sum is 0.
+    """
+    length = int(length)
+    if length <= 0 or i < length:
+        return np.nan
+    bp = 0.0
+    tr = 0.0
+    start = i - length + 1
+    for j in range(start, i + 1):
+        prev = close[j - 1]
+        h = high[j]
+        l_ = low[j]
+        c = close[j]
+        if np.isnan(prev) or np.isnan(h) or np.isnan(l_) or np.isnan(c):
+            return np.nan
+        low_ref = l_ if l_ < prev else prev
+        high_ref = h if h > prev else prev
+        bp += c - low_ref
+        tr += high_ref - low_ref
+    if tr == 0.0:
+        return np.nan
+    return bp / tr
+
+
+@numba.njit(cache=True)
+def numba_uo(high, low, close, len1, len2, len3, i):
+    """Ultimate Oscillator at bar ``i`` (reference ``ta.uo``).
+
+    ``100 * (4*avg(len1) + 2*avg(len2) + avg(len3)) / 7``. Warm-up is NaN
+    until the longest window has a previous close.
+    """
+    len1 = int(len1)
+    len2 = int(len2)
+    len3 = int(len3)
+    if len1 <= 0 or len2 <= 0 or len3 <= 0:
+        return np.nan
+    a1 = _numba_uo_avg(high, low, close, len1, i)
+    a2 = _numba_uo_avg(high, low, close, len2, i)
+    a3 = _numba_uo_avg(high, low, close, len3, i)
+    if np.isnan(a1) or np.isnan(a2) or np.isnan(a3):
+        return np.nan
+    return 100.0 * (4.0 * a1 + 2.0 * a2 + a3) / 7.0
+
+
+@numba.njit(cache=True)
 def numba_cmo(arr, length, i):
     """Chande Momentum Oscillator over ``length`` changes ending at ``i``.
 
@@ -5252,6 +6328,70 @@ def numba_cmo(arr, length, i):
             up += diff
         else:
             down += -diff
+    denom = up + down
+    if denom == 0.0:
+        return 0.0
+    return 100.0 * (up - down) / denom
+
+
+@numba.njit(cache=False)
+def numba_cmo_inc(arr, length, i, st):
+    """Incremental CMO; *st* is ``[up, down, last_i]``.
+
+    If *st* did not come from bar ``i-1`` (first call, gap, or nopython
+    state not persisting), seed from a full-window scan so last-value stays
+    correct. Matches :func:`numba_cmo` / interpret ``_cmo_inc_update``.
+    """
+    length = int(length)
+    if length <= 0 or i < length:
+        return np.nan
+    if len(st) < 3:
+        return numba_cmo(arr, length, i)
+
+    last_i = st[2]
+    need_seed = last_i != last_i or int(last_i) != i - 1
+    if need_seed:
+        up = 0.0
+        down = 0.0
+        for j in range(i - length + 1, i + 1):
+            a = arr[j - 1]
+            b = arr[j]
+            if np.isnan(a) or np.isnan(b):
+                continue
+            diff = b - a
+            if diff > 0.0:
+                up += diff
+            else:
+                down += -diff
+        st[0] = up
+        st[1] = down
+        st[2] = float(i)
+        denom = up + down
+        if denom == 0.0:
+            return 0.0
+        return 100.0 * (up - down) / denom
+
+    up = st[0]
+    down = st[1]
+    a0 = arr[i - length - 1]
+    b0 = arr[i - length]
+    if not (np.isnan(a0) or np.isnan(b0)):
+        old = b0 - a0
+        if old > 0.0:
+            up -= old
+        else:
+            down -= -old
+    a1 = arr[i - 1]
+    b1 = arr[i]
+    if not (np.isnan(a1) or np.isnan(b1)):
+        new = b1 - a1
+        if new > 0.0:
+            up += new
+        else:
+            down += -new
+    st[0] = up
+    st[1] = down
+    st[2] = float(i)
     denom = up + down
     if denom == 0.0:
         return 0.0
@@ -5612,6 +6752,63 @@ def numba_cmf_inc(high, low, close, vol, period, i, st):
     return 0.0
 
 
+@numba.njit(cache=True)
+def numba_wad(high, low, close, vol, i):
+    """Williams A/D at bar ``i``. Bar 0 is 0; nan volume counts as 0."""
+    if i < 0:
+        return np.nan
+    wad = 0.0
+    if i == 0:
+        return 0.0
+    for j in range(1, i + 1):
+        c = close[j]
+        pc = close[j - 1]
+        v = vol[j]
+        if np.isnan(v):
+            v = 0.0
+        if c > pc:
+            wad += v * (c - low[j])
+        elif c < pc:
+            wad -= v * (high[j] - c)
+    return wad
+
+
+@numba.njit(cache=True)
+def numba_iii(high, low, close, i):
+    """Intraday Intensity Index at bar ``i``: ``(2*c-h-l)/(h-l)``; range 0 → 0.0."""
+    if i < 0:
+        return np.nan
+    h = high[i]
+    l_ = low[i]
+    c = close[i]
+    rng = h - l_
+    if rng == 0.0:
+        return 0.0
+    return (2.0 * c - h - l_) / rng
+
+
+@numba.njit(cache=True)
+def numba_wvad(high, low, close, vol, period, i):
+    """Williams Volume A/D: ``wad[i] / sum(vol window)``; 0 if vol_sum == 0."""
+    period = int(period)
+    if i < 0:
+        return np.nan
+    if period <= 0:
+        return 0.0
+    wad = numba_wad(high, low, close, vol, i)
+    start = i - period + 1
+    if start < 0:
+        start = 0
+    vol_sum = 0.0
+    for j in range(start, i + 1):
+        v = vol[j]
+        if not np.isnan(v):
+            vol_sum += v
+    if vol_sum == 0.0:
+        return 0.0
+    return wad / vol_sum
+
+
 def array_range(arr):
     """Pine ``array.range(id)`` — max − min of numeric elements; empty → na.
 
@@ -5630,6 +6827,536 @@ def array_range(arr):
         return np.nan
     return hi - lo
 
+
+def _array_finite_nums(arr):
+    """Finite numeric elements of *arr*; bad input → []."""
+    nums = []
+    if arr is None:
+        return nums
+    try:
+        seq = list(arr)
+    except TypeError:
+        return nums
+    for x in seq:
+        f = safe_float(x)
+        if f == f:
+            nums.append(f)
+    return nums
+
+
+def array_abs(arr):
+    """Pine ``array.abs`` — elementwise abs; na stays na."""
+    if arr is None:
+        return []
+    try:
+        seq = list(arr)
+    except TypeError:
+        return []
+    out = []
+    for x in seq:
+        if x is None:
+            out.append(np.nan)
+            continue
+        try:
+            if x != x:
+                out.append(np.nan)
+                continue
+            out.append(abs(x))
+        except (TypeError, ValueError):
+            f = safe_float(x)
+            out.append(abs(f) if f == f else np.nan)
+    return out
+
+
+def array_every(arr, predicate=None):
+    """Unary: all truthy. Binary: all(predicate(x)). Non-callable pred → unary."""
+    if arr is None:
+        return False
+    try:
+        seq = list(arr)
+    except TypeError:
+        return False
+    if not callable(predicate):
+        return all(bool(x) and x == x for x in seq)
+    return all(predicate(x) for x in seq)
+
+
+def array_some(arr, predicate=None):
+    """Unary: any truthy. Binary: any(predicate(x)). Non-callable pred → unary."""
+    if arr is None:
+        return False
+    try:
+        seq = list(arr)
+    except TypeError:
+        return False
+    if not callable(predicate):
+        return any(bool(x) and x == x for x in seq)
+    return any(predicate(x) for x in seq)
+
+
+def array_percentile_linear_interpolation(arr, percentile):
+    """Sort finite nums, ``h=(p/100)*(n-1)``, linear interpolate. Empty → nan."""
+    nums = _array_finite_nums(arr)
+    if not nums:
+        return np.nan
+    try:
+        p = float(percentile)
+    except (TypeError, ValueError):
+        return np.nan
+    if p != p:
+        return np.nan
+    nums.sort()
+    n = len(nums)
+    h = (p / 100.0) * (n - 1)
+    h_floor = int(h)
+    h_frac = h - h_floor
+    if h_floor >= n - 1:
+        return float(nums[-1])
+    if h_floor < 0:
+        return float(nums[0])
+    return float(nums[h_floor] * (1.0 - h_frac) + nums[h_floor + 1] * h_frac)
+
+
+def array_percentile_nearest_rank(arr, percentile):
+    """``rank = max(1, int((p/100)*n + 0.5))``; return sorted[rank-1]. Empty → nan."""
+    nums = _array_finite_nums(arr)
+    if not nums:
+        return np.nan
+    try:
+        p = float(percentile)
+    except (TypeError, ValueError):
+        return np.nan
+    if p != p:
+        return np.nan
+    nums.sort()
+    n = len(nums)
+    rank = max(1, int((p / 100.0) * n + 0.5))
+    if rank > n:
+        rank = n
+    return nums[rank - 1]
+
+
+def array_percentrank(arr, value):
+    """``((count of nums <= value) - 1) / (n - 1) * 100``; ``n==1`` → 0.0."""
+    nums = _array_finite_nums(arr)
+    if not nums:
+        return np.nan
+    v = safe_float(value)
+    if v != v:
+        return np.nan
+    n = len(nums)
+    if n == 1:
+        return 0.0
+    count = sum(1 for x in nums if x <= v)
+    return ((count - 1) / (n - 1)) * 100.0
+
+
+def map_put_all(dest, src):
+    """``dict.update``; no-op if either is not a dict. Return dest."""
+    if not isinstance(dest, dict) or not isinstance(src, dict):
+        return dest
+    dest.update(src)
+    return dest
+
+
+def _matrix_float_array(m):
+    """List-of-lists → 2-d float64 ndarray; bad input → None."""
+    if isinstance(m, (bool, np.bool_, str, bytes, dict, set, float, int, complex, np.floating, np.integer)):
+        return None
+    if isinstance(m, np.ndarray) and m.ndim == 0:
+        return None
+    m = _matrix_ensure(m)
+    if not isinstance(m, list):
+        return None
+    if not m:
+        return np.zeros((0, 0), dtype=np.float64)
+    ncols = _matrix_ncols(m)
+    rows = []
+    for row in m:
+        if isinstance(row, (list, tuple, np.ndarray)):
+            cells = [safe_float(x) for x in row]
+        else:
+            cells = [safe_float(row)]
+        if len(cells) < ncols:
+            cells.extend([np.nan] * (ncols - len(cells)))
+        elif ncols >= 0:
+            cells = cells[:ncols]
+        rows.append(cells)
+    try:
+        return np.asarray(rows, dtype=np.float64)
+    except Exception:
+        return None
+
+
+def _matrix_flat_finite(m):
+    """Flatten finite numeric cells of a list-of-lists matrix."""
+    m = _matrix_ensure(m)
+    vals = []
+    for row in m:
+        cells = row if isinstance(row, (list, tuple, np.ndarray)) else [row]
+        for x in cells:
+            f = safe_float(x)
+            if f == f:
+                vals.append(f)
+    return vals
+
+
+def matrix_det(m):
+    """``np.linalg.det`` on list-of-lists; non-square / bad input → nan."""
+    arr = _matrix_float_array(m)
+    if arr is None or arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        return np.nan
+    if arr.shape[0] == 0:
+        return 1.0
+    try:
+        return float(np.linalg.det(arr))
+    except Exception:
+        return np.nan
+
+
+def matrix_inv(m):
+    """Inverse of a square list-of-lists matrix; bad input → []."""
+    arr = _matrix_float_array(m)
+    if arr is None or arr.ndim != 2 or arr.shape[0] != arr.shape[1] or arr.shape[0] == 0:
+        return []
+    try:
+        return np.linalg.inv(arr).tolist()
+    except Exception:
+        return []
+
+
+def matrix_pinv(m):
+    """Moore–Penrose pseudoinverse; bad input → []."""
+    arr = _matrix_float_array(m)
+    if arr is None or arr.ndim != 2:
+        return []
+    try:
+        return np.linalg.pinv(arr).tolist()
+    except Exception:
+        return []
+
+
+def matrix_transpose(m):
+    """Transpose list-of-lists; empty / bad input → []."""
+    m = _matrix_ensure(m)
+    if not m:
+        return []
+    ncols = _matrix_ncols(m)
+    out = []
+    for c in range(ncols):
+        col = []
+        for row in m:
+            if isinstance(row, (list, tuple)) and c < len(row):
+                col.append(row[c])
+            else:
+                col.append(np.nan)
+        out.append(col)
+    return out
+
+
+def matrix_median(m):
+    """Median of all finite cells; empty → nan."""
+    vals = _matrix_flat_finite(m)
+    if not vals:
+        return np.nan
+    return float(np.median(vals))
+
+
+def matrix_mode(m):
+    """Mode of flattened finite cells via ``array_mode``."""
+    return array_mode(_matrix_flat_finite(m))
+
+
+def matrix_elements_count(m):
+    """``rows * cols`` of a list-of-lists matrix; bad input → 0."""
+    m = _matrix_ensure(m)
+    return len(m) * _matrix_ncols(m)
+
+
+def matrix_concat(m1, m2, axis=0):
+    """Concatenate along axis 0 (rows) or 1 (cols); mismatch → []."""
+    a = _matrix_ensure(m1)
+    b = _matrix_ensure(m2)
+    try:
+        ax = int(axis) if axis is not None else 0
+    except (TypeError, ValueError):
+        return []
+
+    def _rows(src):
+        return [list(r) if isinstance(r, (list, tuple)) else [r] for r in src]
+
+    if ax == 0:
+        ca, cb = _matrix_ncols(a), _matrix_ncols(b)
+        if a and b and ca != cb:
+            return []
+        return _rows(a) + _rows(b)
+    if a and b and len(a) != len(b):
+        return []
+    if not a:
+        return _rows(b)
+    if not b:
+        return _rows(a)
+    out = []
+    for ra, rb in zip(_rows(a), _rows(b), strict=True):
+        out.append(ra + rb)
+    return out
+
+
+def matrix_mult(m1, other):
+    """Scalar multiply or matmul; bad input → []."""
+    a = _matrix_float_array(m1)
+    if a is None:
+        return []
+    if isinstance(other, (bool, np.bool_)):
+        other = float(other)
+    if isinstance(other, (int, float, np.integer, np.floating)):
+        try:
+            s = float(other)
+        except (TypeError, ValueError):
+            return []
+        if s != s:
+            return []
+        return (a * s).tolist()
+    b = _matrix_float_array(other)
+    if b is not None and b.size > 0:
+        try:
+            return (a @ b).tolist()
+        except Exception:
+            return []
+    # 1-d vector (list of scalars)
+    if isinstance(other, (list, tuple, np.ndarray)):
+        try:
+            vec = np.asarray([safe_float(x) for x in other], dtype=np.float64)
+        except Exception:
+            return []
+        if vec.ndim != 1 or a.shape[1] != vec.shape[0]:
+            return []
+        try:
+            return (a @ vec).tolist()
+        except Exception:
+            return []
+    return []
+
+
+def matrix_diff(m1, m2):
+    """Element-wise ``m1 - m2``; shape mismatch → []."""
+    a = _matrix_float_array(m1)
+    b = _matrix_float_array(m2)
+    if a is None or b is None or a.shape != b.shape:
+        return []
+    return (a - b).tolist()
+
+
+def matrix_get(m, row, col):
+    """``matrix.get(id, row, column)``; bad handle/index → nan (no ``len()`` on scalars)."""
+    m = _matrix_ensure(m)
+    if not m:
+        return np.nan
+    try:
+        r = int(row)
+        c = int(col)
+    except (TypeError, ValueError):
+        return np.nan
+    if r < 0 or c < 0 or r >= len(m):
+        return np.nan
+    row_data = m[r]
+    if not isinstance(row_data, (list, tuple, np.ndarray)):
+        return np.nan
+    try:
+        if c >= len(row_data):
+            return np.nan
+        return row_data[c]
+    except (TypeError, IndexError):
+        return np.nan
+
+
+def matrix_rows(m):
+    """Row count of a list-of-lists matrix; scalar/bad input → 0."""
+    m = _matrix_ensure(m)
+    return len(m) if isinstance(m, list) else 0
+
+
+def matrix_columns(m):
+    """Column count of a list-of-lists matrix; scalar/bad input → 0."""
+    return _matrix_ncols(_matrix_ensure(m))
+
+
+def matrix_kron(m1, m2):
+    """Kronecker product; bad input (including float64 series) → []."""
+    a = _matrix_float_array(m1)
+    b = _matrix_float_array(m2)
+    if a is None or b is None:
+        return []
+    try:
+        return np.kron(a, b).tolist()
+    except Exception:
+        return []
+
+
+def matrix_pow(m, n):
+    """Square matrix power; non-square / negative / bad input → []."""
+    arr = _matrix_float_array(m)
+    if arr is None or arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        return []
+    try:
+        exp = int(n)
+    except (TypeError, ValueError):
+        return []
+    if exp < 0:
+        return []
+    try:
+        return np.linalg.matrix_power(arr, exp).tolist()
+    except Exception:
+        return []
+
+
+def matrix_is_square(m):
+    """True when rows == cols (including 0×0). Bad input → False."""
+    m = _matrix_ensure(m)
+    if not isinstance(m, list):
+        return False
+    return len(m) == _matrix_ncols(m)
+
+
+def _matrix_is_handle(m) -> bool:
+    """True when *m* looks like a list-of-lists / ndarray matrix handle."""
+    if m is None or isinstance(m, (str, bytes, dict, set, bool, np.bool_)):
+        return False
+    if isinstance(m, (float, int, complex, np.floating, np.integer)):
+        return False
+    return isinstance(m, (list, tuple, np.ndarray))
+
+
+def matrix_is_zero(m):
+    """True when every cell is 0. Bad input → False."""
+    if not _matrix_is_handle(m):
+        return False
+    arr = _matrix_float_array(m)
+    if arr is None:
+        return False
+    try:
+        return bool(np.all(arr == 0))
+    except Exception:
+        return False
+
+
+def matrix_is_identity(m):
+    """True when *m* is square identity. Bad / non-square input → False."""
+    if not _matrix_is_handle(m):
+        return False
+    arr = _matrix_float_array(m)
+    if arr is None or arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        return False
+    try:
+        return bool(np.array_equal(arr, np.eye(arr.shape[0])))
+    except Exception:
+        return False
+
+
+def matrix_is_antidiagonal(m):
+    """True when off-antidiagonal cells are 0. Bad / non-square → False."""
+    if not _matrix_is_handle(m):
+        return False
+    arr = _matrix_float_array(m)
+    if arr is None or arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        return False
+    n = arr.shape[0]
+    try:
+        off = arr.copy()
+        if n:
+            idx = np.arange(n)
+            off[idx, n - 1 - idx] = 0.0
+        return bool(np.all(off == 0))
+    except Exception:
+        return False
+
+
+def input_bool(defval=False, *args, **kwargs):
+    """Pine ``input.bool`` leak fallback — return *defval* as bool."""
+    if defval is None:
+        return False
+    try:
+        return bool(defval)
+    except Exception:
+        return False
+
+
+def _series_f64(x):
+    """Coerce *x* to 1-d float64; bad input → None."""
+    if x is None:
+        return None
+    try:
+        a = np.asarray(x, dtype=np.float64)
+        if a.ndim == 0:
+            a = a.reshape(1)
+        return np.reshape(a, -1)
+    except Exception:
+        return None
+
+
+def ta_wad(*args, **kwargs):
+    """Pine ``ta.wad`` leak fallback. 0/4/5 args ``(h, l, c, v[, i])``; else nan."""
+    try:
+        n = len(args)
+        if n < 4:
+            return np.nan
+        high = _series_f64(args[0])
+        low = _series_f64(args[1])
+        close = _series_f64(args[2])
+        vol = _series_f64(args[3])
+        if high is None or low is None or close is None or vol is None:
+            return np.nan
+        if n >= 5:
+            i = int(args[4])
+        else:
+            i = int(close.shape[0]) - 1
+        return float(numba_wad(high, low, close, vol, i))
+    except Exception:
+        return np.nan
+
+
+def ta_iii(*args, **kwargs):
+    """Pine ``ta.iii`` leak fallback. 0/3/4 args ``(h, l, c[, i])``; else nan."""
+    try:
+        n = len(args)
+        if n < 3:
+            return np.nan
+        high = _series_f64(args[0])
+        low = _series_f64(args[1])
+        close = _series_f64(args[2])
+        if high is None or low is None or close is None:
+            return np.nan
+        if n >= 4:
+            i = int(args[3])
+        else:
+            i = int(close.shape[0]) - 1
+        return float(numba_iii(high, low, close, i))
+    except Exception:
+        return np.nan
+
+
+def ta_wvad(*args, **kwargs):
+    """Pine ``ta.wvad`` leak fallback. Period-only or ``(h,l,c,v,period[,i])``."""
+    try:
+        n = len(args)
+        if n == 1:
+            return np.nan
+        if n < 5:
+            return np.nan
+        high = _series_f64(args[0])
+        low = _series_f64(args[1])
+        close = _series_f64(args[2])
+        vol = _series_f64(args[3])
+        if high is None or low is None or close is None or vol is None:
+            return np.nan
+        period = args[4]
+        if n >= 6:
+            i = int(args[5])
+        else:
+            i = int(close.shape[0]) - 1
+        return float(numba_wvad(high, low, close, vol, period, i))
+    except Exception:
+        return np.nan
 
 
 # ---------------------------------------------------------------------------
@@ -5650,7 +7377,7 @@ def numba_days_from_civil(y, m, d):
 
 
 @numba.njit(cache=True)
-def numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):
+def _numba_timestamp_jit(y, m, d, h=0.0, mi=0.0, s=0.0):
     """Unix epoch ms from calendar components with month/day overflow.
 
     Matches reference Pine ``timestamp(year, month, day, hour, minute, second)``
@@ -5683,6 +7410,48 @@ def numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):
     base_days = numba_days_from_civil(yi, mo, 1)
     epoch_days = base_days + add_days
     return float(epoch_days * 86400000 + rem * 1000)
+
+
+def _is_timezone_string(y):
+    """True for Pine timezone names/offsets, False for numeric date-part strings."""
+    if not isinstance(y, str):
+        return False
+    s = y.strip()
+    if not s:
+        return True
+    if any(ch.isalpha() for ch in s):
+        return True
+    # +0300 / -05:00 offsets (not a signed year like "-3")
+    return s[0] in "+-" and (":" in s or len(s) >= 4)
+
+
+def numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):
+    """Unix epoch ms; object-mode None/str/NA coerce; leading timezone skipped.
+
+    Pine ``timestamp(timezone, year, month, day, …)`` arrives as a leading
+    string (``"GMT+3"``, ``"America/Chicago"``, ``"+0300"``). Skip it so the
+    float64 jit inner never sees ``unicode_type``. Date-part strings
+    (``"2021"``) still coerce via ``safe_float``.
+    """
+    if _is_timezone_string(y):
+        y, m, d, h, mi, s = m, d, h, mi, s, 0.0
+    fy = _as_njit_float(y)
+    fm = _as_njit_float(m)
+    fd = _as_njit_float(d)
+    fh = _as_njit_float(h)
+    fmi = _as_njit_float(mi)
+    fs = _as_njit_float(s)
+    return _numba_timestamp_jit(fy, fm, fd, fh, fmi, fs)
+
+
+def _ol_numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):  # noqa: ARG001
+    def impl(y, m, d, h=0.0, mi=0.0, s=0.0):
+        return _numba_timestamp_jit(y, m, d, h, mi, s)
+
+    return impl
+
+
+numba.extending.overload(numba_timestamp)(_ol_numba_timestamp)
 
 
 @numba.njit(cache=True)

@@ -46,12 +46,13 @@ from tenant_verify import flush_usage_queue
 from tenant_verify import key_hash_full
 from tenant_verify import queue_usage_event
 from tenant_verify import verify_tenant
+from window import apply_window
 
 # ---------------------------------------------------------------------------
 # Limits
 # ---------------------------------------------------------------------------
 
-_WORKER_VERSION = "0.6.0"
+_WORKER_VERSION = "0.7.0"
 _MAX_SCRIPT_LENGTH = 100_000  # characters
 _MAX_BARS = 100_000
 _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -504,6 +505,7 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
                 "profiler": True,
                 "drawings": True,
                 "timeout_seconds": True,
+                "windowing": True,
                 "live_feed": True,
                 "feed_sources": ["bybit", "binance"],
                 "timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
@@ -535,6 +537,9 @@ async def handle_run(
       - ``profiler`` — per-line interpret timings
       - ``timeout_seconds`` — wall-clock budget (default 30, max 30)
       - ``max_bars`` — optional tail length when loading from R2
+      - ``from_bar`` / ``to_bar`` — optional inclusive bar window (negative
+        counts from the end). Trims the serialized envelope only; the bar loop
+        still sees every bar. Adds ``window`` metadata when applied.
     """
     data, err = _parse_body(body)
     if err is not None:
@@ -704,6 +709,15 @@ async def handle_run(
             return _json_response({"error": "'timeout_seconds' must be > 0"}, 400)
         timeout_seconds = min(timeout_seconds, _MAX_TIMEOUT_SECONDS)
 
+    # Optional response window (Pro API parity): inclusive bar indices into the
+    # submitted data, negative counts from the end. Mirrors RUN_SCHEMA's
+    # integer check — bools are rejected as integers.
+    from_bar = data.get("from_bar")
+    to_bar = data.get("to_bar")
+    for field, value in (("from_bar", from_bar), ("to_bar", to_bar)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            return _json_response({"error": f"'{field}' must be an integer"}, 400)
+
     # Execute with timeout via Runtime
     runtime = Runtime(symbol=symbol)
     result = runtime.run(
@@ -732,6 +746,16 @@ async def handle_run(
             {"error": "Script execution timed out", "error_kind": "runtime"},
             504,
         )
+
+    # Response windowing (Pro API parity) — serialize only the requested bar
+    # range. Runs after the full result is built (the bar loop is untouched)
+    # and is a no-op when the client sends no window, so the default path is
+    # byte-identical.
+    if from_bar is not None or to_bar is not None:
+        try:
+            result = apply_window(result, from_bar, to_bar)
+        except Exception as e:  # noqa: BLE001 — never fail a run over a trim
+            print(json.dumps({"type": "window_trim_error", "error": type(e).__name__}))
 
     bar_count = result.get("count", len(ohlcv))
     resp: dict[str, Any] = {
@@ -784,6 +808,8 @@ async def handle_run(
         resp["logs"] = result["logs"]
     if result.get("profile") is not None:
         resp["profile"] = result["profile"]
+    if result.get("window") is not None:
+        resp["window"] = result["window"]
     return _json_response(resp)
 
 

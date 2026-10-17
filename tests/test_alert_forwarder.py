@@ -115,3 +115,47 @@ class TestGroupAndForward:
         )
         assert meta["failed"] == 1
         assert meta["forwarded"] == 0
+
+    def test_redirect_counts_as_failure(self) -> None:
+        # A 30x must never be treated as delivery: with redirects refused it
+        # means the receiver re-targeted the payload elsewhere.
+        async def post(url: str, body: dict) -> int:
+            return 302
+
+        meta = asyncio.run(
+            forward_alerts(
+                [{"message": "x"}],
+                "https://hooks.test/pine",
+                http_post_json=post,
+            )
+        )
+        assert meta["failed"] == 1
+        assert meta["forwarded"] == 0
+        assert any("302" in e for e in meta["errors"])
+
+
+class TestDefaultTransportHardening:
+    def test_no_redirect_opener_refuses_redirects(self) -> None:
+        import urllib.request
+
+        from alert_forwarder import _no_redirect_opener
+
+        opener = _no_redirect_opener()
+        handlers = [
+            h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+        ]
+        assert handlers, "redirect handler missing from opener"
+        # Returning None makes urllib raise HTTPError on a 30x instead of
+        # following it to a (possibly private) host.
+        assert (
+            handlers[0].redirect_request(None, None, 302, "", None, "https://evil/")
+            is None
+        )
+
+    def test_default_post_rechecks_private_url(self) -> None:
+        from alert_forwarder import default_http_post_json
+
+        # Re-validated at POST time (pynescript 0.6.6 parity): a private URL
+        # never reaches the transport, even via a direct call.
+        status = asyncio.run(default_http_post_json("https://127.0.0.1/evil", {"a": 1}))
+        assert status == 0

@@ -54,10 +54,6 @@ QUINARY = 5
 
 MIN_SERIES_LENGTH = 2
 
-# Sentinel for ``_series_last`` getattr default (distinct from None / na).
-_MISSING: Any = object()
-
-
 class TechnicalHelpers:
     """Base utilities for ``ta.*`` handlers (series expect, SMA helpers, state).
 
@@ -97,7 +93,10 @@ class TechnicalHelpers:
 
         Resolved once per evaluator instance (hot path is called many times/bar).
         """
-        cached = getattr(self, "_pine_ta_inc_cached", None)
+        try:
+            cached = self._pine_ta_inc_cached
+        except AttributeError:
+            cached = None
         if cached is not None:
             return cached
         if not self._bar_mode():
@@ -112,17 +111,82 @@ class TechnicalHelpers:
         return result
 
     def _ta_next_slot(self) -> int:
-        """Per-bar call-site index (reset by Runtime each bar, like crossover)."""
-        i = int(getattr(self, "_ta_call_i", 0) or 0)
+        """Per-bar call-site index (reset by Runtime each bar, like crossover).
+
+        Slot identity is call *order*, not the ``ta.`` prefix. Host must
+        zero ``_ta_call_i`` on every bar, including v4 bare ``sma``/``wma``.
+        """
+        try:
+            i = self._ta_call_i
+        except AttributeError:
+            i = 0
+        if type(i) is not int:
+            i = int(i or 0)
         self._ta_call_i = i + 1  # type: ignore[attr-defined]
         return i
 
     def _ta_state_bucket(self) -> dict[tuple[Any, ...], dict[str, Any]]:
-        state = getattr(self, "_ta_inc_state", None)
+        try:
+            state = self._ta_inc_state
+        except AttributeError:
+            state = None
         if state is None:
             state = {}
             self._ta_inc_state = state  # type: ignore[attr-defined]
         return state
+
+    def _ta_key1(
+        self, kind: str, period: int
+    ) -> tuple[dict[tuple[Any, ...], dict[str, Any]], tuple[Any, ...]]:
+        """Advance the call-site slot and return ``(bucket, key)``.
+
+        ``key`` is ``(kind, slot, period)``. The tuple is reused across bars
+        when that signature stays put, so the dict lookup keeps its cached
+        hash. A period change, or a realtime rollback that restored a
+        different signature, allocates a fresh key and looks that up.
+        Slot order matches :meth:`_ta_next_slot` (one increment per call).
+        """
+        try:
+            i = self._ta_call_i
+        except AttributeError:
+            i = 0
+        if type(i) is not int:
+            i = int(i or 0)
+        self._ta_call_i = i + 1  # type: ignore[attr-defined]
+        try:
+            bucket = self._ta_inc_state
+        except AttributeError:
+            bucket = None
+        if bucket is None:
+            bucket = {}
+            self._ta_inc_state = bucket  # type: ignore[attr-defined]
+        try:
+            cache = self._ta_key_cache
+        except AttributeError:
+            cache = []
+            self._ta_key_cache = cache  # type: ignore[attr-defined]
+        if cache is None:
+            cache = []
+            self._ta_key_cache = cache  # type: ignore[attr-defined]
+        key: tuple[Any, ...] | None = cache[i] if i < len(cache) else None
+        if (
+            key is not None
+            and key[0] == kind
+            and key[1] == i
+            and len(key) == 3
+            and key[2] == period
+        ):
+            return bucket, key
+        key = (kind, i, period)
+        ncache = len(cache)
+        if i == ncache:
+            cache.append(key)
+        elif i < ncache:
+            cache[i] = key
+        else:
+            cache.extend([None] * (i - ncache))
+            cache.append(key)
+        return bucket, key
 
     @staticmethod
     def _series_last(series: Any) -> Any:
@@ -142,10 +206,13 @@ class TechnicalHelpers:
             return series[-1] if series else None
         if series is None or t is float or t is int or t is bool:
             return series
-        # PineSeries / series wrapper: prefer .current (avoids history access)
-        current = getattr(series, "current", _MISSING)
-        if current is not _MISSING:
-            return current
+        # PineSeries / RingPineSeries store the bar sample on ``.current``.
+        # LOAD_ATTR beats getattr() on the TA hot path; objects without the
+        # attribute fall through to history / sequence.
+        try:
+            return series.current  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
         hist = getattr(series, "history", None)
         if hist is not None:
             try:
@@ -163,6 +230,22 @@ class TechnicalHelpers:
                 pass
         return series
 
+    @staticmethod
+    def _finite_or_none(x: Any) -> float | None:
+        """Coerce a sample to finite float; ``None`` / NaN / non-numeric → None."""
+        if x is None:
+            return None
+        t = type(x)
+        if t is float:
+            return None if x != x else x
+        if t is int or t is bool:
+            return float(x)
+        try:
+            xf = float(x)
+        except (TypeError, ValueError):
+            return None
+        return None if xf != xf else xf
+
     def _sma_inc_update(self, series: list[Any], period: int) -> float | None:
         """Incremental SMA matching full ``_sma`` NA-window rules (last value).
 
@@ -173,9 +256,7 @@ class TechnicalHelpers:
         """
         if period <= 0:
             return None
-        slot = self._ta_next_slot()
-        key = ("sma", slot, period)
-        bucket = self._ta_state_bucket()
+        bucket, key = self._ta_key1("sma", period)
         st = bucket.get(key)
         if st is None:
             st = {"window": deque(), "sum": 0.0, "count": 0, "value": None}
@@ -184,19 +265,18 @@ class TechnicalHelpers:
         window: deque[Any] = st["window"]
         if len(window) == period:
             old = window.popleft()
-            if old is not None:
-                st["sum"] -= float(old)
+            of = self._finite_or_none(old)
+            if of is not None:
+                st["sum"] -= of
                 st["count"] -= 1
-        window.append(x)
-        if x is not None:
-            try:
-                st["sum"] += float(x)
-                st["count"] += 1
-            except (TypeError, ValueError):
-                # Treat non-numeric as na: replace with None in window
-                window[-1] = None
+        xf = self._finite_or_none(x)
+        window.append(xf)
+        if xf is not None:
+            st["sum"] += xf
+            st["count"] += 1
         # Strict window (match compile numba_sma / reference Pine): any na in the length
-        # window → na. Require count == period (every slot finite).
+        # window → na. Require count == period (every slot finite). IEEE NaN
+        # (e.g. ta.rci warmup) is na — never add NaN to the running sum (poison).
         if len(window) < period or st["count"] != period:
             st["value"] = None
         else:
@@ -252,14 +332,14 @@ class TechnicalHelpers:
     def _ema_inc_update(self, series: list[Any], period: int) -> float | None:
         """Incremental EMA with SMA seed (matches ``numba_ema_inc`` / reference Pine).
 
-        Seed = mean of first ``period`` finite samples; na until the window is
-        full. Prior first-value seed diverged from compile on Chaikin Osc etc.
+        Seed = SMA of the first ``period`` *consecutive* finite samples
+        (``numba_ema_inc``). A na/NaN before the seed is ready resets the
+        seed buffer so interleaved 0/na sources (RVI ternary) do not seed
+        early. Prior first-value seed diverged from compile on Chaikin Osc etc.
         """
         if period <= 0:
             return None
-        slot = self._ta_next_slot()
-        key = ("ema", slot, period)
-        bucket = self._ta_state_bucket()
+        bucket, key = self._ta_key1("ema", period)
         st = bucket.get(key)
         if st is None:
             st = {
@@ -269,20 +349,15 @@ class TechnicalHelpers:
                 "value": None,
             }
             bucket[key] = st
-        x = self._series_last(series)
-        # Soft-fail non-numeric samples (unresolved source-name strings, colors)
-        # to na rather than ``float('obv')`` Runtime Error.
-        if x is not None and type(x) is not float and type(x) is not int:
-            try:
-                x = float(x)
-            except (TypeError, ValueError):
-                x = None
+        x = self._finite_or_none(self._series_last(series))
         alpha = 2.0 / (period + 1)
         if not st["seeded"]:
             if x is None:
+                # Consecutive window: na breaks the SMA seed (match compile).
+                st["seed_buf"] = []
                 st["value"] = None
                 return None
-            st["seed_buf"].append(float(x))
+            st["seed_buf"].append(x)
             if len(st["seed_buf"]) < period:
                 st["value"] = None
                 return None
@@ -297,9 +372,9 @@ class TechnicalHelpers:
             return st.get("ema")
         prev = st["ema"]
         if prev is None:
-            st["ema"] = float(x)
+            st["ema"] = x
         else:
-            st["ema"] = alpha * float(x) + (1.0 - alpha) * float(prev)
+            st["ema"] = alpha * x + (1.0 - alpha) * float(prev)
         st["value"] = st["ema"]
         return st.get("ema")
 
@@ -361,9 +436,7 @@ class TechnicalHelpers:
         """Incremental RSI using RMA of gains/losses (matches ``_rsi`` structure)."""
         if period <= 0:
             return None
-        slot = self._ta_next_slot()
-        key = ("rsi", slot, period)
-        bucket = self._ta_state_bucket()
+        bucket, key = self._ta_key1("rsi", period)
         st = bucket.get(key)
         if st is None:
             st = {
@@ -504,9 +577,7 @@ class TechnicalHelpers:
         """
         if period <= 0:
             return None
-        slot = self._ta_next_slot()
-        key = ("atr", slot, period)
-        bucket = self._ta_state_bucket()
+        bucket, key = self._ta_key1("atr", period)
         st = bucket.get(key)
         if st is None:
             st = {
@@ -547,9 +618,7 @@ class TechnicalHelpers:
         """
         if period <= 1:
             return None
-        slot = self._ta_next_slot()
-        key = ("stdev", slot, period)
-        bucket = self._ta_state_bucket()
+        bucket, key = self._ta_key1("stdev", period)
         st = bucket.get(key)
         if st is None:
             st = {"window": deque(), "sum": 0.0, "sumsq": 0.0, "count": 0, "value": None}
@@ -593,66 +662,84 @@ class TechnicalHelpers:
         return st.get("value")
 
     def _highest_inc_update(self, series: list[Any], period: int) -> float | None:
-        """Incremental highest matching full ``_highest`` (last value)."""
+        """Incremental highest matching full ``_highest`` (last value).
+
+        Monotonic-deque sliding maximum: amortized O(1) per bar instead of
+        the former O(period) scan (``ta.highest(high, 200)`` × 50k bars was
+        10M comparisons per call site). na / non-numeric samples are skipped
+        (they poison nothing), matching the previous scan semantics.
+        """
         if period <= 0:
             return None
-        slot = self._ta_next_slot()
-        key = ("highest", slot, period)
-        bucket = self._ta_state_bucket()
+        bucket, key = self._ta_key1("highest", period)
         st = bucket.get(key)
         if st is None:
-            st = {"window": deque(), "value": None}
+            st = {"dq": deque(), "count": 0, "value": None}
             bucket[key] = st
         x = self._series_last(series)
-        window: deque[Any] = st["window"]
-        if len(window) == period:
-            window.popleft()
-        window.append(x)
-        if len(window) < period:
+        dq: deque[Any] = st["dq"]
+        st["count"] += 1
+        seq = st["count"]
+        fv: float | None = None
+        if x is not None:
+            try:
+                fv = float(x)
+            except (TypeError, ValueError):
+                fv = None
+            if fv is not None and fv != fv:  # NaN
+                fv = None
+        if fv is not None:
+            # Drop dominated records (ties included — equal values are
+            # interchangeable for max semantics); keep the newest.
+            while dq and dq[-1][1] <= fv:
+                dq.pop()
+            dq.append((seq, fv))
+        # Evict records that fell out of the period window.
+        min_seq = seq - period + 1
+        while dq and dq[0][0] < min_seq:
+            dq.popleft()
+        if seq < period:
             st["value"] = None
             return None
-        best: float | None = None
-        for v in window:
-            if v is None:
-                continue
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                continue
-            if best is None or fv > best:
-                best = fv
+        best = dq[0][1] if dq else None
         st["value"] = best
         return best
 
     def _lowest_inc_update(self, series: list[Any], period: int) -> float | None:
-        """Incremental lowest matching full ``_lowest`` (last value)."""
+        """Incremental lowest matching full ``_lowest`` (last value).
+
+        Monotonic-deque sliding minimum (see :meth:`_highest_inc_update`).
+        """
         if period <= 0:
             return None
-        slot = self._ta_next_slot()
-        key = ("lowest", slot, period)
-        bucket = self._ta_state_bucket()
+        bucket, key = self._ta_key1("lowest", period)
         st = bucket.get(key)
         if st is None:
-            st = {"window": deque(), "value": None}
+            st = {"dq": deque(), "count": 0, "value": None}
             bucket[key] = st
         x = self._series_last(series)
-        window: deque[Any] = st["window"]
-        if len(window) == period:
-            window.popleft()
-        window.append(x)
-        if len(window) < period:
+        dq: deque[Any] = st["dq"]
+        st["count"] += 1
+        seq = st["count"]
+        fv: float | None = None
+        if x is not None:
+            try:
+                fv = float(x)
+            except (TypeError, ValueError):
+                fv = None
+            if fv is not None and fv != fv:  # NaN
+                fv = None
+        if fv is not None:
+            while dq and dq[-1][1] >= fv:
+                dq.pop()
+            dq.append((seq, fv))
+        min_seq = seq - period + 1
+        while dq and dq[0][0] < min_seq:
+            dq.popleft()
+        if seq < period:
             st["value"] = None
             return None
-        best: float | None = None
-        for v in window:
-            if v is None:
-                continue
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                continue
-            if best is None or fv < best:
-                best = fv
+        best = dq[0][1] if dq else None
         st["value"] = best
         return best
 
@@ -847,6 +934,53 @@ class TechnicalHelpers:
             st["value"] = None
         return st.get("value")
 
+    def _extreme_window_push(self, st: dict[str, Any], x: Any, period: int, *, mode: str) -> float | None:
+        """Maintain a monotonic-deque sliding extreme (amortized O(1)/bar).
+
+        State (``st``): ``dq`` of ``(seq, value)`` records (dominated entries
+        popped), ``bad`` seq list of invalid (na/non-numeric) samples,
+        ``count`` total samples seen, ``na_count`` invalid samples currently
+        in the period window. Returns the window extreme once the window is
+        full and na-free; ``None`` while warming up or when any sample in the
+        window is invalid (na poisons the window — callers decide na policy).
+        """
+        dq: deque[Any] = st["dq"]
+        bad: deque[Any] = st["bad"]
+        st["count"] += 1
+        seq = int(st["count"])
+        fv: float | None = None
+        if x is not None:
+            try:
+                fv = float(x)
+            except (TypeError, ValueError):
+                fv = None
+            if fv is not None and fv != fv:  # NaN
+                fv = None
+        if fv is None:
+            st["na_count"] += 1
+            bad.append(seq)
+        elif mode == "high":
+            while dq and dq[-1][1] <= fv:
+                dq.pop()
+            dq.append((seq, fv))
+        else:
+            while dq and dq[-1][1] >= fv:
+                dq.pop()
+            dq.append((seq, fv))
+        # One sample leaves per bar once the window is full: the dropped
+        # sample is seq - period (the window covers [seq-period+1, seq]).
+        min_seq = seq - period + 1
+        if seq > period:
+            dropped = seq - period
+            if bad and bad[0] == dropped:
+                bad.popleft()
+                st["na_count"] -= 1
+        while dq and dq[0][0] < min_seq:
+            dq.popleft()
+        if seq < period or st["na_count"] > 0:
+            return None
+        return dq[0][1] if dq else None
+
     def _stoch_k_inc_update(
         self,
         source: list[Any],
@@ -863,33 +997,25 @@ class TechnicalHelpers:
         st = bucket.get(key)
         if st is None:
             st = {
-                "h_win": deque(maxlen=length),
-                "l_win": deque(maxlen=length),
+                "h": {"dq": deque(), "bad": deque(), "count": 0, "na_count": 0},
+                "l": {"dq": deque(), "bad": deque(), "count": 0, "na_count": 0},
                 "value": None,
             }
             bucket[key] = st
-        c = self._series_last(source)
+        c = self._finite_or_none(self._series_last(source))
         h = self._series_last(highs)
         l = self._series_last(lows)
-        h_win: deque[Any] = st["h_win"]
-        l_win: deque[Any] = st["l_win"]
-        h_win.append(h)
-        l_win.append(l)
-        # Match full ``_stoch_k``: use available history (partial window OK).
-        window_h = [v for v in h_win if v is not None]
-        window_l = [v for v in l_win if v is not None]
-        if c is None or not window_h or not window_l:
+        # Monotonic-deque extremes (amortized O(1)); na anywhere → na
+        # (matches full ``length`` window requirement / numba_stoch_inc).
+        hh = self._extreme_window_push(st["h"], h, length, mode="high")
+        ll = self._extreme_window_push(st["l"], l, length, mode="low")
+        if hh is None or ll is None or c is None:
             st["value"] = None
             return None
-        try:
-            hh = max(float(v) for v in window_h)
-            ll = min(float(v) for v in window_l)
-            if hh == ll:
-                st["value"] = 50.0
-                return 50.0
-            st["value"] = 100.0 * (float(c) - ll) / (hh - ll)
-        except (TypeError, ValueError):
-            st["value"] = None
+        if hh == ll:
+            st["value"] = 50.0
+            return 50.0
+        st["value"] = 100.0 * (c - ll) / (hh - ll)
         return st.get("value")
 
     def _cum_inc_update(self, series: list[Any]) -> float | None:
@@ -939,6 +1065,7 @@ class TechnicalHelpers:
                 "v_win": deque(maxlen=period),
                 "sum_pv": 0.0,
                 "sum_v": 0.0,
+                "na_count": 0,
                 "value": None,
             }
             bucket[key] = st
@@ -950,40 +1077,31 @@ class TechnicalHelpers:
         if len(s_win) == period:
             old_s = s_win[0]
             old_v = v_win[0]
-            if old_s is not None and old_v is not None:
+            if old_s is None or old_v is None:
+                st["na_count"] -= 1
+            else:
                 try:
                     st["sum_pv"] -= float(old_s) * float(old_v)
                     st["sum_v"] -= float(old_v)
                 except (TypeError, ValueError):
-                    pass
+                    st["na_count"] -= 1
         s_win.append(x)
         v_win.append(v)
-        if x is not None and v is not None:
+        if x is None or v is None:
+            st["na_count"] += 1
+        else:
             try:
                 st["sum_pv"] += float(x) * float(v)
                 st["sum_v"] += float(v)
             except (TypeError, ValueError):
-                st["value"] = None
-                return None
+                st["na_count"] += 1
         if len(s_win) < period:
             st["value"] = None
             return None
-        # Any None in window → recompute carefully (match NaN windows)
-        if any(a is None or b is None for a, b in zip(s_win, v_win, strict=True)):
-            sp = 0.0
-            sv = 0.0
-            for a, b in zip(s_win, v_win, strict=True):
-                if a is None or b is None:
-                    st["value"] = None
-                    return None
-                try:
-                    sp += float(a) * float(b)
-                    sv += float(b)
-                except (TypeError, ValueError):
-                    st["value"] = None
-                    return None
-            st["sum_pv"] = sp
-            st["sum_v"] = sv
+        # Any na in window → na (match NaN windows); running sums stay exact.
+        if st["na_count"] > 0:
+            st["value"] = None
+            return None
         if st["sum_v"] == 0.0:
             st["value"] = None
             return None
@@ -996,15 +1114,16 @@ class TechnicalHelpers:
         lows: list[Any],
         closes: list[Any],
         period: int,
-    ) -> float:
-        """Incremental CCI matching full ``_cci`` (last value).
+    ) -> float | None:
+        """Incremental CCI matching compile ``numba_cci_inc`` (last value).
 
         Window of typical price; SMA via running sum; mean absolute deviation
-        recomputed over the window each bar (O(period)). Full path returns
-        ``0.0`` when under-warmed or mean deviation is zero/undefined.
+        recomputed over the window each bar (O(period)). Warm-up and na windows
+        return ``None`` (never silent 0). Mean deviation of zero after a full
+        window still returns ``0.0`` (compile).
         """
         if period <= 0:
-            return 0.0
+            return None
         slot = self._ta_next_slot()
         key = ("cci", slot, period)
         bucket = self._ta_state_bucket()
@@ -1015,20 +1134,17 @@ class TechnicalHelpers:
                 "sum": 0.0,
                 "count": 0,
                 "last_mean_dev": None,  # last non-zero mean abs dev
-                "value": 0.0,
+                "value": None,
             }
             bucket[key] = st
-        h = self._series_last(highs)
-        l = self._series_last(lows)
-        c = self._series_last(closes)
+        h = self._finite_or_none(self._series_last(highs))
+        l = self._finite_or_none(self._series_last(lows))
+        c = self._finite_or_none(self._series_last(closes))
         tp: float | None
         if h is None or l is None or c is None:
             tp = None
         else:
-            try:
-                tp = (float(h) + float(l) + float(c)) / 3.0
-            except (TypeError, ValueError):
-                tp = None
+            tp = (h + l + c) / 3.0
         window: deque[float | None] = st["window"]
         if len(window) == period:
             old = window.popleft()
@@ -1039,9 +1155,9 @@ class TechnicalHelpers:
         if tp is not None:
             st["sum"] += tp
             st["count"] += 1
-        if len(window) < period or st["count"] <= 0:
-            st["value"] = 0.0
-            return 0.0
+        if len(window) < period or st["count"] != period:
+            st["value"] = None
+            return None
         sma = float(st["sum"]) / int(st["count"])
         # Mean abs dev over non-None samples vs current SMA (matches full path)
         acc = 0.0
@@ -1185,34 +1301,152 @@ class TechnicalHelpers:
         st = bucket.get(key)
         if st is None:
             st = {
-                "h_win": deque(maxlen=period),
-                "l_win": deque(maxlen=period),
+                "h": {"dq": deque(), "bad": deque(), "count": 0, "na_count": 0},
+                "l": {"dq": deque(), "bad": deque(), "count": 0, "na_count": 0},
                 "value": 0.0,
             }
             bucket[key] = st
         h = self._series_last(highs)
         l = self._series_last(lows)
         c = self._series_last(closes)
-        h_win: deque[Any] = st["h_win"]
-        l_win: deque[Any] = st["l_win"]
-        h_win.append(h)
-        l_win.append(l)
-        if len(h_win) < period:
+        # Monotonic-deque extremes (amortized O(1)); na anywhere → 0.0
+        # (full path: float(None) raises → caught → 0.0).
+        hh = self._extreme_window_push(st["h"], h, period, mode="high")
+        ll = self._extreme_window_push(st["l"], l, period, mode="low")
+        if hh is None or ll is None:
             st["value"] = 0.0
             return 0.0
-        try:
-            # Match full path: max/min over raw window (no None filter)
-            hh = max(float(v) for v in h_win)
-            ll = min(float(v) for v in l_win)
-            if hh == ll:
-                st["value"] = 0.0
-                return 0.0
-            if c is None:
-                st["value"] = 0.0
-                return 0.0
-            st["value"] = -100.0 * (hh - float(c)) / (hh - ll)
-        except (TypeError, ValueError):
+        if hh == ll:
             st["value"] = 0.0
+            return 0.0
+        if c is None:
+            st["value"] = 0.0
+            return 0.0
+        st["value"] = -100.0 * (hh - float(c)) / (hh - ll)
+        return float(st["value"])
+
+    def _uo_avg(
+        self,
+        highs: list[Any],
+        lows: list[Any],
+        closes: list[Any],
+        i: int,
+        length: int,
+    ) -> float | None:
+        """Buying-pressure / Williams true-range average ending at ``i``."""
+        if length <= 0 or i < length:
+            return None
+        bp = 0.0
+        tr = 0.0
+        for j in range(i - length + 1, i + 1):
+            prev = closes[j - 1]
+            h = highs[j]
+            lo = lows[j]
+            c = closes[j]
+            if prev is None or h is None or lo is None or c is None:
+                return None
+            try:
+                prevf = float(prev)
+                hf = float(h)
+                lf = float(lo)
+                cf = float(c)
+            except (TypeError, ValueError):
+                return None
+            # NaN
+            if prevf != prevf or hf != hf or lf != lf or cf != cf:
+                return None
+            low_ref = lf if lf < prevf else prevf
+            high_ref = hf if hf > prevf else prevf
+            bp += cf - low_ref
+            tr += high_ref - low_ref
+        if tr == 0.0:
+            return None
+        return bp / tr
+
+    def _uo_last(
+        self,
+        highs: list[Any],
+        lows: list[Any],
+        closes: list[Any],
+        n1: int,
+        n2: int,
+        n3: int,
+    ) -> float | None:
+        """Ultimate Oscillator at the last bar. Weights are 4, 2, 1 by argument."""
+        if n1 <= 0 or n2 <= 0 or n3 <= 0:
+            return None
+        n = min(len(highs), len(lows), len(closes))
+        if n <= max(n1, n2, n3):
+            return None
+        i = n - 1
+        a1 = self._uo_avg(highs, lows, closes, i, n1)
+        a2 = self._uo_avg(highs, lows, closes, i, n2)
+        a3 = self._uo_avg(highs, lows, closes, i, n3)
+        if a1 is None or a2 is None or a3 is None:
+            return None
+        return 100.0 * (4.0 * a1 + 2.0 * a2 + a3) / 7.0
+
+    def _uo_inc_update(self, n1: int, n2: int, n3: int) -> float | None:
+        """Bar-mode Ultimate Oscillator. O(longest window), not the full history."""
+        if n1 <= 0 or n2 <= 0 or n3 <= 0:
+            return None
+        need = max(n1, n2, n3)
+        slot = self._ta_next_slot()
+        key = ("uo", slot, n1, n2, n3)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"prev": None, "window": deque(), "value": None}
+            bucket[key] = st
+        h = self._series_last(self._context_source("high"))
+        lo = self._series_last(self._context_source("low"))
+        c = self._series_last(self._context_source("close"))
+        prev = st["prev"]
+        st["prev"] = c
+        bp: float | None = None
+        tr: float | None = None
+        if prev is not None and h is not None and lo is not None and c is not None:
+            try:
+                prevf = float(prev)
+                hf = float(h)
+                lf = float(lo)
+                cf = float(c)
+                if prevf == prevf and hf == hf and lf == lf and cf == cf:
+                    low_ref = lf if lf < prevf else prevf
+                    high_ref = hf if hf > prevf else prevf
+                    bp = cf - low_ref
+                    tr = high_ref - low_ref
+            except (TypeError, ValueError):
+                bp = None
+                tr = None
+        window: deque[tuple[float | None, float | None]] = st["window"]
+        window.append((bp, tr))
+        if len(window) > need:
+            window.popleft()
+        if len(window) < need:
+            st["value"] = None
+            return None
+        items = list(window)
+
+        def avg(length: int) -> float | None:
+            bp_s = 0.0
+            tr_s = 0.0
+            for b, t in items[-length:]:
+                if b is None or t is None:
+                    return None
+                bp_s += b
+                tr_s += t
+            if tr_s == 0.0:
+                return None
+            return bp_s / tr_s
+
+        a1 = avg(n1)
+        a2 = avg(n2)
+        a3 = avg(n3)
+        if a1 is None or a2 is None or a3 is None:
+            st["value"] = None
+            return None
+        st["value"] = 100.0 * (4.0 * a1 + 2.0 * a2 + a3) / 7.0
         return float(st["value"])
 
     def _dev_inc_update(self, series: list[Any], period: int) -> float | None:
@@ -1363,17 +1597,18 @@ class TechnicalHelpers:
         """Incremental ``ta.rising`` matching full ``_rising`` last-value semantics."""
         if period < 1:
             return False
+        need = period + 1
         slot = self._ta_next_slot()
         key = ("rising", slot, period)
         bucket = self._ta_state_bucket()
         st = bucket.get(key)
         if st is None:
-            st = {"window": deque(maxlen=period), "value": False}
+            st = {"window": deque(maxlen=need), "value": False}
             bucket[key] = st
         x = self._series_last(series)
         window: deque[Any] = st["window"]
         window.append(x)
-        if len(window) < period:
+        if len(window) < need:
             st["value"] = False
             return False
         # Delegate to full helper so MRO / oracle semantics stay identical.
@@ -1384,21 +1619,67 @@ class TechnicalHelpers:
         """Incremental ``ta.falling`` matching full ``_falling`` last-value semantics."""
         if period < 1:
             return False
+        need = period + 1
         slot = self._ta_next_slot()
         key = ("falling", slot, period)
         bucket = self._ta_state_bucket()
         st = bucket.get(key)
         if st is None:
-            st = {"window": deque(maxlen=period), "value": False}
+            st = {"window": deque(maxlen=need), "value": False}
             bucket[key] = st
         x = self._series_last(series)
         window: deque[Any] = st["window"]
         window.append(x)
-        if len(window) < period:
+        if len(window) < need:
             st["value"] = False
             return False
         st["value"] = bool(self._falling(list(window), period))
         return bool(st["value"])
+
+    def _rci_spearman(self, window: list[Any]) -> float | None:
+        """Spearman rho of time vs value ranks. Any na → na (match ``numba_rci``).
+
+        Rank of index ``a`` is ``#{b: vb < va} + #{b: vb == va and b < a}``,
+        i.e. the position in a stable sort by value — so one O(n log n) sort
+        replaces the former O(n²) pairwise scan (this runs per bar).
+        """
+        n = len(window)
+        if n < 2:
+            return None
+        vals: list[float] = []
+        for v in window:
+            f = self._finite_or_none(v)
+            if f is None:
+                return None
+            vals.append(f)
+        d2 = 0.0
+        for pos, idx in enumerate(sorted(range(n), key=vals.__getitem__)):
+            d = float(idx - pos)
+            d2 += d * d
+        denom = float(n) * (float(n) * float(n) - 1.0)
+        if denom == 0.0:
+            return None
+        return 1.0 - (6.0 * d2) / denom
+
+    def _rci_inc_update(self, series: Any, length: int) -> float | None:
+        """Incremental ``ta.rci`` from last-sample sources (``input.source``)."""
+        length = int(length)
+        if length < 2:
+            return None
+        slot = self._ta_next_slot()
+        key = ("rci", slot, length)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"window": deque(maxlen=length), "value": None}
+            bucket[key] = st
+        window: deque[Any] = st["window"]
+        window.append(self._series_last(series))
+        if len(window) < length:
+            st["value"] = None
+            return None
+        st["value"] = self._rci_spearman(list(window))
+        return st.get("value")
 
     def _median_inc_update(self, series: list[Any], period: int) -> float | None:
         """Incremental rolling median matching full ``_median`` (last value)."""
@@ -1431,6 +1712,73 @@ class TechnicalHelpers:
             return None
         st["value"] = statistics.median(valid)
         return st.get("value")
+
+    def _mode_inc_update(self, series: list[Any], period: int) -> float | None:
+        """Incremental mode matching full ``_mode`` (last value)."""
+        if period <= 0:
+            return None
+        slot = self._ta_next_slot()
+        key = ("mode", slot, period)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"window": deque(maxlen=period), "value": None}
+            bucket[key] = st
+        raw = self._series_last(series)
+        x: float | None
+        if raw is None:
+            x = None
+        else:
+            try:
+                x = float(raw)
+            except (TypeError, ValueError):
+                x = None
+        window: deque[float | None] = st["window"]
+        window.append(x)
+        if len(window) < period:
+            st["value"] = None
+            return None
+        valid = [v for v in window if v is not None]
+        if not valid:
+            st["value"] = None
+            return None
+        try:
+            st["value"] = float(statistics.mode(valid))
+        except statistics.StatisticsError:
+            st["value"] = float(valid[0])
+        return st.get("value")
+
+    def _cog_inc_update(self, series: list[Any], length: int) -> float:
+        """Incremental Center of Gravity matching full ``_builtin_ta_cog``."""
+        if length < 1:
+            return math.nan
+        slot = self._ta_next_slot()
+        key = ("cog", slot, int(length))
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"window": deque(maxlen=length)}
+            bucket[key] = st
+        raw = self._series_last(series)
+        x: float | None
+        if raw is None:
+            x = None
+        else:
+            try:
+                x = float(raw)
+                if x != x:
+                    x = None
+            except (TypeError, ValueError):
+                x = None
+        window: deque[float | None] = st["window"]
+        window.append(x)
+        if len(window) < length:
+            return math.nan
+        num_sum = sum((i + 1) * val for i, val in enumerate(reversed(window)) if val is not None)
+        den_sum = sum(val for val in window if val is not None)
+        if den_sum == 0:
+            return math.nan
+        return -num_sum / den_sum
 
     def _percentrank_inc_update(self, series: list[Any], period: int) -> float | None:
         """Incremental percentrank matching full ``_percentrank`` (last value)."""
@@ -1574,19 +1922,22 @@ class TechnicalHelpers:
         volume: list[Any] | None = None,
         *,
         anchor: Any = None,
-    ) -> float | None:
+        stdev_mult: Any = None,
+    ) -> float | tuple[float, float, float] | None:
         """Incremental cumulative VWAP matching bar-mode full recompute last value.
 
         Sums price*volume / sum(volume) over all bars seen at this call site.
         None prices are skipped (same as full ``_builtin_ta_vwap`` loop).
         When *anchor* is truthy, the cumulative window restarts on this bar.
+        When *stdev_mult* is set, returns ``(vwap, upper, lower)`` using
+        volume-weighted variance ``E[x^2] - E[x]^2``.
         """
         slot = self._ta_next_slot()
         key = ("vwap", slot)
         bucket = self._ta_state_bucket()
         st = bucket.get(key)
         if st is None:
-            st = {"cum_pv": 0.0, "cum_v": 0.0, "value": None, "n": 0}
+            st = {"cum_pv": 0.0, "cum_v": 0.0, "cum_p2v": 0.0, "value": None, "n": 0}
             bucket[key] = st
         # Anchor reset (ta.vwap(src, anchor)) before adding this bar
         if anchor is not None:
@@ -1597,6 +1948,7 @@ class TechnicalHelpers:
                 if a is not None and bool(a) and not (isinstance(a, float) and a != a):
                     st["cum_pv"] = 0.0
                     st["cum_v"] = 0.0
+                    st["cum_p2v"] = 0.0
                     st["n"] = 0
                     st["value"] = None
             except (TypeError, ValueError):
@@ -1618,12 +1970,34 @@ class TechnicalHelpers:
                     v = 0.0
         st["cum_pv"] = float(st["cum_pv"]) + price * v
         st["cum_v"] = float(st["cum_v"]) + v
+        st["cum_p2v"] = float(st.get("cum_p2v", 0.0)) + price * price * v
         st["n"] = int(st["n"]) + 1
         if st["cum_v"]:
-            st["value"] = st["cum_pv"] / st["cum_v"]
+            vwap = st["cum_pv"] / st["cum_v"]
         else:
-            st["value"] = price
-        return st.get("value")
+            vwap = price
+        if stdev_mult is None:
+            st["value"] = vwap
+            return vwap
+        m_raw = (
+            self._series_last(stdev_mult)
+            if not isinstance(stdev_mult, (bool, int, float))
+            else stdev_mult
+        )
+        try:
+            m = float(m_raw) if m_raw is not None else 0.0
+        except (TypeError, ValueError):
+            m = 0.0
+        if st["cum_v"]:
+            var = st["cum_p2v"] / st["cum_v"] - vwap * vwap
+            if var < 0.0:
+                var = 0.0
+            sd = math.sqrt(var)
+        else:
+            sd = 0.0
+        bands = (vwap, vwap + sd * m, vwap - sd * m)
+        st["value"] = bands
+        return bands
 
     def _barssince_inc_update(self, condition: Any) -> int | None:
         """Incremental ``ta.barssince`` for bar-mode scalar conditions.
@@ -2110,55 +2484,68 @@ class TechnicalHelpers:
         st["value"] = hits[-(occurrence + 1)]
         return st["value"]
 
+    def _pivot_confirm_window(
+        self,
+        window: Any,
+        left_bars: int,
+        right_bars: int,
+        *,
+        is_high: bool,
+    ) -> float | None:
+        """Pine ``ta.pivothigh`` / ``ta.pivotlow`` on a chronological window.
+
+        Center is ``right_bars`` before the newest sample. Confirmed only when
+        the center is a strict extreme vs both left and right sides (compile
+        ``numba_pivothigh`` / ``numba_pivotlow``).
+        """
+        need = left_bars + right_bars + 1
+        if len(window) < need:
+            return None
+        center_i = len(window) - 1 - right_bars
+        val = self._finite_or_none(window[center_i])
+        if val is None:
+            return None
+        lo = center_i - left_bars
+        hi = center_i + right_bars
+        for j in range(lo, hi + 1):
+            if j == center_i:
+                continue
+            other = self._finite_or_none(window[j])
+            if other is None:
+                continue
+            if is_high:
+                if other >= val:
+                    return None
+            elif other <= val:
+                return None
+        return val
+
     def _pivothigh_inc_update(
         self,
         series: list[Any],
         left_bars: int,
         right_bars: int,
     ) -> float | None:
-        """Incremental pivothigh matching BasicIndicators left-only check."""
+        """Incremental pivothigh: left+right confirmation (Pine / compile)."""
         if left_bars < 0 or right_bars < 0:
             return None
         slot = self._ta_next_slot()
         key = ("pivothigh", slot, left_bars, right_bars)
         bucket = self._ta_state_bucket()
+        need = left_bars + right_bars + 1
         st = bucket.get(key)
         if st is None:
-            need = left_bars + 1
             st = {"window": deque(maxlen=max(need, 1)), "n": 0, "value": None}
             bucket[key] = st
         x = self._series_last(series)
         st["window"].append(x)
         st["n"] = int(st["n"]) + 1
-        # Full: len(source) <= left + right → None
         if int(st["n"]) <= left_bars + right_bars:
             st["value"] = None
             return None
-        window: deque[Any] = st["window"]
-        if len(window) < left_bars + 1:
-            st["value"] = None
-            return None
-        current = window[-1]
-        if current is None:
-            st["value"] = None
-            return None
-        try:
-            cur_f = float(current)
-        except (TypeError, ValueError):
-            st["value"] = None
-            return None
-        for i in range(1, left_bars + 1):
-            left_val = window[-1 - i]
-            if left_val is None:
-                continue
-            try:
-                if float(left_val) >= cur_f:
-                    st["value"] = None
-                    return None
-            except (TypeError, ValueError):
-                continue
-        st["value"] = cur_f
-        return cur_f
+        val = self._pivot_confirm_window(st["window"], left_bars, right_bars, is_high=True)
+        st["value"] = val
+        return val
 
     def _pivotlow_inc_update(
         self,
@@ -2166,15 +2553,15 @@ class TechnicalHelpers:
         left_bars: int,
         right_bars: int,
     ) -> float | None:
-        """Incremental pivotlow matching BasicIndicators left-only check."""
+        """Incremental pivotlow: left+right confirmation (Pine / compile)."""
         if left_bars < 0 or right_bars < 0:
             return None
         slot = self._ta_next_slot()
         key = ("pivotlow", slot, left_bars, right_bars)
         bucket = self._ta_state_bucket()
+        need = left_bars + right_bars + 1
         st = bucket.get(key)
         if st is None:
-            need = left_bars + 1
             st = {"window": deque(maxlen=max(need, 1)), "n": 0, "value": None}
             bucket[key] = st
         x = self._series_last(series)
@@ -2183,31 +2570,9 @@ class TechnicalHelpers:
         if int(st["n"]) <= left_bars + right_bars:
             st["value"] = None
             return None
-        window: deque[Any] = st["window"]
-        if len(window) < left_bars + 1:
-            st["value"] = None
-            return None
-        current = window[-1]
-        if current is None:
-            st["value"] = None
-            return None
-        try:
-            cur_f = float(current)
-        except (TypeError, ValueError):
-            st["value"] = None
-            return None
-        for i in range(1, left_bars + 1):
-            left_val = window[-1 - i]
-            if left_val is None:
-                continue
-            try:
-                if float(left_val) <= cur_f:
-                    st["value"] = None
-                    return None
-            except (TypeError, ValueError):
-                continue
-        st["value"] = cur_f
-        return cur_f
+        val = self._pivot_confirm_window(st["window"], left_bars, right_bars, is_high=False)
+        st["value"] = val
+        return val
 
     def _dema_inc_update(self, series: list[Any], period: int) -> float | None:
         """Incremental DEMA: 2*EMA(src) - EMA(EMA(src)). Matches full last value."""
@@ -2702,16 +3067,51 @@ class TechnicalHelpers:
     ) -> tuple[float | None, float | None, float | None]:
         """Incremental Bollinger Bands (upper, middle, lower).
 
-        Nested ``_sma_inc_update`` + ``_stdev_inc_update`` (own call-site slots).
-        Matches ``_bollinger_bands`` last-value oracle.
+        One sliding window shared by SMA (middle) and sample stdev (ddof=1),
+        matching ``_bollinger_bands`` last-value oracle. ``period <= 1`` is
+        na (stdev needs two samples).
         """
-        middle = self._sma_inc_update(series, period)
-        deviation = self._stdev_inc_update(series, period)
-        if middle is None or deviation is None:
+        if period <= 1:
             return None, None, None
+        bucket, key = self._ta_key1("bb", int(period))
+        st = bucket.get(key)
+        if st is None:
+            st = {"window": deque(), "sum": 0.0, "sumsq": 0.0, "count": 0}
+            bucket[key] = st
+        raw = self._series_last(series)
+        x: float | None
+        if raw is None:
+            x = None
+        else:
+            try:
+                x = float(raw)
+                if x != x:  # NaN
+                    x = None
+            except (TypeError, ValueError):
+                x = None
+        window: deque[float | None] = st["window"]
+        if len(window) == period:
+            old = window.popleft()
+            if old is not None:
+                st["sum"] -= old
+                st["sumsq"] -= old * old
+                st["count"] -= 1
+        window.append(x)
+        if x is not None:
+            st["sum"] += x
+            st["sumsq"] += x * x
+            st["count"] += 1
+        n = int(st["count"])
+        if len(window) < period or n != period:
+            return None, None, None
+        s = float(st["sum"])
+        ss = float(st["sumsq"])
+        var = (ss - (s * s) / n) / (n - 1)
+        if var < 0.0:
+            var = 0.0
         try:
-            mid_f = float(middle)
-            dev_f = float(deviation)
+            mid_f = s / period
+            dev_f = math.sqrt(var)
             mult = float(multiplier)
         except (TypeError, ValueError):
             return None, None, None
@@ -2958,6 +3358,172 @@ class TechnicalHelpers:
         st["value"] = stochrsi_val
         return {"stochrsi": stochrsi_val, "signal": signal}
 
+    def _aroon_inc_update(
+        self,
+        highs: list[Any],
+        lows: list[Any],
+        length: int,
+    ) -> tuple[float, float] | None:
+        """Incremental Aroon matching full ``_builtin_ta_aroon`` (down, up).
+
+        Window is ``length + 1`` samples. ``bars_since`` is distance from the
+        end of the window; output is ``100 * (length - bars_since) / length``.
+        """
+        if length <= 0:
+            return None
+        window_n = length + 1
+        slot = self._ta_next_slot()
+        key = ("aroon", slot, int(length))
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {
+                "highs": deque(maxlen=window_n),
+                "lows": deque(maxlen=window_n),
+                "value": None,
+            }
+            bucket[key] = st
+        h = self._series_last(highs)
+        l = self._series_last(lows)
+        st["highs"].append(h)
+        st["lows"].append(l)
+        if len(st["highs"]) < window_n or len(st["lows"]) < window_n:
+            st["value"] = None
+            return None
+        h_win = list(st["highs"])
+        l_win = list(st["lows"])
+        try:
+            hh_i = max(range(window_n), key=lambda i: float(h_win[i]))
+            ll_i = min(range(window_n), key=lambda i: float(l_win[i]))
+        except (TypeError, ValueError):
+            st["value"] = None
+            return None
+        bars_since_hh = (window_n - 1) - hh_i
+        bars_since_ll = (window_n - 1) - ll_i
+        aroon_up = 100.0 * (length - bars_since_hh) / length
+        aroon_down = 100.0 * (length - bars_since_ll) / length
+        pair = (float(aroon_down), float(aroon_up))
+        st["value"] = pair
+        return pair
+
+    def _dpo_inc_update(self, closes: list[Any], length: int) -> float | None:
+        """Incremental DPO matching full ``ta.dpo`` last value.
+
+        ``close[length//2 + 1] - sma(close, length)``. SMA uses the same
+        last-N mean as the full path (no na-skip).
+        """
+        if length < 1:
+            return None
+        slot = self._ta_next_slot()
+        key = ("dpo", slot, int(length))
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        disp = length // 2 + 1
+        keep = max(length, disp)
+        if st is None:
+            st = {"window": deque(maxlen=keep), "value": None}
+            bucket[key] = st
+        raw = self._series_last(closes)
+        try:
+            x = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            x = None
+        window: deque[float | None] = st["window"]
+        window.append(x)
+        if len(window) < length:
+            st["value"] = None
+            return None
+        sma_win = list(window)[-length:]
+        if x is None or any(v is None for v in sma_win):
+            st["value"] = None
+            return None
+        sma_val = sum(float(v) for v in sma_win) / length
+        if len(window) < disp:
+            st["value"] = None
+            return None
+        displaced = list(window)[-disp]
+        try:
+            dpo_val = float(displaced) - sma_val
+        except (TypeError, ValueError):
+            st["value"] = None
+            return None
+        st["value"] = dpo_val
+        return dpo_val
+
+    def _donchian_inc_update(
+        self,
+        highs: list[Any],
+        lows: list[Any],
+        length: int,
+    ) -> dict[str, float | None]:
+        """Incremental Donchian matching full ``ta.donchian`` last window."""
+        empty = {"high": None, "low": None, "mid": None}
+        if length < 1:
+            return empty
+        hi = self._highest_inc_update(highs, length)
+        lo = self._lowest_inc_update(lows, length)
+        if hi is None or lo is None:
+            return empty
+        try:
+            hf = float(hi)
+            lf = float(lo)
+        except (TypeError, ValueError):
+            return empty
+        return {"high": hf, "low": lf, "mid": (hf + lf) / 2.0}
+
+    def _kst_inc_update(
+        self,
+        closes: list[Any],
+        length1: int,
+        length2: int,
+        length3: int,
+        length4: int,
+    ) -> float | None:
+        """Incremental KST matching full ``ta.kst`` last value.
+
+        Full path uses ``(close - close[-length]) / close[-length] * 100``
+        (not ``ta.roc``'s ``src[period]`` lookback). Weighted 1/2/3/4, /10.
+        """
+        lengths = (int(length1), int(length2), int(length3), int(length4))
+        if min(lengths) < 1:
+            return None
+        keep = max(lengths)
+        slot = self._ta_next_slot()
+        key = ("kst", slot, lengths)
+        bucket = self._ta_state_bucket()
+        st = bucket.get(key)
+        if st is None:
+            st = {"window": deque(maxlen=keep), "value": None}
+            bucket[key] = st
+        raw = self._series_last(closes)
+        try:
+            x = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            x = None
+        window: deque[float | None] = st["window"]
+        window.append(x)
+        if len(window) < keep or x is None:
+            st["value"] = None
+            return None
+        rocs: list[float] = []
+        for length in lengths:
+            base = window[-length]
+            if base is None or x is None:
+                st["value"] = None
+                return None
+            try:
+                b = float(base)
+                if b == 0.0:
+                    rocs.append(0.0)
+                else:
+                    rocs.append((x - b) / b * 100.0)
+            except (TypeError, ValueError):
+                st["value"] = None
+                return None
+        kst_val = (rocs[0] * 1.0 + rocs[1] * 2.0 + rocs[2] * 3.0 + rocs[3] * 4.0) / 10.0
+        st["value"] = kst_val
+        return kst_val
+
     def _finalize_series(self, values: list[Any]) -> Any:
         """Return full series list, or current scalar in bar mode."""
         if not self._bar_mode():
@@ -3017,15 +3583,9 @@ class TechnicalHelpers:
         """
         if isinstance(value, list):
             return self._cap_series_list(value)
-        # ChronoTailView (oldest-first Sequence, no .history)
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and getattr(
-            value, "history", None
-        ) is None:
-            try:
-                return self._cap_series_list(list(value))
-            except TypeError:
-                pass
-        # Duck-type PineSeries: newest-first history (deque or list)
+        # Duck-type PineSeries first (dominant Runtime arg). Checking
+        # ``history`` before ``isinstance(..., Sequence)`` skips the ABC
+        # cache on every full-recompute materialization.
         hist = getattr(value, "history", None)
         if hist is not None:
             try:
@@ -3040,14 +3600,23 @@ class TechnicalHelpers:
                 take = n if n <= cap else cap
                 # Same-bar cache: many ta.* calls share one PineSeries per bar.
                 head = hist[0]
+                # Fingerprint the two newest samples (`is`) — small ints are
+                # interned, so one sample cannot distinguish two series.
+                head2 = hist[1] if take > 1 else None
                 cache = getattr(self, "_pine_as_series_cache", None)
                 if cache is None:
                     cache = {}
                     self._pine_as_series_cache = cache  # type: ignore[attr-defined]
                 key = id(value)
                 ent = cache.get(key)
-                if ent is not None and ent[0] == n and ent[1] is head and ent[2] == take:
-                    return ent[3]
+                if (
+                    ent is not None
+                    and ent[0] == n
+                    and ent[1] is head
+                    and ent[2] is head2
+                    and ent[3] == take
+                ):
+                    return ent[4]
                 # Newest-first → take first `take` then reverse to chronological.
                 # Avoid list(reversed(full_history)) when n >> SERIES_MAX.
                 if take == n:
@@ -3055,8 +3624,14 @@ class TechnicalHelpers:
                 else:
                     # hist[0] newest … hist[take-1] oldest among window
                     raw = [hist[i] for i in range(take - 1, -1, -1)]
-                cache[key] = (n, head, take, raw)
+                cache[key] = (n, head, head2, take, raw)
                 return raw
+        # ChronoTailView (oldest-first Sequence, no .history)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            try:
+                return self._cap_series_list(list(value))
+            except TypeError:
+                pass
         # Named series reference — look up from the pre-loaded dict
         series_map = getattr(self, "current_series", None) or {}
         if isinstance(value, str):
@@ -3118,7 +3693,12 @@ class TechnicalHelpers:
         Incremental kernels only read ``_series_last``; return the live list
         (or empty) without allocating a capped slice.
         """
-        series_map = getattr(self, "current_series", None) or {}
+        try:
+            series_map = self.current_series
+        except AttributeError:
+            return []
+        if not series_map:
+            return []
         src = series_map.get(name)
         if src is None:
             return []
@@ -3624,13 +4204,13 @@ class TechnicalHelpers:
     def _falling(self, series: list[float], period: int) -> bool:
         """Check if series is falling for period (na-safe).
 
-        Strict consecutive decline: ``s[-1] < s[-2] < ...`` over ``period`` bars.
+        ``period`` pairwise steps (``s[-1] < s[-2] < …``), needing
+        ``period+1`` samples — matches ``numba_falling`` (``i >= length``).
         Any Pine na (None) or non-numeric sample → False (never TypeError).
         """
-        if len(series) < period or period < 1:
+        if period < 1 or len(series) < period + 1:
             return False
-        for idx in range(1, period):
-            # consecutive: series[-idx] < series[-idx-1] for falling
+        for idx in range(1, period + 1):
             a, b = series[-idx], series[-idx - 1]
             if a is None or b is None:
                 return False
@@ -3644,11 +4224,12 @@ class TechnicalHelpers:
     def _rising(self, series: list[float], period: int) -> bool:
         """Check if series is rising for period (na-safe).
 
-        Strict consecutive rise; any na / non-numeric → False (never TypeError).
+        ``period`` pairwise steps, needing ``period+1`` samples — matches
+        ``numba_rising``. Any na / non-numeric → False (never TypeError).
         """
-        if len(series) < period or period < 1:
+        if period < 1 or len(series) < period + 1:
             return False
-        for idx in range(1, period):
+        for idx in range(1, period + 1):
             a, b = series[-idx], series[-idx - 1]
             if a is None or b is None:
                 return False

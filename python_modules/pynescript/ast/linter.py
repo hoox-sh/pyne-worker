@@ -37,6 +37,7 @@ from __future__ import annotations
 import re
 
 from dataclasses import dataclass
+from typing import Any
 
 from pynescript.ast import parse
 
@@ -75,19 +76,24 @@ class PineLinter:
         """Create a linter with an empty :attr:`warnings` list."""
         self.warnings: list[LintWarning] = []
 
-    def lint(self, source: str, filename: str = "<input>") -> list[LintWarning]:
+    def lint(self, source: str, filename: str = "<input>", *, tree: Any | None = None) -> list[LintWarning]:
         """Run all rules on *source* and return findings.
 
         Args:
             source: Full script text.
             filename: Label passed to the parser for syntax diagnostics.
+            tree: Pre-parsed AST. When given, the syntax rule reuses it
+                instead of re-parsing *source* (halves parse cost for
+                callers that already have the tree, e.g. the language
+                server workspace).
 
         Returns:
             List of :class:`LintWarning` (also stored on :attr:`warnings`).
         """
         self.warnings = []
 
-        self._check_syntax(source, filename)
+        if tree is None:
+            self._check_syntax(source, filename)
         self._check_version(source)
         self._check_deprecated(source)
         self._check_naming(source)
@@ -158,11 +164,15 @@ class PineLinter:
                 )
 
     def _check_deprecated(self, source: str) -> None:
-        """Flag known deprecated call/init patterns (``W101``–``W103``)."""
+        """Flag known deprecated call patterns (``W101``).
+
+        Retired: ``W102`` (histogram → plotcandle was wrong guidance —
+        plotcandle is not a histogram substitute) and ``W103``
+        (``var int x = na`` → 0 changes semantics; na-init is idiomatic).
+        Codes stay retired so history stays greppable.
+        """
         deprecated_patterns = [
             (r"\bsecurity\s*\(\s*'[A-Z]+:[A-Z]+'", "W101", "Use request.security() with explicit parameters"),
-            (r"plot\(.*style=plot\.style_histogram", "W102", "Consider using plotcandle for better visualization"),
-            (r"var\s+int\s+\w+\s*=\s*na", "W103", "Initialize with 0 instead of na for better type safety"),
         ]
 
         for pattern, code, message in deprecated_patterns:
@@ -172,32 +182,43 @@ class PineLinter:
 
     def _check_naming(self, source: str) -> None:
         """Heuristic naming checks for ``ta.*`` assignments (``C001``)."""
-        lines = source.split("\n")
-        for i, line in enumerate(lines, 1):
-            if match := re.search(r"(\w+)\s*=\s*ta\.", line):
-                var_name = match.group(1)
-                if re.match(r"^[a-z]", var_name):
-                    self._add_warning(
-                        code="C001",
-                        message=f"Variable '{var_name}' should use camelCase (e.g., '{_to_camel(var_name)}')",
-                        line=i,
-                    )
+        for i, line in enumerate(source.split("\n"), 1):
+            eq = line.find("=")
+            if eq <= 0:
+                continue
+            if line[eq - 1] == ":":
+                continue
+            lhs = line[:eq].rstrip(" \t")
+            j = len(lhs)
+            while j > 0 and (lhs[j - 1].isalnum() or lhs[j - 1] == "_"):
+                j -= 1
+            var_name = lhs[j:]
+            if not var_name:
+                continue
+            rhs = line[eq + 1 :].lstrip(" \t")
+            if not rhs.startswith("ta."):
+                continue
+            # snake_case only — ``fastMA`` / ``sma`` are already camel/short.
+            if "_" in var_name and "a" <= var_name[0] <= "z":
+                self._add_warning(
+                    code="C001",
+                    message=f"Variable '{var_name}' should use camelCase (e.g., '{_to_camel(var_name)}')",
+                    line=i,
+                )
 
     def _check_style(self, source: str) -> None:
-        """Line length, if-style, and trailing-newline style rules (``C002``–``C004``)."""
+        """Line length and trailing-newline style rules (``C002``, ``C004``).
+
+        Retired: ``C003`` (indented ``if`` without “braces” — Pine has no
+        braces, so the rule fired on every normal block). Code stays
+        retired so history stays greppable.
+        """
         lines = source.split("\n")
         for i, line in enumerate(lines, 1):
             if len(line.rstrip()) > 120:
                 self._add_warning(
                     code="C002",
                     message=f"Line exceeds 120 characters ({len(line.rstrip())})",
-                    line=i,
-                )
-
-            if re.match(r"^\s+if\s+", line):
-                self._add_warning(
-                    code="C003",
-                    message="Avoid single-line if statements without braces",
                     line=i,
                 )
 
@@ -215,18 +236,19 @@ def _to_camel(name: str) -> str:
     return components[0] + "".join(x.title() for x in components[1:])
 
 
-def lint_script(source: str, filename: str = "<input>") -> list[LintWarning]:
+def lint_script(source: str, filename: str = "<input>", *, tree: Any | None = None) -> list[LintWarning]:
     """Lint a source string; convenience wrapper around :class:`PineLinter`.
 
     Args:
         source: Decoded Pine Script text.
         filename: Label for diagnostics.
+        tree: Pre-parsed AST; skips the internal re-parse when given.
 
     Returns:
         Findings from a fresh linter instance.
     """
     linter = PineLinter()
-    return linter.lint(source, filename)
+    return linter.lint(source, filename, tree=tree)
 
 
 def lint_file(filepath: str) -> list[LintWarning]:

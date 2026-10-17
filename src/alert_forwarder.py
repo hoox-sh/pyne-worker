@@ -59,7 +59,17 @@ def build_alert_payload(alert: dict[str, Any]) -> dict[str, Any]:
 
 
 async def default_http_post_json(url: str, body: dict[str, Any]) -> int:
-    """POST JSON — Workers ``js.fetch`` when available, else urllib."""
+    """POST JSON — Workers ``js.fetch`` when available, else urllib.
+
+    Fail-closed hardening (parity with the Pro API, pynescript 0.6.6):
+
+    - The URL is re-validated **at POST time** (not just when queued).
+    - Redirects are never followed: a 30x answer is returned as-is so the
+      caller counts it failed instead of re-targeting the request.
+    """
+    if validate_webhook_url(url) is None:
+        return 0
+
     data = json.dumps(body).encode("utf-8")
     try:
         from js import Headers  # type: ignore[import-not-found]
@@ -77,7 +87,10 @@ async def default_http_post_json(url: str, body: dict[str, Any]) -> int:
             method="POST",
             headers=headers,
             body=data.decode("utf-8"),
+            # Never follow a redirect to a different (possibly private) host.
+            redirect="manual",
         )
+        # 30x is surfaced as-is; the caller counts only 2xx as delivered.
         return int(getattr(resp, "status", 0) or 0)
     except ImportError:
         pass
@@ -96,10 +109,26 @@ async def default_http_post_json(url: str, body: dict[str, Any]) -> int:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _no_redirect_opener().open(req, timeout=15) as resp:
             return int(getattr(resp, "status", 200) or 200)
     except urllib.error.HTTPError as e:
         return int(e.code)
+
+
+def _no_redirect_opener():
+    """urllib opener that refuses redirects (a 30x raises ``HTTPError``).
+
+    Exposed for tests: following a redirect would re-post the alert payload
+    to whatever host the receiver names, defeating the SSRF check done when
+    the URL was accepted.
+    """
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+            return None
+
+    return urllib.request.build_opener(_NoRedirect())
 
 
 async def forward_alerts(

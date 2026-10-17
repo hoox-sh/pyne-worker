@@ -30,13 +30,16 @@ Commands
 --------
 - ``check`` — parse-only validation (CI-friendly exit codes)
 - ``format`` / ``fmt`` — parse → unparse (optional in-place write)
+- ``convert`` — rewrite older Pine toward v5 or v6 (any older version → v6)
 - ``parse-and-dump`` / ``dump`` / ``ast`` — AST dump
 - ``parse-and-unparse`` / ``unparse`` — round-trip source
 - ``lint`` — linter with colored / JSON output
 - ``compile`` — transpile or compile-check via Numba pipeline
 - ``prewarm`` — warm Numba builtins / optional script IR caches (H2)
 - ``run`` — compile + execute on synthetic OHLCV
+- ``runner`` — deploy / tick hosted scripts on the Pro API (``PYNE_RUNNER``)
 - ``data`` — fetch market bars (mock / Yahoo / …)
+- ``download-builtins`` — fetch TradingView builtin Pine templates
 - ``info`` — version and optional extras (numba, rich, …)
 
 The Language Server is a **separate** console script (``pyne-lsp`` /
@@ -56,6 +59,26 @@ import click
 
 # Explicit version: PyPI dist is ``hoox-pyne``; import package is ``pynescript``.
 from pynescript.__about__ import __version__ as _CLI_VERSION
+from pynescript.util.runner_cli import runner_group
+
+
+def _configure_stdio() -> None:
+    """Prefer UTF-8 on stdout/stderr so Windows cp1252 does not crash ``--help``.
+
+    Click prints help before the ``cli()`` body runs, so this must run at
+    import time (console-script entry is ``pynescript.__main__:cli``).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+_configure_stdio()
 
 
 # ---------------------------------------------------------------------------
@@ -72,20 +95,26 @@ _FG = "#EFEFE8"
 _EPILOG = """\
 \b
 Examples:
-  pynescript check script.pine
-  pynescript format script.pine -w
-  pynescript dump script.pine --indent 2
-  pynescript lint script.pine --json
-  pynescript compile script.pine --emit
-  pynescript run script.pine --bars 100
-  pynescript data AAPL --provider yahoo --period 6mo
-  pynescript info
+  pyne check script.pine
+  pyne format script.pine -w
+  pyne convert script.pine --to 6
+  pyne dump script.pine --indent 2
+  pyne lint script.pine --json
+  pyne compile script.pine --emit
+  pyne run script.pine --bars 100
+  pyne runner deploy script.pine --id demo
+  pyne runner tick --id demo --force
+  pyne data AAPL --provider yahoo --period 6mo
+  pyne download-builtins --list
+  pyne download-builtins --yes
+  pyne info
 
 \b
-Aliases:  dump→parse-and-dump  ast→parse-and-dump  unparse→parse-and-unparse
-          fmt→format  ls→info
+Aliases:  dump -> parse-and-dump  ast -> parse-and-dump  unparse -> parse-and-unparse
+          fmt -> format  ls -> info
+          pynescript remains a compatibility alias of pyne
 
-Language server:  pynescript-lsp  (separate entry point, not a subcommand)
+Language server:  pyne-lsp  (alias: pynescript-lsp; separate entry point, not a subcommand)
 Docs:             https://hoox.sh/pyne
 """
 
@@ -229,15 +258,10 @@ def _print_banner() -> None:
 
     con = _console()
     if con is not None:
-        con.print(
-            f"[pyne.accent]◆ PYNE[/] [pyne.fg]pynescript[/] "
-            f"[pyne.muted]v{__version__}[/]"
-        )
-        con.print(
-            "[pyne.muted]Pine Script toolchain — parse · lint · compile · run[/]"
-        )
+        con.print(f"[pyne.accent]◆ PYNE[/] [pyne.fg]pyne[/] [pyne.muted]v{__version__}[/]")
+        con.print("[pyne.muted]Pine Script toolchain — parse · lint · compile · run[/]")
     else:
-        _echo(f"PYNE pynescript v{__version__}")
+        _echo(f"PYNE pyne v{__version__}")
         _echo("Pine Script toolchain — parse · lint · compile · run")
 
 
@@ -256,7 +280,7 @@ def _print_banner() -> None:
     "--version",
     "-V",
     message="%(version)s",
-    prog_name="pynescript",
+    prog_name="pyne",
 )
 @click.option(
     "--no-color",
@@ -265,9 +289,10 @@ def _print_banner() -> None:
 )
 @click.pass_context
 def cli(ctx: click.Context, no_color: bool) -> None:
-    """Pyne / pynescript — Pine Script parse, lint, compile, and run.
+    """pyne -- Pine Script parse, lint, compile, and run.
 
-    Use ``pynescript COMMAND -h`` for per-command help.
+    Use ``pyne COMMAND -h`` for per-command help.
+    ``pynescript`` remains a compatibility alias of ``pyne``.
     """
     if no_color:
         import os
@@ -480,7 +505,7 @@ def parse_and_unparse(filename: str, encoding: str, output_file: str) -> None:
     _write_out(unparse(parse(source, label)), output_file, encoding)
 
 
-@cli.command("format", short_help="Format Pine via parse → unparse.")
+@cli.command("format", short_help="Format Pine via parse -> unparse.")
 @click.argument(
     "filename",
     metavar="PATH",
@@ -547,6 +572,74 @@ def format_cmd(
         return
 
     _write_out(formatted.rstrip("\n"), output_file, encoding)
+
+
+# ---------------------------------------------------------------------------
+# convert (v5 ↔ v6)
+# ---------------------------------------------------------------------------
+
+
+@cli.command("convert", short_help="Rewrite older Pine toward v5 or v6.")
+@click.argument(
+    "filename",
+    metavar="PATH",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True, allow_dash=True),
+)
+@click.option(
+    "--to",
+    "target",
+    type=click.Choice(["5", "6", "v5", "v6"]),
+    required=True,
+    help="Target language version.",
+)
+@click.option("--encoding", default="utf-8", help="Text encoding of the file.")
+@click.option(
+    "-w",
+    "--write",
+    "write_inplace",
+    is_flag=True,
+    help="Write converted source back to PATH (not for stdin).",
+)
+@click.option(
+    "--output-file",
+    "-o",
+    metavar="PATH",
+    type=click.Path(writable=True, allow_dash=True),
+    default="-",
+    help="Output path when not using --write (default: stdout).",
+)
+def convert_cmd(
+    filename: str,
+    target: str,
+    encoding: str,
+    write_inplace: bool,
+    output_file: str,
+) -> None:
+    """Rewrite older Pine toward v5 or v6.
+
+    ``--to 6`` converts any older version (missing ``//@version`` counts as v1):
+    colors / ``n`` / timeframe idents, ``ta.*`` / ``math.*`` / ``request.*``
+    namespaces, ``study(``→``indicator(``, typed ``input.*()``, ``iff`` / ``offset``.
+    Does not attempt semantic v6 tightening (bool-as-int, ``na``). Comments
+    and string literals are left unchanged.
+    """
+    from pynescript.util.pine_convert import convert_pine
+
+    if filename == "-" and write_inplace:
+        raise click.ClickException("cannot --write stdin")
+
+    source, label = _read_source(filename if filename != "-" else "-", encoding)
+    to = int(target.lstrip("v"))
+    converted = convert_pine(source, to=to)
+    if not converted.endswith("\n"):
+        converted += "\n"
+
+    if write_inplace:
+        Path(filename).write_text(converted, encoding=encoding)
+        _echo_status("ok", f"converted {label} → v{to}")
+        return
+
+    _write_out(converted.rstrip("\n"), output_file, encoding)
 
 
 # ---------------------------------------------------------------------------
@@ -663,9 +756,7 @@ def lint(filename: str | None, encoding: str, fail_on: str, as_json: bool, quiet
     help="Where to write --emit output (default: stdout).",
 )
 @click.option("--time/--no-time", "show_time", default=True, help="Print compile timing.")
-def compile_cmd(
-    filename: str, encoding: str, emit: bool, output_file: str, show_time: bool
-) -> None:
+def compile_cmd(filename: str, encoding: str, emit: bool, output_file: str, show_time: bool) -> None:
     """Compile PATH through :func:`pynescript.compiler.compile_script`.
 
     Without ``--emit``, loads the compiled entry (and warm-ups Numba when
@@ -700,9 +791,7 @@ def compile_cmd(
             msg += "  (numba missing?)"
         _echo_status("ok", msg)
         if compiled.plot_titles:
-            _echo(
-                f"  plots: {', '.join(compiled.plot_titles[:12])}" + ("…" if plots > 12 else "")
-            )
+            _echo(f"  plots: {', '.join(compiled.plot_titles[:12])}" + ("…" if plots > 12 else ""))
     except Exception as e:
         _echo_status("fail", f"{type(e).__name__}: {e}", err=True)
         raise SystemExit(1) from e
@@ -857,13 +946,200 @@ def run_cmd(filename: str, encoding: str, bars: int, as_json: bool, quiet: bool)
             con.print(table)
         else:
             for title, series in plots.items():
-                _echo(f"  {title}: n={len(series) if hasattr(series, '__len__') else '?'}  "
-                      f"last={_jsonable_last(series)}")
+                _echo(
+                    f"  {title}: n={len(series) if hasattr(series, '__len__') else '?'}  last={_jsonable_last(series)}"
+                )
     else:
         _echo("  (no plot series)")
     if extras:
         keys = ", ".join(sorted(extras))
         _echo(f"  extras: {keys}")
+
+
+def _validation_from_cli(
+    *,
+    mode: str,
+    bars: int,
+    train_bars: int | None,
+    test_bars: int | None,
+    step_bars: int | None,
+    holdout_frac: float | None,
+) -> Any:
+    from pynescript.optimize.types import ValidationSpec
+    from pynescript.optimize.walk_forward import rolling_windows
+
+    frac = 0.3 if holdout_frac is None else holdout_frac
+    if mode == "walk-forward":
+        train = train_bars if train_bars is not None else max(8, bars * 2 // 3)
+        test = test_bars if test_bars is not None else max(4, bars // 6)
+        step = step_bars if step_bars is not None else max(1, test)
+    else:
+        train = train_bars if train_bars is not None else 200
+        test = test_bars if test_bars is not None else 50
+        step = step_bars if step_bars is not None else 50
+    spec = ValidationSpec(
+        mode=mode,  # type: ignore[arg-type]
+        holdout_frac=frac,
+        train_bars=train,
+        test_bars=test,
+        step_bars=step,
+    )
+    if mode == "walk-forward" and not rolling_windows(bars, spec):
+        raise click.ClickException(f"walk-forward needs --bars >= train+test ({train}+{test}); got {bars}")
+    return spec
+
+
+def _emit_optimize_study(study: Any, label: str, *, as_json: bool) -> None:
+    all_errored = bool(study.trials) and all(t.error for t in study.trials)
+    failed = study.status == "error" or all_errored or (study.best_params is None and all_errored)
+    if as_json:
+        _echo(json.dumps(study.to_dict(), indent=2, default=str))
+        if failed:
+            raise SystemExit(1)
+        return
+    if failed:
+        err = study.error or next((t.error for t in study.trials if t.error), None)
+        _echo_status("fail", err or "optimize failed", err=True)
+        raise SystemExit(1)
+    _echo_status(
+        "ok",
+        f"optimized {label}  trials={len(study.trials)}  "
+        f"runs={study.engine_runs}  {study.ms:.0f}ms  sampler={study.sampler}",
+    )
+    if study.warning:
+        _echo(f"  warn: {study.warning}")
+    if study.best_params:
+        bits = ", ".join(f"{k}={v}" for k, v in study.best_params.items())
+        _echo(f"  best: {bits}")
+        _echo(f"  is_score={study.best_is_score}  oos_score={study.best_oos_score}")
+    else:
+        _echo("  (no valid winner)")
+
+
+@cli.command("optimize", short_help="Search strategy input.* values over N interpret runs.")
+@click.argument(
+    "filename",
+    metavar="PATH",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True, allow_dash=True),
+)
+@click.option("--encoding", default="utf-8", help="Text encoding of the file.")
+@click.option("--bars", type=int, default=120, show_default=True, help="Synthetic bar count.")
+@click.option("--trials", type=int, default=20, show_default=True, help="Trial budget (max 200).")
+@click.option(
+    "--space",
+    "space_json",
+    type=str,
+    default="",
+    help='JSON SearchSpace: {"params":[{"name":"Len","kind":"int","min":2,"max":20}]}',
+)
+@click.option(
+    "--sampler",
+    type=click.Choice(["auto", "random", "tpe", "grid"]),
+    default="auto",
+    show_default=True,
+)
+@click.option(
+    "--objective",
+    type=click.Choice(["composite", "net_pnl", "profit_factor", "calmar"]),
+    default="composite",
+    show_default=True,
+)
+@click.option(
+    "--validation",
+    "validation_mode",
+    type=click.Choice(["holdout", "walk-forward", "in-sample"]),
+    default="holdout",
+    show_default=True,
+)
+@click.option(
+    "--train-bars",
+    type=int,
+    default=None,
+    help="Walk-forward train bars (default: derive from --bars).",
+)
+@click.option(
+    "--test-bars",
+    type=int,
+    default=None,
+    help="Walk-forward test bars (default: derive from --bars).",
+)
+@click.option(
+    "--step-bars",
+    type=int,
+    default=None,
+    help="Walk-forward step bars (default: the test window).",
+)
+@click.option(
+    "--holdout-frac",
+    type=float,
+    default=None,
+    help="Holdout test fraction (default: 0.3).",
+)
+@click.option("--seed", type=int, default=None, help="RNG seed.")
+@click.option("--json", "as_json", is_flag=True, help="Print the full study JSON.")
+def optimize_cmd(
+    filename: str,
+    encoding: str,
+    bars: int,
+    trials: int,
+    space_json: str,
+    sampler: str,
+    objective: str,
+    validation_mode: str,
+    train_bars: int | None,
+    test_bars: int | None,
+    step_bars: int | None,
+    holdout_frac: float | None,
+    seed: int | None,
+    as_json: bool,
+) -> None:
+    """Optimise a ``strategy()`` script (interpret Runtime, not /backtest/quick)."""
+    from pynescript.optimize import run_study
+    from pynescript.optimize import space_from_payload
+
+    if bars < 8:
+        raise click.ClickException("--bars must be >= 8")
+    source, label = _read_source(filename if filename != "-" else "-", encoding)
+    raw_space = space_json.strip()
+    if not raw_space:
+        raise click.ClickException("--space JSON is required")
+    try:
+        payload = json.loads(raw_space)
+        space = space_from_payload(payload)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise click.ClickException(f"invalid --space: {exc}") from exc
+    spec = _validation_from_cli(
+        mode=validation_mode,
+        bars=bars,
+        train_bars=train_bars,
+        test_bars=test_bars,
+        step_bars=step_bars,
+        holdout_frac=holdout_frac,
+    )
+    cols = _synthetic_ohlcv(bars)
+    ohlcv = [
+        {
+            "time": 1_700_000_000 + i * 60,
+            "open": cols["open"][i],
+            "high": cols["high"][i],
+            "low": cols["low"][i],
+            "close": cols["close"][i],
+            "volume": cols["volume"][i],
+        }
+        for i in range(bars)
+    ]
+    study = run_study(
+        source,
+        ohlcv,
+        space,
+        n_trials=trials,
+        sampler=sampler,
+        objective=objective,
+        validation=spec,
+        seed=seed,
+        min_trades=0 if validation_mode == "in-sample" else 5,
+    )
+    _emit_optimize_study(study, label, as_json=as_json)
 
 
 def _jsonable_last(series: Any) -> Any:
@@ -945,9 +1221,9 @@ def data(
 
     \b
     Examples:
-      pynescript data AAPL
-      pynescript data BTC-USD --provider yahoo --period 6mo
-      pynescript data BTC/USDT --provider ccxt --exchange binance --format csv
+      pyne data AAPL
+      pyne data BTC-USD --provider yahoo --period 6mo
+      pyne data BTC/USDT --provider ccxt --exchange binance --format csv
     """
     from pynescript.util.data import DataProviderError
     from pynescript.util.data import get_provider
@@ -996,10 +1272,7 @@ def data(
             lines = ["open,high,low,close,volume"]
             vols = result.get("volume") or [0] * n
             for i in range(n):
-                lines.append(
-                    f"{result['open'][i]},{result['high'][i]},{result['low'][i]},"
-                    f"{closes[i]},{vols[i]}"
-                )
+                lines.append(f"{result['open'][i]},{result['high'][i]},{result['low'][i]},{closes[i]},{vols[i]}")
             _write_out("\n".join(lines) + "\n", output_file)
             return
 
@@ -1043,9 +1316,76 @@ def data(
 
 
 # ---------------------------------------------------------------------------
+# download-builtins
+# ---------------------------------------------------------------------------
+
+
+@cli.command("download-builtins", short_help="Download TradingView builtin Pine templates.")
+@click.argument(
+    "dest",
+    required=False,
+    type=click.Path(file_okay=False, writable=True, path_type=Path),
+)
+@click.option("--workers", type=int, default=None, help="Parallel GET workers (default: 8).")
+@click.option("--encoding", default="utf-8", help="Text encoding for written .pine files.")
+@click.option(
+    "--list",
+    "dry_run",
+    is_flag=True,
+    help="Print the Rich catalog only — do not download.",
+)
+@click.option("--yes", "assume_yes", is_flag=True, help="Skip the confirm prompt.")
+@click.option("--skip-existing", is_flag=True, help="Do not overwrite files already on disk.")
+@click.option("--limit", type=int, default=None, help="Download only the first N templates.")
+@click.option("--plain", is_flag=True, help="Disable Rich (tqdm / ASCII).")
+@click.option("--rich", "force_rich", is_flag=True, help="Force Rich even when stdout is not a TTY.")
+def download_builtins_cmd(
+    dest: Path | None,
+    workers: int | None,
+    encoding: str,
+    dry_run: bool,
+    assume_yes: bool,
+    skip_existing: bool,
+    limit: int | None,
+    plain: bool,
+    force_rich: bool,
+) -> None:
+    """Fetch official builtin Pine templates from pine-facade.
+
+    Prints a Rich catalog *before* any per-script download starts.
+
+    \b
+    Examples:
+      pyne download-builtins --list
+      pyne download-builtins --yes
+      pyne download-builtins /tmp/pine-builtins --limit 5 --yes
+      python -m pynescript.util.pine_facade --list
+    """
+    from pynescript.util.pine_facade import DEFAULT_DEST
+    from pynescript.util.pine_facade import download_builtin_scripts
+
+    summary = download_builtin_scripts(
+        dest or DEFAULT_DEST,
+        encoding=encoding,
+        max_workers=workers,
+        dry_run=dry_run,
+        confirm=not assume_yes,
+        skip_existing=skip_existing,
+        limit=limit,
+        plain=plain,
+        force_rich=force_rich,
+    )
+    if summary.get("failed"):
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
 
+cli.add_command(runner_group)
+
+
 if __name__ == "__main__":
-    cli(prog_name="pynescript")  # pragma: no cover
+    cli(prog_name="pyne")  # pragma: no cover

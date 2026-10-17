@@ -43,6 +43,7 @@ from typing import Any
 from pynescript.ast import node as ast
 from pynescript.ast.evaluator.builtins.declarations import ScriptDeclaration
 from pynescript.ast.evaluator.libraries import STUB_KNOWN_EXPORTS
+from pynescript.ast.evaluator.libraries import bind_tradingview_ta_stub_exports
 from pynescript.ast.evaluator.libraries import LibraryModule
 from pynescript.ast.evaluator.names import ast_qualified_name
 from pynescript.ast.helper import parse as parse_pine
@@ -57,6 +58,28 @@ from pynescript.ast.type_system import UserDefinedType
 
 # Sentinel: param was not present in context before binding (pop on unbind).
 _CONTEXT_MISSING: Any = object()
+
+# Lazy handles into expressions.py (import cycle + per-bar hot paths:
+# hoisting avoids the import machinery on every ``x += 1`` / switch).
+_BINOP_RAW: Any = None
+_elementwise_binary: Any = None
+_switch_case_matches: Any = None
+
+
+def _load_expression_helpers() -> None:
+    """Bind lazy expression helpers once (first hot-path use)."""
+    global _BINOP_RAW, _elementwise_binary, _switch_case_matches
+    if _BINOP_RAW is None:
+        from pynescript.ast.evaluator import expressions as _expr_mod
+
+        _BINOP_RAW = _expr_mod._BINOP_RAW
+        _elementwise_binary = _expr_mod._elementwise_binary
+        _switch_case_matches = _expr_mod._switch_case_matches
+
+
+# Top-level declarations that are no-ops after the host locks defs (bar 1+).
+_DECL_CALL_NAMES = frozenset({"indicator", "strategy", "library", "study"})
+_SKIP_AFTER_LOCK = (ast.FunctionDef, ast.TypeDef, ast.EnumDef, ast.Import)
 
 
 def _type_spec_tag(spec: Any) -> str | None:
@@ -167,6 +190,30 @@ _NA_EXCLUDED_TAGS = frozenset(
     }
 )
 
+# Cached drawing / matrix classes for overload dispatch (lazy to avoid a
+# hard import cycle; the tuple is built once and reused per call per bar).
+_drawing_matrix_cache: tuple[type, ...] | None = None
+
+
+def _drawing_matrix_types() -> tuple[Any, ...]:
+    """Return ``(Box, ChartPoint, Label, Line, LineFill, Polyline, Table, Matrix)``."""
+    global _drawing_matrix_cache
+    if _drawing_matrix_cache is None:
+        try:
+            from pynescript.ast.evaluator.builtins.drawing import Box
+            from pynescript.ast.evaluator.builtins.drawing import ChartPoint
+            from pynescript.ast.evaluator.builtins.drawing import Label
+            from pynescript.ast.evaluator.builtins.drawing import Line
+            from pynescript.ast.evaluator.builtins.drawing import LineFill
+            from pynescript.ast.evaluator.builtins.drawing import Polyline
+            from pynescript.ast.evaluator.builtins.drawing import Table
+            from pynescript.ast.evaluator.builtins.matrix import Matrix
+
+            _drawing_matrix_cache = (Box, ChartPoint, Label, Line, LineFill, Polyline, Table, Matrix)
+        except Exception:  # pragma: no cover
+            _drawing_matrix_cache = ((), (), (), (), (), (), (), ())
+    return _drawing_matrix_cache
+
 
 def _receiver_matches_type_tag(tag: str | None, receiver: Any) -> bool:
     """True if *receiver* is compatible with a method first-param type tag."""
@@ -179,18 +226,9 @@ def _receiver_matches_type_tag(tag: str | None, receiver: Any) -> bool:
         base = tag_l.split(".", 1)[0]
         return base not in _NA_EXCLUDED_TAGS
 
-    # Built-in drawing / collection types
-    try:
-        from pynescript.ast.evaluator.builtins.drawing import Box
-        from pynescript.ast.evaluator.builtins.drawing import ChartPoint
-        from pynescript.ast.evaluator.builtins.drawing import Label
-        from pynescript.ast.evaluator.builtins.drawing import Line
-        from pynescript.ast.evaluator.builtins.drawing import LineFill
-        from pynescript.ast.evaluator.builtins.drawing import Polyline
-        from pynescript.ast.evaluator.builtins.drawing import Table
-        from pynescript.ast.evaluator.builtins.matrix import Matrix
-    except Exception:  # pragma: no cover
-        Box = Label = Line = LineFill = Polyline = Table = ChartPoint = Matrix = ()  # type: ignore
+    # Built-in drawing / collection types (cached at module scope — this
+    # dispatch runs per call site per bar in method-heavy library scripts).
+    Box, ChartPoint, Label, Line, LineFill, Polyline, Table, Matrix = _drawing_matrix_types()
 
     # matrix / matrix.float / matrix.string
     if tag_l == "matrix" or tag_l.startswith("matrix."):
@@ -433,11 +471,15 @@ class StatementEvaluator:
 
     def _collect_history_names(self, node: Any, out: set[str]) -> None:
         """Collect Name bases of history Subscripts (``x[1]``, ``x[n]``)."""
-        if node is None or not hasattr(node, "__dict__"):
+        if node is None or not hasattr(node, "_fields"):
             return
         if isinstance(node, ast.Subscript) and isinstance(getattr(node, "value", None), ast.Name):
             out.add(node.value.id)
-        for child in node.__dict__.values():
+        for name in node._fields:
+            try:
+                child = getattr(node, name)
+            except AttributeError:
+                continue
             if isinstance(child, list):
                 for c in child:
                     self._collect_history_names(c, out)
@@ -494,8 +536,29 @@ class StatementEvaluator:
         overwrites the current sample so ``x[1]`` is the previous bar's final
         value (Fisher / self-ref scripts).
         """
-        history_names: set[str] = getattr(self, "_history_names", None) or set()
-        if name not in history_names:
+        # Empty set is falsy — never ``getattr(...) or set()`` (that allocated
+        # a fresh set on every plain assign when no history names exist).
+        history_names: set[str] | None = self._history_names
+        if not history_names or name not in history_names:
+            # Floats / ints from ta.* are the common assign. Skip the
+            # PineSeries hasattr probes those values can never satisfy.
+            vt = type(value)
+            if (
+                value is None
+                or vt is float
+                or vt is int
+                or vt is bool
+                or vt is str
+                or vt is tuple
+                or vt is list
+            ):
+                self.context[name] = value
+                return value
+            # Snapshot host/user series (``EP := high``). Storing the handle
+            # makes the local track the live OHLCV series so ``high > EP`` is
+            # never true after the first ``EP := high`` (Parabolic SAR AF).
+            if hasattr(value, "current") and hasattr(value, "history"):
+                value = value.current
             self.context[name] = value
             return value
 
@@ -504,11 +567,7 @@ class StatementEvaluator:
         # ``last := …`` would otherwise mutate the host ``time`` buffer
         # (dividend_yield last_div_ttm_time path) and break ``time[j]`` history.
         # Copy the current scalar into a fresh series for *name* instead.
-        if (
-            hasattr(value, "current")
-            and hasattr(value, "history")
-            and hasattr(value, "update")
-        ):
+        if hasattr(value, "current") and hasattr(value, "history") and hasattr(value, "update"):
             value = getattr(value, "current", value)
 
         # Track scalars that need bar history: numerics, bools, na, and strings.
@@ -547,11 +606,7 @@ class StatementEvaluator:
         track_key: Any = (udf_site, name) if udf_site is not None else name
 
         existing = self.context.get(name)
-        if (
-            hasattr(existing, "update")
-            and hasattr(existing, "current")
-            and hasattr(existing, "history")
-        ):
+        if hasattr(existing, "update") and hasattr(existing, "current") and hasattr(existing, "history"):
             if last_map.get(track_key) == bar_i and hasattr(existing, "set_current"):
                 existing.set_current(value)
             elif last_map.get(track_key) == bar_i:
@@ -571,9 +626,10 @@ class StatementEvaluator:
             return existing
 
         try:
+            from pynescript.ast.evaluator.series_buffer import evaluator_history_length
             from pynescript.ast.evaluator.series_buffer import make_series
 
-            ps = make_series(history_length=512)
+            ps = make_series(history_length=evaluator_history_length(self))
             if hasattr(ps, "update"):
                 ps.update(value)
             else:
@@ -601,24 +657,28 @@ class StatementEvaluator:
         """
         # Once per script: collect names used with history subscript so assigns
         # can track PineSeries across bars (``ma[barsback]``, ``x[1]``, …).
-        if not getattr(self, "_history_names_scanned", False):
+        if not self._history_names_scanned:
             hist: set[str] = set()
             self._collect_history_names(node, hist)
             self._history_names = hist  # type: ignore[attr-defined]
             self._history_names_scanned = True  # type: ignore[attr-defined]
-        # Fresh library-export buffer for this script evaluation
-        self._pending_library_exports = {}  # type: ignore[attr-defined]
+        # Persist unwritten ``var`` series *before* the body so ``x[1]`` on
+        # this bar sees the prior-bar value (end-of-previous-bar carry).
+        self._commit_unwritten_history()
+        # Reuse the export buffer — do not allocate ``{}`` every bar.
+        pending = self._pending_library_exports
+        if pending:
+            pending.clear()
+        elif pending is None:
+            self._pending_library_exports = {}  # type: ignore[attr-defined]
         self._active_library = None  # type: ignore[attr-defined]
         last: Any = None
-        visit = self.visit
-        line_prof: dict[int, list[float]] | None = getattr(self, "_pine_line_profile", None)
-        # Hot path: walk body via visitor cache (Assign/Expr/Call already have
-        # lean handlers). Avoid extra per-stmt Python dispatch layers that
-        # regress tiny scripts (minimal = 2 stmts).
+        line_prof: dict[int, list[float]] | None = self._pine_line_profile
         if line_prof is not None:
             # Lazy import keeps hot path free of time when profiler is off
             from time import perf_counter
 
+            visit = self.visit
             for stmt in node.body:
                 ln = int(getattr(stmt, "lineno", 0) or 0)
                 t0 = perf_counter()
@@ -631,17 +691,148 @@ class StatementEvaluator:
                     else:
                         bucket[0] += dt_ms
                         bucket[1] += 1.0
-                # Detect library("Title") declaration from Expr(Call(...))
                 if isinstance(last, ScriptDeclaration) and last.script_type == "library":
                     self._active_library = LibraryModule(title=str(last.title))  # type: ignore[attr-defined]
-        else:
-            for stmt in node.body:
-                last = visit(stmt)  # type: ignore[attr-defined]
-                # Detect library("Title") declaration from Expr(Call(...))
-                if isinstance(last, ScriptDeclaration) and last.script_type == "library":
-                    self._active_library = LibraryModule(title=str(last.title))  # type: ignore[attr-defined]
+            self._finalize_library_registration()
+            return last
+
+        locked = self._pine_defs_locked
+        body: Sequence[ast.AST] = node.body
+        if locked:
+            hot = self._hot_body
+            if hot is None:
+                hot = self._build_hot_body(body)
+                self._hot_body = hot  # type: ignore[attr-defined]
+            body = hot
+            return self._run_body_hot(body, detect_library=False)
+
+        last = self._run_body_hot(body, detect_library=True)
         self._finalize_library_registration()
         return last
+
+    def _build_hot_body(self, body: Sequence[ast.AST]) -> tuple[ast.AST, ...]:
+        """Drop no-op statement kinds after ``_pine_defs_locked`` (bar 1+).
+
+        Skips ``FunctionDef`` / ``TypeDef`` / ``EnumDef`` / ``Import`` (already
+        bound) and top-level ``indicator`` / ``strategy`` / ``library`` /
+        ``study`` declarations (constant after first visit).
+        """
+        out: list[ast.AST] = []
+        skip_types = _SKIP_AFTER_LOCK
+        decl_names = _DECL_CALL_NAMES
+        have_decl = getattr(self, "_script_declaration", None) is not None
+        for stmt in body:
+            st = type(stmt)
+            if st in skip_types:
+                continue
+            if have_decl and st is ast.Expr:
+                val = stmt.value
+                if type(val) is ast.Call:
+                    func = val.func
+                    if type(func) is ast.Name and func.id in decl_names:
+                        continue
+            out.append(stmt)
+        return tuple(out)
+
+    def _run_body_hot(self, body: Sequence[ast.AST], *, detect_library: bool) -> Any:
+        """Walk *body* with direct Assign / Expr(Call) dispatch (no visit frame)."""
+        last: Any = None
+        Assign = ast.Assign
+        Expr = ast.Expr
+        Call = ast.Call
+        visit_Assign = self.visit_Assign
+        visit_Call = self.visit_Call  # type: ignore[attr-defined]
+        visit = self.visit
+        for stmt in body:
+            st = type(stmt)
+            if st is Assign:
+                last = visit_Assign(stmt)
+            elif st is Expr:
+                val = stmt.value
+                if type(val) is Call:
+                    last = visit_Call(val)
+                else:
+                    last = visit(val)  # type: ignore[attr-defined]
+            else:
+                last = visit(stmt)  # type: ignore[attr-defined]
+            if detect_library and isinstance(last, ScriptDeclaration) and last.script_type == "library":
+                self._active_library = LibraryModule(title=str(last.title))  # type: ignore[attr-defined]
+        return last
+
+    def _commit_unwritten_history(self) -> None:
+        """Push one sample for ``var`` / ``varip`` series not yet written this bar.
+
+        Called at the start of ``visit_Script`` so ``x[1]`` in the body sees
+        the prior-bar persist. Pine keeps ``var`` even when the declaration is
+        skipped and no ``:=`` ran; without this, history stays length 1 and
+        ``x[1]`` is ``na`` forever.
+
+        Only names in both ``_history_names`` and ``_var_declarations`` are
+        touched — host OHLCV (``close[n]``) is collected as a history name but
+        must not be overwritten. Same-bar ``=`` / ``:=`` after this stamp
+        ``set_current`` via ``_series_assign_bar`` (including realtime ticks).
+        """
+        history_names: set[str] | None = getattr(self, "_history_names", None)
+        declared: set[str] | None = getattr(self, "_var_declarations", None)
+        if not history_names or not declared:
+            return
+        # Both sets are static after bar 0 — intersect once, then iterate only
+        # the (usually small) overlap instead of the full history set per bar.
+        commit_names: frozenset[str] | None = getattr(self, "_commit_history_names", None)
+        stamp = getattr(self, "_commit_history_stamp", None)
+        if commit_names is None or stamp is None or stamp[0] is not history_names or stamp[1] is not declared:
+            commit_names = frozenset(history_names & declared)
+            self._commit_history_names = commit_names  # type: ignore[attr-defined]
+            self._commit_history_stamp = (history_names, declared)  # type: ignore[attr-defined]
+        if not commit_names:
+            return
+        last_map: dict[Any, int] | None = getattr(self, "_series_assign_bar", None)
+        if last_map is None:
+            last_map = {}
+            self._series_assign_bar = last_map  # type: ignore[attr-defined]
+        bar = self.context.get("bar_index", 0)
+        try:
+            bar_i = int(bar) if bar is not None else 0
+        except (TypeError, ValueError):
+            bar_i = 0
+        ctx = self.context
+        for name in commit_names:
+            if last_map.get(name) == bar_i:
+                continue
+            existing = ctx.get(name)
+            if not (hasattr(existing, "update") and hasattr(existing, "current") and hasattr(existing, "history")):
+                continue
+            existing.update(getattr(existing, "current", None))
+            last_map[name] = bar_i
+
+    def _commit_udf_series_history(self, names: frozenset[str], site: int) -> None:
+        """Start-of-call carry for UDF series locals so ``x[1]`` sees last bar.
+
+        Script-level :meth:`_commit_unwritten_history` does not run inside a
+        UDF. Without this, ``var`` + ``x[1]`` in a function body sees ``na``
+        on the first read of each bar (history length stays 1).
+        """
+        if not names:
+            return
+        last_map: dict[Any, int] | None = getattr(self, "_series_assign_bar", None)
+        if last_map is None:
+            last_map = {}
+            self._series_assign_bar = last_map  # type: ignore[attr-defined]
+        bar = self.context.get("bar_index", 0)
+        try:
+            bar_i = int(bar) if bar is not None else 0
+        except (TypeError, ValueError):
+            bar_i = 0
+        ctx = self.context
+        for name in names:
+            track_key: Any = (site, name)
+            if last_map.get(track_key) == bar_i:
+                continue
+            existing = ctx.get(name)
+            if not (hasattr(existing, "update") and hasattr(existing, "current") and hasattr(existing, "history")):
+                continue
+            existing.update(getattr(existing, "current", None))
+            last_map[track_key] = bar_i
 
     def _finalize_library_registration(self) -> None:
         """If this script was a library, register collected exports."""
@@ -669,9 +860,11 @@ class StatementEvaluator:
 
         - **``var`` / ``varip``** — initializer runs only the first time this
           declaration executes (name recorded in ``_var_declarations``). Later
-          visits skip so the value persists across bars. Not limited to
-          ``bar_index == 0``: a ``var`` inside a conditional or function inits
-          on first *execution*, which may be a later bar.
+          visits skip so the value persists across bars. History-tracked
+          ``var`` series get a start-of-bar carry in ``visit_Script`` so
+          ``x[1]`` is the prior-bar persist when no ``:=`` ran. Not limited
+          to ``bar_index == 0``: a ``var`` inside a conditional or function
+          inits on first *execution*, which may be a later bar.
         - **``const``** — always initializes (no cross-bar skip like ``var``).
         - **plain** — evaluate RHS and store; supports ``export`` for libraries
           and ``[a, b] = …`` unpack (lists, multi-value series wrappers).
@@ -686,8 +879,8 @@ class StatementEvaluator:
         # Dominant bar-loop path: plain ``name = expr`` (no var/const mode).
         # Avoids isinstance on Var/VarIp/Const for every assign every bar.
         if mode is None:
-            if node.value:
-                rhs = node.value
+            rhs = node.value
+            if rhs is not None:
                 # Call RHS is the common case (s = ta.sma(...)); skip visit frame.
                 if type(rhs) is ast.Call:
                     value = self.visit_Call(rhs)  # type: ignore[attr-defined]
@@ -697,21 +890,29 @@ class StatementEvaluator:
                 # current scalar — storing the PineSeries handle makes
                 # ``array.set(buf, i, x)`` keep live references so every slot
                 # tracks the latest bar (breaks ring-buffer SMAs / BBI).
-                type_node = getattr(node, "type", None)
+                type_node = node.type
                 if type_node is not None:
                     value = self._coerce_typed_assign_value(type_node, value)
                 target = node.target
                 if type(target) is ast.Name:
                     stored = self._bind_series_name(target.id, value)
-                    if getattr(node, "export", None):
+                    if node.export:
                         self._register_export(target.id, stored)
                     # Return assigned value so UDF bodies ending in ``x = expr``
                     # yield expr (Pine: last expression is the function result).
+                    # Bare numerics / lists skip hasattr (ta_combo assigns).
+                    st = type(stored)
                     if (
-                        stored is not None
-                        and hasattr(stored, "current")
-                        and hasattr(stored, "history")
+                        st is float
+                        or st is int
+                        or stored is None
+                        or st is bool
+                        or st is list
+                        or st is tuple
+                        or st is str
                     ):
+                        return stored
+                    if hasattr(stored, "current") and hasattr(stored, "history"):
                         return getattr(stored, "current", stored)
                     return stored
                 if type(target) is ast.Tuple:
@@ -746,13 +947,19 @@ class StatementEvaluator:
                     if node.value:
                         value = self.visit(node.value)  # type: ignore[attr-defined]
                         self._bind_series_name(name, value)
-                    declared.add(name)
-                    return
-                if name not in declared:
+                elif name not in declared:
                     if node.value:
                         value = self.visit(node.value)  # type: ignore[attr-defined]
                         self._bind_series_name(name, value)
-                    declared.add(name)
+                declared.add(name)
+                if is_varip:
+                    # Tracked separately so intrabar rollback can persist
+                    # varip while restoring var (reference tick semantics).
+                    varips: set[str] = getattr(self, "_varip_declarations", None)  # type: ignore[assignment]
+                    if varips is None:
+                        varips = set()
+                        self._varip_declarations = varips  # type: ignore[attr-defined]
+                    varips.add(name)
                 return
             msg = f"Unsupported var/varip target: {type(node.target)}"
             self._error(msg)  # type: ignore[attr-defined]
@@ -781,6 +988,20 @@ class StatementEvaluator:
     def _assign_tuple_unpack(self, target: ast.Tuple, value: Any) -> None:
         """Unpack RHS into ``[a, b, …]`` targets (lists, multi-value series, soft-fail)."""
         elts = target.elts
+        vt = type(value)
+        if vt is tuple or vt is list:
+            n_elt = len(elts)
+            n_val = len(value)
+            bind = self._bind_series_name
+            Name = ast.Name
+            for i in range(n_elt):
+                target_node = elts[i]
+                if type(target_node) is not Name:
+                    msg = f"Unsupported unpack target: {type(target_node)}"
+                    self._error(msg)  # type: ignore[attr-defined]
+                    return
+                bind(target_node.id, value[i] if i < n_val else None)  # type: ignore[attr-defined]
+            return
         if isinstance(value, (list, tuple)):
             values = list(value)
         elif hasattr(value, "history") and isinstance(getattr(value, "history", None), list):
@@ -793,16 +1014,12 @@ class StatementEvaluator:
             current = getattr(value, "current", None)
             if isinstance(current, (list, tuple)) and len(current) == len(elts):
                 values = list(current)
-            elif len(hist) == len(elts) and not all(
-                x is None or isinstance(x, (int, float, bool)) for x in hist
-            ):
+            elif len(hist) == len(elts) and not all(x is None or isinstance(x, (int, float, bool)) for x in hist):
                 # chronological order for unpack (history is reverse)
                 values = list(reversed(hist))
             else:
                 values = [current] * len(elts)
-        elif value is not None and hasattr(value, "__iter__") and not isinstance(
-            value, (str, bytes, dict)
-        ):
+        elif value is not None and hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict)):
             # Do NOT iterate Matrix/UDT objects as unpack sources — only
             # plain sequences. Matrices are iterable by row and would
             # corrupt `[arr, mat] = …` when the RHS is wrongly a matrix.
@@ -891,11 +1108,7 @@ class StatementEvaluator:
             value = self.visit(node.value)  # type: ignore[attr-defined]
             stored = self._bind_series_name(target.id, value)
             # Pine ``:=`` is an expression; UDF bodies may end with reassignment.
-            if (
-                stored is not None
-                and hasattr(stored, "current")
-                and hasattr(stored, "history")
-            ):
+            if stored is not None and hasattr(stored, "current") and hasattr(stored, "history"):
                 return getattr(stored, "current", stored)
             return stored
 
@@ -991,10 +1204,8 @@ class StatementEvaluator:
                 current = ctx[var_name]
                 rhs = self.visit(node.value)  # type: ignore[attr-defined]
                 # Direct elementwise path (no wrapper frame); matches visit_BinOp.
-                from pynescript.ast.evaluator.expressions import (
-                    _BINOP_RAW,
-                    _elementwise_binary,
-                )
+                if _elementwise_binary is None:
+                    _load_expression_helpers()
 
                 raw = _BINOP_RAW.get(type(node.op))
                 if raw is not None:
@@ -1227,12 +1438,9 @@ class StatementEvaluator:
 
         # Static end/step: Constant nodes cannot change mid-loop.
         end_node = node.end
-        static_end = type(end_node) is ast.Constant and (
-            end_node.kind is None or end_node.kind == "#"
-        )
+        static_end = type(end_node) is ast.Constant and (end_node.kind is None or end_node.kind == "#")
         static_step = (not explicit_step) or (
-            type(node.step) is ast.Constant
-            and (node.step.kind is None or node.step.kind == "#")  # type: ignore[union-attr]
+            type(node.step) is ast.Constant and (node.step.kind is None or node.step.kind == "#")  # type: ignore[union-attr]
         )
 
         if static_end and static_step:
@@ -1245,9 +1453,7 @@ class StatementEvaluator:
                 return None
             if step is None:
                 step = 1.0 if start_f <= end_f else -1.0
-            return self._run_for_to_static(
-                target_name, start_f, end_f, step, node.body
-            )
+            return self._run_for_to_static(target_name, start_f, end_f, step, node.body)
 
         # v6: re-evaluate the end bound on every iteration (dynamic for loop boundaries)
         # Pine Script for loops are inclusive of end
@@ -1293,12 +1499,7 @@ class StatementEvaluator:
         last_result = None
         max_iters = 1_000_000
         # Integer range: use Python range (faster counter + inclusive end).
-        if (
-            start_f == int(start_f)
-            and end_f == int(end_f)
-            and step == int(step)
-            and step != 0
-        ):
+        if start_f == int(start_f) and end_f == int(end_f) and step == int(step) and step != 0:
             start_i = int(start_f)
             end_i = int(end_f)
             step_i = int(step)
@@ -1359,11 +1560,7 @@ class StatementEvaluator:
         try:
             # Pine: ``for [i, v] in array`` yields index+value pairs.
             # Use enumerate when iterating a list with a 2-tuple target.
-            use_enumerate = (
-                isinstance(target, ast.Tuple)
-                and len(target.elts) == 2
-                and isinstance(iterable, list)
-            )
+            use_enumerate = isinstance(target, ast.Tuple) and len(target.elts) == 2 and isinstance(iterable, list)
             iterator = enumerate(iterable) if use_enumerate else iter(iterable)
         except TypeError:
             return None
@@ -1430,9 +1627,7 @@ class StatementEvaluator:
         params = tuple(arg for arg in node.args if isinstance(arg, ast.Param))
         param_names = tuple(p.name for p in params)
         param_name_set = frozenset(param_names)
-        defaults: tuple[tuple[str, Any], ...] = tuple(
-            (p.name, p.default) for p in params if p.default is not None
-        )
+        defaults: tuple[tuple[str, Any], ...] = tuple((p.name, p.default) for p in params if p.default is not None)
         body_plan: list[tuple[bool, Any]] = []
         for stmt in node.body:
             if type(stmt) is ast.Expr:
@@ -1443,10 +1638,14 @@ class StatementEvaluator:
         n_params = len(params)
         # Series locals that use history (``kf[1]``) must be isolated per
         # call site — two ``kahlman(...)`` invocations cannot share one ``kf``.
-        series_locals: set[str] = set()
-        self._collect_history_names(node, series_locals)
-        series_locals -= param_name_set
+        history_in_fn: set[str] = set()
+        self._collect_history_names(node, history_in_fn)
+        series_locals: set[str] = set(history_in_fn - param_name_set)
         series_locals_t = frozenset(series_locals)
+        # Params subscripted in the body (``s[1]``) need a per-site series even
+        # when the caller passed a scalar (``src = close`` is not in
+        # ``_history_names`` unless ``src`` itself is indexed).
+        series_params_t = frozenset(history_in_fn & param_name_set)
         fsl: dict[str, frozenset[str]] = getattr(self, "_func_series_locals", None)  # type: ignore[attr-defined]
         if fsl is None:
             fsl = {}
@@ -1462,6 +1661,7 @@ class StatementEvaluator:
             __n=n_params,
             __fname=func_name,
             __series_locals=series_locals_t,
+            __series_params=series_params_t,
             **kwargs,
         ):
             """Invoke a UDF with in-place param rebind on the live context.
@@ -1480,6 +1680,8 @@ class StatementEvaluator:
             Series locals with history (``x[1]``) are persisted **per call site**
             (``id`` of the Call AST node, set by ``visit_Call``) so multiple
             invocations of the same UDF do not share one ``kf``/``velo`` series.
+            Series params (``s[1]``) get the same per-site wrap so a scalar
+            caller like ``src = close; f(src)`` still has previous-bar ``s``.
             """
             ctx = self.context  # type: ignore[attr-defined]
             saved: dict[str, Any] = {}
@@ -1490,13 +1692,11 @@ class StatementEvaluator:
                     saved[name] = ctx[name] if name in ctx else missing
                 ctx[name] = value
 
-            # Per-call-site store for series locals (compile uses __st_*_cN).
+            # Per-call-site store for series locals/params (compile uses __st_*_cN).
             site = int(getattr(self, "_pine_udf_site", 0) or 0)
             site_store: dict[str, Any] | None = None
-            if __series_locals:
-                all_stores: dict[tuple[str, int], dict[str, Any]] = getattr(
-                    self, "_udf_call_site_state", None
-                )  # type: ignore[attr-defined]
+            if __series_locals or __series_params:
+                all_stores: dict[tuple[str, int], dict[str, Any]] = getattr(self, "_udf_call_site_state", None)  # type: ignore[attr-defined]
                 if all_stores is None:
                     all_stores = {}
                     self._udf_call_site_state = all_stores  # type: ignore[attr-defined]
@@ -1507,7 +1707,7 @@ class StatementEvaluator:
                 if __fname not in saved:
                     saved[__fname] = ctx[__fname] if __fname in ctx else missing
 
-                # Restore this call site's series locals (or clear for first run).
+                # Restore this call site's series locals/params (or clear for first run).
                 if site_store is not None:
                     for n in __series_locals:
                         if n not in saved:
@@ -1516,20 +1716,51 @@ class StatementEvaluator:
                             ctx[n] = site_store[n]
                         else:
                             ctx.pop(n, None)
+                    for n in __series_params:
+                        if n not in saved:
+                            saved[n] = ctx[n] if n in ctx else missing
+                        if n in site_store:
+                            ctx[n] = site_store[n]
+                        else:
+                            ctx.pop(n, None)
+                    self._commit_udf_series_history(__series_locals, site)
 
-                # Bind positional arguments
+                # Bind positional arguments. Series params keep the restored
+                # PineSeries (``_bind_series_name`` updates current); do not
+                # overwrite it with a raw scalar first.
+                bound: set[str] = set()
                 for i, value in enumerate(args):
                     if i < __n:
-                        _bind(__names[i], value)
+                        pname = __names[i]
+                        bound.add(pname)
+                        if pname in __series_params:
+                            if pname not in saved:
+                                saved[pname] = ctx[pname] if pname in ctx else missing
+                            self._bind_series_name(pname, value)
+                        else:
+                            _bind(pname, value)
 
                 # Bind keyword arguments
                 for key, value in kwargs.items():
-                    _bind(key, value)
+                    bound.add(key)
+                    if key in __series_params:
+                        if key not in saved:
+                            saved[key] = ctx[key] if key in ctx else missing
+                        self._bind_series_name(key, value)
+                    else:
+                        _bind(key, value)
 
                 # Apply parameter defaults for unbound params
                 for dname, dast in __defaults:
-                    if dname not in saved:
-                        _bind(dname, self.visit(dast))  # type: ignore[attr-defined]
+                    if dname in bound:
+                        continue
+                    dval = self.visit(dast)  # type: ignore[attr-defined]
+                    if dname in __series_params:
+                        if dname not in saved:
+                            saved[dname] = ctx[dname] if dname in ctx else missing
+                        self._bind_series_name(dname, dval)
+                    else:
+                        _bind(dname, dval)
 
                 # Execute pre-classified body
                 result = None
@@ -1551,9 +1782,12 @@ class StatementEvaluator:
                         val = visit(item)  # type: ignore[attr-defined]
                         if type(item) in (ast.Assign, ast.ReAssign):
                             result = val
-                # Persist series locals for this call site across bars.
+                # Persist series locals/params for this call site across bars.
                 if site_store is not None:
                     for n in __series_locals:
+                        if n in ctx:
+                            site_store[n] = ctx[n]
+                    for n in __series_params:
                         if n in ctx:
                             site_store[n] = ctx[n]
                 return result
@@ -1660,9 +1894,7 @@ class StatementEvaluator:
             if param is first:
                 continue
             param_type: Type = (
-                self._convert_type_spec_to_type(param.type)
-                if param.type
-                else BuiltinType(BuiltinTypeKind.STRING)
+                self._convert_type_spec_to_type(param.type) if param.type else BuiltinType(BuiltinTypeKind.STRING)
             )
             parameters.append((param.name, param_type))
 
@@ -1711,10 +1943,7 @@ class StatementEvaluator:
                             "strategy",
                         }:
                             last = self.visit(stmt)  # type: ignore[attr-defined]
-                            if (
-                                isinstance(last, ScriptDeclaration)
-                                and last.script_type == "library"
-                            ):
+                            if isinstance(last, ScriptDeclaration) and last.script_type == "library":
                                 self._active_library = LibraryModule(  # type: ignore[attr-defined]
                                     title=str(last.title)
                                 )
@@ -1766,11 +1995,17 @@ class StatementEvaluator:
                 # do not raise. Missing libraries degrade to empty behaviour.
                 # Known helpers (e.g. ArrayExtension.index_2d_to_1d) are
                 # polyfilled so array.get/set receive real indices.
+                tvta_exports = (
+                    bind_tradingview_ta_stub_exports(self) if namespace == "TradingView" and name == "ta" else {}
+                )
+
                 class _StubLib:
                     __pine_import_stub__ = True
                     __pine_import_path__ = path
 
                     def __getattr__(self, item: str) -> Any:
+                        if item in tvta_exports:
+                            return tvta_exports[item]
                         known = STUB_KNOWN_EXPORTS.get(item)
                         if known is not None:
                             return known
@@ -1851,16 +2086,7 @@ class StatementEvaluator:
 
     def _execute_block(self, stmts: Sequence[ast.AST]):
         """Execute a block of statements and return the value of the last expression."""
-        result = None
-        for stmt in stmts:
-            val = self.visit(stmt)  # type: ignore[attr-defined]
-            # In Pine Script, the return value of a block is the value of the last expression.
-            # If the last statement is not an expression (e.g. assignment), it returns na (None).
-            # We update result for every statement.
-            # If visit(stmt) returns None (e.g. Assign), result becomes None.
-            # If visit(stmt) returns value (e.g. Expr, If, Switch), result becomes value.
-            result = val
-        return result
+        return self._run_body_hot(stmts, detect_library=False)
 
     def visit_If(self, node: ast.If):
         """Statement-style if/else via :meth:`_execute_block` (``na`` test → false).
@@ -1889,7 +2115,8 @@ class StatementEvaluator:
         mixes StatementEvaluator alone: **subject present but ``na``** uses
         equality (``na`` only matches ``na``), never boolean-pattern mode.
         """
-        from pynescript.ast.evaluator.expressions import _switch_case_matches
+        if _switch_case_matches is None:
+            _load_expression_helpers()
 
         has_subject = node.subject is not None
         subject_val = self.visit(node.subject) if has_subject else None  # type: ignore[attr-defined]
@@ -1901,6 +2128,47 @@ class StatementEvaluator:
                 if not _switch_case_matches(has_subject, subject_val, pattern_val):
                     continue
             return self._execute_block(case.body)  # type: ignore[arg-type, attr-defined]
+        return None
+
+    def _once_bar_is_confirmed(self) -> bool:
+        """True when the current bar is closed (Pine rollback commits ``once``)."""
+        ctx = getattr(self, "context", None) or {}
+        bs = ctx.get("barstate")
+        if bs is not None:
+            conf = getattr(bs, "isconfirmed", None)
+            if conf is None and isinstance(bs, dict):
+                conf = bs.get("isconfirmed")
+            if conf is not None:
+                return bool(conf)
+        if "barstate.isconfirmed" in ctx:
+            return bool(ctx.get("barstate.isconfirmed"))
+        return True
+
+    def visit_Once(self, node: ast.Once):
+        """Fire the body the first time ``test`` is true on a confirmed bar.
+
+        On unconfirmed realtime ticks the body may run again because rollback
+        has not committed the fired flag (TradingView Aug 2026 ``once``).
+        ``once`` does not return a usable value.
+        """
+        fired: dict[int, bool] = getattr(self, "_once_fired", None)  # type: ignore[assignment]
+        if fired is None:
+            fired = {}
+            self._once_fired = fired  # type: ignore[attr-defined]
+        key = id(node)
+        if fired.get(key):
+            return None
+        if node.test is None:
+            test_val: Any = True
+        else:
+            test_val = self.visit(node.test)  # type: ignore[attr-defined]
+            if test_val is None:
+                test_val = False
+        if not bool(test_val):
+            return None
+        self._execute_block(node.body)
+        if self._once_bar_is_confirmed():
+            fired[key] = True
         return None
 
     def _execute_loop_body(self, stmts: Sequence[ast.AST]) -> tuple[Any, bool]:

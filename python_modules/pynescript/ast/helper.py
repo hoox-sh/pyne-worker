@@ -96,6 +96,50 @@ _DEFAULT_ERROR_STRATEGY = DefaultErrorStrategy()
 # Builder is stateless across visits — reuse one instance to skip alloc.
 _SHARED_BUILDER = PinescriptASTBuilder()
 
+# Per-thread ANTLR engine: keeps SLL DFA warm across *distinct* sources.
+# Shared process-wide lexer/parser is unsafe (indent / token-stream bleed).
+_PARSE_TLS = threading.local()
+
+
+class _ThreadParseEngine:
+    """Reuse Lexer + CommonTokenStream + Parser on one thread.
+
+    ``bind`` retargets the input and clears indent/token/parser state via
+    ANTLR ``reset`` / ``setTokenSource`` so consecutive scripts cannot leak
+    ``_numOpens`` / ``_numSqBrackets`` or leftover tokens.
+    """
+
+    __slots__ = ("lexer", "tokens", "parser")
+
+    def __init__(self) -> None:
+        self.lexer = PinescriptLexer(InputStream(""))
+        self.tokens = CommonTokenStream(self.lexer)
+        self.parser = PinescriptParser(self.tokens)
+        listener = PinescriptErrorListener.INSTANCE
+        self.lexer.removeErrorListeners()
+        self.parser.removeErrorListeners()
+        self.lexer.addErrorListener(listener)
+        self.parser.addErrorListener(listener)
+
+    def bind(self, stream: InputStream) -> tuple[PinescriptLexer, CommonTokenStream, PinescriptParser]:
+        """Point the reused engine at *stream* and return (lexer, tokens, parser)."""
+        self.lexer.inputStream = stream
+        # Full lexer reset: clears _numOpens/_numSqBrackets, indent stack,
+        # pending tokens and ANTLR hitEOF/mode state. Preserves SLL DFA.
+        # Must run after inputStream swap (reset seeks the new stream to 0).
+        self.lexer.reset()
+        self.tokens.setTokenSource(self.lexer)
+        self.parser.setTokenStream(self.tokens)
+        return self.lexer, self.tokens, self.parser
+
+
+def _thread_parse_engine() -> _ThreadParseEngine:
+    eng = getattr(_PARSE_TLS, "engine", None)
+    if eng is None:
+        eng = _ThreadParseEngine()
+        _PARSE_TLS.engine = eng
+    return eng
+
 # Cached after first annotation pass (avoids circular import at module load).
 _StatementCollector = None
 
@@ -168,9 +212,16 @@ def _scrub_pine_call_sites(tree: AST) -> AST:
     ``visit_Call`` may cache bound handlers stamped with evaluator generation.
     A later evaluator ignores a mismatched generation, but scrubbing still
     drops dead instance-method refs so cached trees do not pin evaluators.
+
+    Specialized stack-DFS (no generator, no deque) — this runs on *every*
+    parse-cache hit, so it is tuned for the common "nothing stamped" case.
     """
     try:
-        for node in walk(tree):
+        stack: list[AST] = [tree]
+        pop = stack.pop
+        push = stack.append
+        while stack:
+            node = pop()
             if getattr(node, "_pine_call_site", None) is not None:
                 try:
                     delattr(node, "_pine_call_site")
@@ -179,6 +230,14 @@ def _scrub_pine_call_sites(tree: AST) -> AST:
                         object.__setattr__(node, "_pine_call_site", None)
                     except Exception:
                         pass
+            for name in getattr(type(node), "_fields", None) or ():
+                child = getattr(node, name, None)
+                if child.__class__ is list:
+                    for item in child:
+                        if getattr(type(item), "_fields", None) is not None:
+                            push(item)
+                elif getattr(type(child), "_fields", None) is not None:
+                    push(child)
     except Exception:
         pass
     return tree
@@ -392,15 +451,7 @@ def _parse(
         restore_recursion = False
 
     try:
-        lexer = PinescriptLexer(stream)
-        token_stream = CommonTokenStream(lexer)
-        parser = PinescriptParser(token_stream)
-        error_listener = PinescriptErrorListener.INSTANCE
-
-        lexer.removeErrorListeners()
-        parser.removeErrorListeners()
-        lexer.addErrorListener(error_listener)
-        parser.addErrorListener(error_listener)
+        _lexer, token_stream, parser = _thread_parse_engine().bind(stream)
 
         # Two-stage parse: SLL is much faster on unambiguous input; on SLL
         # failure (BailErrorStrategy → ParseCancellationException) reset and
