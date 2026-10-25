@@ -3,7 +3,7 @@
 > Production **Python Cloudflare® Worker** for the **[PYNE](https://hoox.sh/pyne)** stack —
 > evaluate TradingView® Pine Script™ on the edge with the same bar-loop contract as the Pro API.
 
-**Version:** 0.7.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.6.12)
+**Version:** 0.8.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.6.22)
 
 **Website:** [hoox.sh/pyne](https://hoox.sh/pyne) · **Docs:** [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) · **Repo:** [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker)
 
@@ -109,6 +109,7 @@ Strong real-world Pine coverage via the open PYNE engine — **not** a claim of 
 - **Alert engine + L2 webhooks** — `ALERT_WEBHOOK_URL` or per-job `webhook_url`
 - **Libraries** — `POST /run` `libraries: [{namespace, name, version, source}]` for `import ns/Name/ver` (AXIS git-publish emulator; pynescript 0.3.7+)
 - **Response windowing** — `from_bar` / `to_bar` trim the envelope to a visible bar range (engine still evaluates every bar; Pro API parity, pynescript 0.6.9+)
+- **Realtime last bar** — `realtime_last_bar` / `realtime_ticks` / `realtime_bars` / `realtime_from_bar` on `POST /run` (pynescript 0.6.14+ `barstate.isrealtime` + `varip` multi-tick)
 - **Drawings / plot_meta / logs** — same evaluate-contract envelope as the Pro API
 - **$0 tier OK** for light use; Paid Workers recommended for heavy 1m cron
 
@@ -217,8 +218,11 @@ passed. R2 writes use a clearly-named `LIVETEST` symbol; `--no-r2`,
 | `timeout_seconds` | Wall-clock budget (default 30, max 30) |
 | `max_bars` | Tail length when loading long R2 history |
 | `from_bar` / `to_bar` | Optional inclusive response window over bars (negative = from the end; adds `window` metadata) |
+| `realtime_last_bar` | Last bar is forming (`barstate.isrealtime=true`; `varip` re-inits) |
+| `realtime_ticks` | Re-visits per bar in the realtime window (default 1, min 1) |
+| `realtime_bars` / `realtime_from_bar` | Realtime window extent (last *K* bars, or absolute start index) |
 
-Also accepts `"data"` instead of `"ohlcv"` (PYNE Pro API compat). Success response includes `status`, `plots`, `series`, `plot_meta`, `alerts`, `events`, `drawings`, `inputs`, `logs`, `meta`, `count`/`bars`, and structured `error` / `error_kind` on failure. With `from_bar` / `to_bar`, bar-indexed members are trimmed and a `window` object (`from_bar`, `to_bar`, `bars`, `total_bars`) is added; `alerts` are never trimmed.
+Also accepts `"data"` instead of `"ohlcv"` (PYNE Pro API compat). Success response includes `status`, `plots`, `series`, `plot_meta`, `alerts`, `events`, `drawings`, `inputs`, `logs`, `meta`, `count`/`bars`, and structured `error` / `error_kind` on failure. When the engine ships a bar-time axis, `times` is forwarded (and windowed with `from_bar` / `to_bar`). With `from_bar` / `to_bar`, bar-indexed members are trimmed and a `window` object (`from_bar`, `to_bar`, `bars`, `total_bars`) is added; `alerts` are never trimmed.
 
 Library example (`import ns/Lib/1`):
 

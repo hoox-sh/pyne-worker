@@ -112,7 +112,23 @@ class CommonIndicators(TechnicalHelpers):
         return self._lowestbars(series, period)
 
     def _builtin_ta_range(self, args: list[Any]) -> float | None:
-        """Range = highest - lowest over a period."""
+        """Range = highest - lowest over a period.
+
+        2-arg ``ta.range(source, n)``; 1-arg ``ta.range(n)`` is high - low.
+        """
+        if len(args) == UNARY and self._is_period_like(args[0]):
+            period = self._expect_int(args[0], "Period must be an integer")
+            if self._use_incremental_ta():
+                highest = self._highest_inc_update(self._context_source("high"), period)
+                lowest = self._lowest_inc_update(self._context_source("low"), period)
+                if highest is None or lowest is None:
+                    return None
+                return highest - lowest
+            highest = self._highest(self._context_series("high"), period)
+            lowest = self._lowest(self._context_series("low"), period)
+            if highest is None or lowest is None:
+                return None
+            return highest - lowest
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
         if self._use_incremental_ta():
             highest = self._highest_inc_update(series, period)
@@ -171,8 +187,7 @@ class CommonIndicators(TechnicalHelpers):
     def _builtin_ta_cum(self, args: list[Any]) -> float:
         """Cumulative sum of values in series."""
         msg = "ta.cum expects a series"
-        if len(args) != UNARY:
-            self._error(msg)
+        self._require_len(args, UNARY, msg)
         if self._use_incremental_ta():
             return self._cum_inc_update(args[0])  # type: ignore[return-value]
         series = self._expect_list(args[0], msg)
@@ -252,8 +267,14 @@ class CommonIndicators(TechnicalHelpers):
             msg = "ta.skewness() requires 2 arguments: series, period"
             self._error(msg)
 
-        series = args[0] if isinstance(args[0], list) else [args[0]]
         period = self._expect_int(args[1], "period must be integer")
+        if self._use_incremental_ta():
+            return self._skewness_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                period,
+            )
+
+        series = self._as_series(args[0])
 
         if len(series) < period:
             return None
@@ -266,13 +287,13 @@ class CommonIndicators(TechnicalHelpers):
 
         mean = sum(valid_data) / len(valid_data)
         variance = sum((x - mean) ** 2 for x in valid_data) / len(valid_data)
-        std_dev = variance ** 0.5
+        std_dev = variance**0.5
 
         if std_dev == 0:
             return 0.0
 
         # Skewness = E[(x - mean)³] / std_dev³
-        skewness_val = sum((x - mean) ** 3 for x in valid_data) / (len(valid_data) * (std_dev ** 3))
+        skewness_val = sum((x - mean) ** 3 for x in valid_data) / (len(valid_data) * (std_dev**3))
         return skewness_val
 
     def _builtin_ta_kurtosis(self, args: list[Any]) -> float | None:
@@ -285,8 +306,14 @@ class CommonIndicators(TechnicalHelpers):
             msg = "ta.kurtosis() requires 2 arguments: series, period"
             self._error(msg)
 
-        series = args[0] if isinstance(args[0], list) else [args[0]]
         period = self._expect_int(args[1], "period must be integer")
+        if self._use_incremental_ta():
+            return self._kurtosis_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                period,
+            )
+
+        series = self._as_series(args[0])
 
         if len(series) < period:
             return None
@@ -299,14 +326,14 @@ class CommonIndicators(TechnicalHelpers):
 
         mean = sum(valid_data) / len(valid_data)
         variance = sum((x - mean) ** 2 for x in valid_data) / len(valid_data)
-        std_dev = variance ** 0.5
+        std_dev = variance**0.5
 
         if std_dev == 0:
             return 0.0
 
         # Kurtosis = E[(x - mean)⁴] / std_dev⁴ - 3
         fourth_moment = sum((x - mean) ** 4 for x in valid_data) / len(valid_data)
-        kurtosis_val = (fourth_moment / (std_dev ** 4)) - 3.0
+        kurtosis_val = (fourth_moment / (std_dev**4)) - 3.0
         return kurtosis_val
 
     def _builtin_ta_parkinson(self, args: list[Any]) -> float | None:
@@ -383,16 +410,13 @@ class CommonIndicators(TechnicalHelpers):
     def _builtin_ta_vwap(self, args: list[Any]) -> float:
         """Volume Weighted Average Price."""
         msg = "ta.vwap expects price-volume values"
-        if len(args) != UNARY:
-            self._error(msg)
+        self._require_len(args, UNARY, msg)
         sequence = self._expect_list(args[0], msg)
         return self._vwap(sequence)
 
     def _builtin_ta_barssince(self, args: list[Any]) -> int | None:
         """Bars since condition was last true."""
-        if len(args) != 1:
-            msg = "ta.barssince() takes exactly one argument"
-            self._error(msg)
+        self._require_len(args, 1, "ta.barssince() takes exactly one argument")
         condition = args[0]
         if self._use_incremental_ta():
             return self._barssince_inc_update(condition)
@@ -441,7 +465,11 @@ class CommonIndicators(TechnicalHelpers):
             if current_idx - i < 0:
                 return None
             left_val = source[current_idx - i]
-            lv = getattr(left_val, "current", left_val) if left_val is not None and hasattr(left_val, "history") else left_val
+            lv = (
+                getattr(left_val, "current", left_val)
+                if left_val is not None and hasattr(left_val, "history")
+                else left_val
+            )
             try:
                 if lv is not None and float(lv) >= float(current):
                     return None
@@ -481,7 +509,11 @@ class CommonIndicators(TechnicalHelpers):
             if current_idx - i < 0:
                 return None
             left_val = source[current_idx - i]
-            lv = getattr(left_val, "current", left_val) if left_val is not None and hasattr(left_val, "history") else left_val
+            lv = (
+                getattr(left_val, "current", left_val)
+                if left_val is not None and hasattr(left_val, "history")
+                else left_val
+            )
             try:
                 if lv is not None and float(lv) <= float(current):
                     return None
@@ -637,8 +669,7 @@ class CommonIndicators(TechnicalHelpers):
 
     def _builtin_ta_supertrend(self, args: list[Any]) -> tuple[float, float, int]:
         """Supertrend indicator (returns final_lowerband, final_upperband, direction)."""
-        if len(args) != TERNARY:
-            self._error("ta.supertrend takes high, low series and length, multiplier")
+        self._require_len(args, TERNARY, "ta.supertrend takes high, low series and length, multiplier")
 
         highs = self._expect_list(args[0], "ta.supertrend takes high, low, length, multiplier")
         lows = self._expect_list(args[1], "ta.supertrend takes high, low, length, multiplier")
@@ -676,8 +707,7 @@ class CommonIndicators(TechnicalHelpers):
 
     def _builtin_ta_zigzag(self, args: list[Any]) -> tuple[float, float, int]:
         """Zigzag pattern detector (returns high, low, direction)."""
-        if len(args) != BINARY:
-            self._error("ta.zigzag takes source series and percent threshold")
+        self._require_len(args, BINARY, "ta.zigzag takes source series and percent threshold")
 
         series = self._expect_list(args[0], "ta.zigzag takes source series and percent threshold")
         threshold = args[1] if isinstance(args[1], (int, float)) else 5.0
@@ -723,8 +753,7 @@ class CommonIndicators(TechnicalHelpers):
             if self._use_incremental_ta():
                 return self._adx_inc_update(highs, lows, closes, adx_len)
             return self._adx(highs, lows, closes, adx_len)
-        if len(args) != QUATERNARY:
-            self._error(msg)
+        self._require_len(args, QUATERNARY, msg)
         highs = self._expect_list(args[0], msg)
         lows = self._expect_list(args[1], msg)
         closes = self._expect_list(args[2], msg)
@@ -883,4 +912,3 @@ class CommonIndicators(TechnicalHelpers):
         if not hlc3_volume:
             return 0
         return sum(hlc3_volume) / len(hlc3_volume)
-

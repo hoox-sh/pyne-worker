@@ -44,8 +44,7 @@ class EconomicsIndicators(TechnicalHelpers):
             float: Imbalance ratio (-1.0 to 1.0)
         """
         msg = "ta.order_flow_imbalance() requires 5 arguments"
-        if len(args) != 5:
-            self._error(msg)
+        self._require_len(args, 5, msg)
 
         high = self._expect_list(args[0], msg)
         low = self._expect_list(args[1], msg)
@@ -83,8 +82,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.volume_profile_high(close, volume, period, levels)
         """
         msg = "ta.volume_profile_high() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         close = self._expect_list(args[0], msg)
         volume = self._expect_list(args[1], msg)
@@ -130,8 +128,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.volume_profile_low(close, volume, period, levels)
         """
         msg = "ta.volume_profile_low() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         close = self._expect_list(args[0], msg)
         volume = self._expect_list(args[1], msg)
@@ -177,8 +174,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.spread_analysis(bid, ask, period)
         """
         msg = "ta.spread_analysis() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         bid = self._expect_list(args[0], msg)
         ask = self._expect_list(args[1], msg)
@@ -225,8 +221,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.momentum_divergence(price, momentum_fast, momentum_slow)
         """
         msg = "ta.momentum_divergence() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         price = self._expect_list(args[0], msg)
         mom_fast = self._expect_list(args[1], msg)
@@ -260,8 +255,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.acceleration_factor(momentum_list, period)
         """
         msg = "ta.acceleration_factor() requires 2 arguments"
-        if len(args) != 2:
-            self._error(msg)
+        self._require_len(args, 2, msg)
 
         momentum = self._expect_list(args[0], msg)
         period = self._expect_int(args[1], msg)
@@ -281,13 +275,12 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.mean_reversion_score(close, sma, stdev, period)
         """
         msg = "ta.mean_reversion_score() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         close = self._expect_list(args[0], msg)
         sma = self._expect_list(args[1], msg)
         stdev = self._expect_list(args[2], msg)
-        period = self._expect_int(args[3], msg)
+        self._expect_int(args[3], msg)
 
         if not close or not sma or not stdev:
             return 50.0
@@ -310,8 +303,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.momentum_filter(momentum_raw, volume, period)
         """
         msg = "ta.momentum_filter() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         mom = self._expect_list(args[0], msg)
         vol = self._expect_list(args[1], msg)
@@ -343,8 +335,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.economic_impact_score(price_change, volatility, volume_change)
         """
         msg = "ta.economic_impact_score() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         pc = self._expect_number(args[0], msg)
         vol = self._expect_number(args[1], msg)
@@ -360,8 +351,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.inflation_proxy_indicator(usd_index, commodity_prices, bond_yields)
         """
         msg = "ta.inflation_proxy_indicator() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         usd = self._expect_number(args[0], msg)
         comm = self._expect_number(args[1], msg)
@@ -379,8 +369,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.employment_cycle_indicator(cyclical_stocks, defensive_stocks, unemployment_proxy)
         """
         msg = "ta.employment_cycle_indicator() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         cyc = self._expect_number(args[0], msg)
         def_ = self._expect_number(args[1], msg)
@@ -403,8 +392,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.gdp_growth_proxy(market_breadth, market_volume, price_momentum)
         """
         msg = "ta.gdp_growth_proxy() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         breadth = self._expect_number(args[0], msg)
         volume = self._expect_number(args[1], msg)
@@ -422,8 +410,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.fear_greed_index(rsi, vix_proxy, put_call_ratio, breadth)
         """
         msg = "ta.fear_greed_index() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         rsi = self._expect_number(args[0], msg)
         vix = self._expect_number(args[1], msg)
@@ -451,8 +438,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.crowd_sentiment(price_agreement, volume_agreement, time_agreement)
         """
         msg = "ta.crowd_sentiment() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         pa = self._expect_number(args[0], msg)
         va = self._expect_number(args[1], msg)
@@ -466,12 +452,11 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.contrarian_signal(sentiment, volatility, time_since_extreme)
         """
         msg = "ta.contrarian_signal() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
         sent = self._expect_number(args[0], msg)
         vol = self._expect_number(args[1], msg)
-        time = self._expect_int(args[2], msg)
+        self._expect_int(args[2], msg)
 
         signal = "neutral"
         strength = 0.0
@@ -494,14 +479,22 @@ class EconomicsIndicators(TechnicalHelpers):
         """Cumulative Delta.
 
         ta.cumulative_delta(close, volume, period)
+        Duplicate of ``AdvancedIndicators._builtin_ta_cumulative_delta`` — keep in sync.
+        Bar-mode incremental last sample uses ``_cumulative_delta_inc_update``.
         """
         msg = "ta.cumulative_delta() requires 3 arguments"
-        if len(args) != 3:
-            self._error(msg)
+        self._require_len(args, 3, msg)
 
-        close = self._expect_list(args[0], msg)
-        volume = self._expect_list(args[1], msg)
         period = self._expect_int(args[2], msg)
+        if self._use_incremental_ta():
+            return self._cumulative_delta_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                period,
+            )
+
+        close = self._as_series(args[0])
+        volume = self._as_series(args[1])
 
         if len(close) < period or period <= 0:
             return 0.0
@@ -523,13 +516,20 @@ class EconomicsIndicators(TechnicalHelpers):
         """Volume Momentum.
 
         ta.volume_momentum(volume, period)
+        Duplicate of ``AdvancedIndicators._builtin_ta_volume_momentum`` — keep in sync.
+        Bar-mode incremental last sample uses ``_volume_momentum_inc_update``.
         """
         msg = "ta.volume_momentum() requires 2 arguments"
-        if len(args) != 2:
-            self._error(msg)
+        self._require_len(args, 2, msg)
 
-        volume = self._expect_list(args[0], msg)
         period = self._expect_int(args[1], msg)
+        if self._use_incremental_ta():
+            return self._volume_momentum_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                period,
+            )
+
+        volume = self._as_series(args[0])
 
         if len(volume) < period + 1 or period <= 0:
             return 0.0
@@ -553,8 +553,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.smart_money_flow(price_change, volume, time_since_high, time_since_low)
         """
         msg = "ta.smart_money_flow() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         pc = self._expect_number(args[0], msg)
         vol = self._expect_number(args[1], msg)
@@ -578,13 +577,12 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.liquidity_score(volume, volatility, bid_ask_spread, period)
         """
         msg = "ta.liquidity_score() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         vol = self._expect_list(args[0], msg)
         vola = self._expect_list(args[1], msg)
         spread = self._expect_list(args[2], msg)
-        period = self._expect_int(args[3], msg)
+        self._expect_int(args[3], msg)
 
         if not vol or not vola or not spread:
             return 50.0
@@ -606,8 +604,7 @@ class EconomicsIndicators(TechnicalHelpers):
         ta.volume_thrust(close, volume, volume_sma, sensitivity)
         """
         msg = "ta.volume_thrust() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         close = self._expect_list(args[0], msg)
         volume = self._expect_list(args[1], msg)

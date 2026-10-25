@@ -17,7 +17,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Pyne — Pine Script toolchain (PyPI package ``pynescript``).
+"""Pyne — Pine Script toolchain (PyPI package ``pyne``).
 
 Library surface re-exports only the package version. Parse / dump / unparse
 live under :mod:`pynescript.ast` (helpers often imported as
@@ -25,13 +25,15 @@ live under :mod:`pynescript.ast` (helpers often imported as
 
 **Console scripts** (see ``pyproject.toml`` ``[project.scripts]``):
 
-- ``pynescript`` → :func:`pynescript.__main__.cli` (Click: check, format,
+- ``pyne`` → :func:`pynescript.__main__.cli` (Click: check, format,
   lint, compile, run, data, info, …)
-- ``pynescript-lsp`` → :func:`pynescript.langserver.__main__.main` (stdio LSP)
+- ``pyne-lsp`` → :func:`pynescript.langserver.__main__.main` (stdio LSP)
+- ``pynescript`` and ``pynescript-lsp`` are kept as aliases for backward
+  compatibility.
 
 **Module entrypoints:**
 
-- ``python -m pynescript`` → same CLI as ``pynescript``
+- ``python -m pynescript`` → same CLI as ``pyne``
 - ``python -m pynescript.langserver`` → Language Server (stdio)
 
 **Subpackages:**

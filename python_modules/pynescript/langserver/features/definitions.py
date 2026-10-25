@@ -62,7 +62,7 @@ def handle_definition(
     character = position.character
 
     # Get the word at cursor
-    word, word_start, word_end = get_word_at_position(source, line, character)
+    word, _word_start, _word_end = get_word_at_position(source, line, character)
     if not word:
         return None
 

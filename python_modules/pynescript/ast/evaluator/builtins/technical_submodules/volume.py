@@ -26,6 +26,7 @@ Handlers are composed into
 from __future__ import annotations
 
 import math
+
 from collections import deque
 from typing import Any
 
@@ -142,8 +143,7 @@ class VolumeIndicators(TechnicalHelpers):
             volumes = volumes[-n:]
             return self._mfi(series, series, series, volumes, length)
         msg = "ta.mfi expects source, length (or high, low, close, volume, length)"
-        if len(args) != QUINARY:
-            self._error(msg)
+        self._require_len(args, QUINARY, msg)
         length = self._expect_int(args[4], msg)
         if use_inc:
             return self._mfi_inc_update(args[0], args[1], args[2], args[3], length)
@@ -601,15 +601,9 @@ class VolumeIndicators(TechnicalHelpers):
                     20,
                 )
             if len(args) < QUATERNARY:
-                self._error(
-                    "ta.wvad() requires 0, 1, or 4+ arguments: [high, low, close, volume,] period"
-                )
+                self._error("ta.wvad() requires 0, 1, or 4+ arguments: [high, low, close, volume,] period")
                 return None
-            period = (
-                self._expect_int(args[QUATERNARY], "period must be integer")
-                if len(args) > QUATERNARY
-                else 20
-            )
+            period = self._expect_int(args[QUATERNARY], "period must be integer") if len(args) > QUATERNARY else 20
             return self._wvad_inc_update(
                 self._as_series_or_raw(args[0], last_sample_ok=True),
                 self._as_series_or_raw(args[1], last_sample_ok=True),
@@ -666,9 +660,7 @@ class VolumeIndicators(TechnicalHelpers):
                     period,
                 )
             if len(args) < QUINARY:
-                self._error(
-                    "ta.cmf() requires 1 argument (period) or 5: close, high, low, volume, period"
-                )
+                self._error("ta.cmf() requires 1 argument (period) or 5: close, high, low, volume, period")
                 return None
             period = self._expect_int(args[4], "ta.cmf period must be integer")
             return self._cmf_inc_update(
@@ -686,9 +678,7 @@ class VolumeIndicators(TechnicalHelpers):
             volume_series = self._context_series("volume") or [0.0] * len(close_series)
             return self._cmf(close_series, high_series, low_series, volume_series, period)
         if len(args) < QUINARY:
-            self._error(
-                "ta.cmf() requires 1 argument (period) or 5: close, high, low, volume, period"
-            )
+            self._error("ta.cmf() requires 1 argument (period) or 5: close, high, low, volume, period")
             return []
 
         close_series = self._as_series(args[0])
@@ -725,22 +715,28 @@ class VolumeIndicators(TechnicalHelpers):
         volume_series = args[3] if isinstance(args[3], list) else [args[3]]
         return self._klinger(close_series, volume_series, fast_period, slow_period)
 
-    def _builtin_ta_apo(self, args: list[Any]) -> list[float | None]:
+    def _builtin_ta_apo(self, args: list[Any]) -> Any:
         """Absolute Price Oscillator.
 
         ta.apo(series, fast_period, slow_period)
         APO = EMA(fast) - EMA(slow)
-        Returns APO series.
+        Returns APO series (full) or last scalar (incremental bar mode).
         """
         if len(args) < TERNARY:
             msg = "ta.apo() requires 3 arguments: series, fast_period, slow_period"
             self._error(msg)
 
-        series = args[0] if isinstance(args[0], list) else [args[0]]
         fast = self._expect_int(args[1], "ta.apo fast_period must be integer")
         slow = self._expect_int(args[2], "ta.apo slow_period must be integer")
+        if self._use_incremental_ta():
+            return self._apo_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                fast,
+                slow,
+            )
 
-        return self._apo(series, fast, slow)
+        series = self._as_series(args[0])
+        return self._finalize_series(self._apo(series, fast, slow))
 
     def _builtin_ta_vpt(self, args: list[Any]) -> float | None:
         """Volume Price Trend / Price Volume Trend.
@@ -814,6 +810,14 @@ class VolumeIndicators(TechnicalHelpers):
         if length < unary:
             msg = "EMV length must be >= 1"
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._emv_inc_update(
+                self._context_source("high"),
+                self._context_source("low"),
+                self._context_source("volume"),
+                length,
+            )
 
         highs = (getattr(self, "current_series", None) or {}).get("high", [])
         lows = (getattr(self, "current_series", None) or {}).get("low", [])
@@ -914,11 +918,7 @@ class VolumeIndicators(TechnicalHelpers):
                 close_change = 0
             vol = volume_series[i] if isinstance(volume_series[i], (int, float)) else 0
 
-            prev_vol = (
-                volume_series[i - 1]
-                if i > 0 and isinstance(volume_series[i - 1], (int, float))
-                else 0
-            )
+            prev_vol = volume_series[i - 1] if i > 0 and isinstance(volume_series[i - 1], (int, float)) else 0
             if vol < prev_vol:
                 nvi = nvi * (1 + close_change)
 
@@ -972,11 +972,7 @@ class VolumeIndicators(TechnicalHelpers):
             else:
                 close_change = 0
             vol = volume_series[i] if isinstance(volume_series[i], (int, float)) else 0
-            prev_vol = (
-                volume_series[i - 1]
-                if i > 0 and isinstance(volume_series[i - 1], (int, float))
-                else 0
-            )
+            prev_vol = volume_series[i - 1] if i > 0 and isinstance(volume_series[i - 1], (int, float)) else 0
 
             if vol > prev_vol:
                 pvi = pvi * (1 + close_change)
@@ -1039,9 +1035,16 @@ class VolumeIndicators(TechnicalHelpers):
             msg = "ta.volume_weighted_momentum() requires 3 arguments: series, volume, length"
             self._error(msg)
 
-        series = args[0] if isinstance(args[0], list) else [args[0]]
-        volume = args[1] if isinstance(args[1], list) else [args[1]]
         length = self._expect_int(args[2], "length must be integer")
+        if self._use_incremental_ta():
+            return self._volume_weighted_momentum_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                length,
+            )
+
+        series = self._as_series(args[0])
+        volume = self._as_series(args[1])
 
         if len(series) < length or len(volume) < length:
             return None
@@ -1102,9 +1105,7 @@ class VolumeIndicators(TechnicalHelpers):
 
         def _tp(k: int) -> float | None:
             h, lo, c = highs[k], lows[k], closes[k]
-            if not isinstance(h, (int, float)) or not isinstance(lo, (int, float)) or not isinstance(
-                c, (int, float)
-            ):
+            if not isinstance(h, (int, float)) or not isinstance(lo, (int, float)) or not isinstance(c, (int, float)):
                 return None
             return (float(h) + float(lo) + float(c)) / 3.0
 
@@ -1205,11 +1206,7 @@ class VolumeIndicators(TechnicalHelpers):
         wvad_values = []
         for i in range(len(wad_values)):
             start_idx = max(0, i - period + 1)
-            volume_sum = sum(
-                v
-                for v in volume_series[start_idx : i + 1]
-                if isinstance(v, (int, float))
-            )
+            volume_sum = sum(v for v in volume_series[start_idx : i + 1] if isinstance(v, (int, float)))
 
             if volume_sum > 0:
                 wvad = wad_values[i] / volume_sum if wad_values[i] is not None else 0.0
@@ -1365,19 +1362,13 @@ class VolumeIndicators(TechnicalHelpers):
                 emv_vals.append(None)
                 continue
 
-            distance_moved = ((highs[i] + lows[i]) / 2.0) - (
-                (highs[i - 1] + lows[i - 1]) / 2.0
-            )
+            distance_moved = ((highs[i] + lows[i]) / 2.0) - ((highs[i - 1] + lows[i - 1]) / 2.0)
             box_height = highs[i] - lows[i]
 
             if box_height == 0:
                 emv_vals.append(None)
             else:
-                emv = (
-                    (distance_moved / box_height) * (highs[i] - lows[i]) / volumes[i]
-                    if volumes[i] != 0
-                    else 0
-                )
+                emv = (distance_moved / box_height) * (highs[i] - lows[i]) / volumes[i] if volumes[i] != 0 else 0
                 emv_vals.append(emv)
 
         valid_emv = [v for v in emv_vals if v is not None]

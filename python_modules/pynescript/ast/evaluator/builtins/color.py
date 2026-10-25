@@ -32,6 +32,7 @@ import re
 
 from typing import Any
 
+
 # Hex color string lengths
 HEX_COLOR_SHORT_LEN = 6
 HEX_COLOR_LONG_LEN = 8
@@ -70,7 +71,7 @@ _NAMED_COLORS: dict[str, str] = {
 class Color:
     """RGBA color value used by plot/drawing builtins and ``color.*`` helpers.
 
-    Components are clamped to 0–255. Stringification yields an 8-digit hex
+    Components are clamped to 0-255. Stringification yields an 8-digit hex
     form (``#RRGGBBAA``) suitable for export and comparison.
     """
 
@@ -117,12 +118,7 @@ class Color:
         """Check equality with another color."""
         if not isinstance(other, Color):
             return NotImplemented
-        return (
-            self.r == other.r
-            and self.g == other.g
-            and self.b == other.b
-            and self.a == other.a
-        )
+        return self.r == other.r and self.g == other.g and self.b == other.b and self.a == other.a
 
     def __hash__(self) -> int:
         """Return hash for the color."""
@@ -209,18 +205,18 @@ def _parse_color_string(color: str) -> tuple[int, int, int, int] | None:
     # rgb()/rgba() used by drawing defaults and export paths
     m = _RGBA_RE.match(raw)
     if m:
-        r = int(round(float(m.group(1))))
-        g = int(round(float(m.group(2))))
-        b = int(round(float(m.group(3))))
+        r = round(float(m.group(1)))
+        g = round(float(m.group(2)))
+        b = round(float(m.group(3)))
         if m.group(4) is None:
             a = 255
         else:
             alpha_raw = float(m.group(4))
             # Pine/CSS often use 0-1; drawing sometimes uses 0-255
             if 0.0 <= alpha_raw <= 1.0:
-                a = int(round(alpha_raw * 255.0))
+                a = round(alpha_raw * 255.0)
             else:
-                a = int(round(alpha_raw))
+                a = round(alpha_raw)
         return (
             max(0, min(255, r)),
             max(0, min(255, g)),
@@ -329,7 +325,7 @@ def color_rgb(r: int, g: int, b: int, transp: int | float | None = None, a: int 
         alpha = int(a)
     elif transp is not None:
         t = max(0.0, min(100.0, float(transp)))
-        alpha = int(round(255 * (1.0 - t / 100.0)))
+        alpha = round(255 * (1.0 - t / 100.0))
     else:
         alpha = 255
     return Color(int(r), int(g), int(b), alpha)

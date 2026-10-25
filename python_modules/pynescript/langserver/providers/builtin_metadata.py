@@ -99,7 +99,7 @@ def get_metadata() -> dict[str, Any]:
         if loaded is None and enc_path.exists():
             try:
                 # Lazy: only needed for Nuitka binary path
-                from pynescript.langserver.providers import metadata_decrypt  # noqa: PLC0415
+                from pynescript.langserver.providers import metadata_decrypt
 
                 loaded = metadata_decrypt.load_encrypted_metadata()
             except Exception as exc:

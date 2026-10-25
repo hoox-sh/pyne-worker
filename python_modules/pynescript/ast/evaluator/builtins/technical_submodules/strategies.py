@@ -65,14 +65,13 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.market_structure_pivot(high, low, close, left, right)
         """
         msg = "ta.market_structure_pivot() requires 5 arguments"
-        if len(args) != 5:
-            self._error(msg)
+        self._require_len(args, 5, msg)
 
-        high = self._expect_list(args[0], msg)
-        low = self._expect_list(args[1], msg)
+        self._expect_list(args[0], msg)
+        self._expect_list(args[1], msg)
         close = self._expect_list(args[2], msg)
-        left = self._expect_int(args[3], msg)
-        right = self._expect_int(args[4], msg)
+        self._expect_int(args[3], msg)
+        self._expect_int(args[4], msg)
 
         return {"pivot_price": close[-1] if close else 0.0, "structure": "fractal", "type": "high"}
 
@@ -82,8 +81,7 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.breakeven_level(entry_price, quantity, commission, slippage, direction)
         """
         msg = "ta.breakeven_level() requires 5 arguments"
-        if len(args) != 5:
-            self._error(msg)
+        self._require_len(args, 5, msg)
 
         entry = self._expect_number(args[0], msg)
         qty = self._expect_number(args[1], msg)
@@ -110,8 +108,7 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.drawdown_recovery_level(peak, current, recovery_factor, period)
         """
         msg = "ta.drawdown_recovery_level() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         peak = self._expect_number(args[0], msg)
         current = self._expect_number(args[1], msg)
@@ -137,8 +134,7 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.risk_reward_asymmetry(entry, stop, target, win_rate)
         """
         msg = "ta.risk_reward_asymmetry() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         entry = self._expect_number(args[0], msg)
         stop = self._expect_number(args[1], msg)
@@ -167,8 +163,7 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.market_timing_index(trend, momentum, volatility, sentiment)
         """
         msg = "ta.market_timing_index() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         trend = self._expect_number(args[0], msg)
         mom = self._expect_number(args[1], msg)
@@ -202,13 +197,12 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.regime_adaptive_signal(signal_strength, volatility_regime, trend_regime, period)
         """
         msg = "ta.regime_adaptive_signal() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         strength = self._expect_number(args[0], msg)
         vol_regime = self._expect_string(args[1], msg)
         trend_regime = self._expect_string(args[2], msg)
-        period = self._expect_int(args[3], msg)
+        self._expect_int(args[3], msg)
 
         adapted_strength = strength
         regime_fit = 1.0
@@ -237,8 +231,7 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.position_sizing_score(account_risk, volatility, conviction, correlation)
         """
         msg = "ta.position_sizing_score() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         risk = self._expect_number(args[0], msg)
         vol = self._expect_number(args[1], msg)
@@ -262,22 +255,21 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.optimal_entry_zone(high, low, close, period)
         """
         msg = "ta.optimal_entry_zone() requires 4 arguments"
-        if len(args) != 4:
-            self._error(msg)
+        self._require_len(args, 4, msg)
 
         try:
-            high = self._expect_list(args[0], msg)
-            low = self._expect_list(args[1], msg)
+            self._expect_list(args[0], msg)
+            self._expect_list(args[1], msg)
             close = self._expect_list(args[2], msg)
         except ValueError:
-            high = [self._expect_number(args[0], msg)]
-            low = [self._expect_number(args[1], msg)]
+            self._expect_number(args[0], msg)
+            self._expect_number(args[1], msg)
             close = [self._expect_number(args[2], msg)]
 
         try:
-            period = self._expect_int(args[3], msg)
+            self._expect_int(args[3], msg)
         except ValueError:
-            period = int(self._expect_number(args[3], msg))
+            int(self._expect_number(args[3], msg))
 
         if not close:
             return {"min": 0.0, "max": 0.0, "optimal": 0.0}
@@ -300,19 +292,17 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.trailing_exit_level(entry, current, atr, multiplier, step)
         """
         msg = "ta.trailing_exit_level() requires 5 arguments"
-        if len(args) != 5:
-            self._error(msg)
+        self._require_len(args, 5, msg)
 
         entry = self._expect_number(args[0], msg)
         current = self._expect_number(args[1], msg)
         atr = self._expect_number(args[2], msg)
         mult = self._expect_number(args[3], msg)
-        step = self._expect_number(args[4], msg)
+        self._expect_number(args[4], msg)
 
         trail_stop = 0.0
         if current > entry:
             # Long position
-            raw_stop = current - (atr * mult)
             # Ensure stop doesn't go below entry if we are far enough?
             # Or just simple trailing logic.
             # Test expects > 100 when entry=100, current=105, atr=10, mult=1.
@@ -351,8 +341,7 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.mean_reversion_entry(price, sma, stdev, period, threshold)
         """
         msg = "ta.mean_reversion_entry() requires 5 arguments"
-        if len(args) != 5:
-            self._error(msg)
+        self._require_len(args, 5, msg)
 
         try:
             price = self._expect_list(args[0], msg)
@@ -363,7 +352,7 @@ class StrategiesIndicators(TechnicalHelpers):
             sma = [self._expect_number(args[1], msg)]
             stdev = [self._expect_number(args[2], msg)]
 
-        period = self._expect_int(args[3], msg)
+        self._expect_int(args[3], msg)
         threshold = self._expect_number(args[4], msg)
 
         p = price[-1] if isinstance(price[-1], (int, float)) else 0
@@ -389,8 +378,7 @@ class StrategiesIndicators(TechnicalHelpers):
         ta.multi_timeframe_signal(s1, s2, s3, w1, w2, w3)
         """
         msg = "ta.multi_timeframe_signal() requires 6 arguments"
-        if len(args) != 6:
-            self._error(msg)
+        self._require_len(args, 6, msg)
 
         s1 = self._expect_number(args[0], msg)
         s2 = self._expect_number(args[1], msg)

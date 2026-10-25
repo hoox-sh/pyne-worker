@@ -145,9 +145,7 @@ class AdvancedIndicators(TechnicalHelpers):
         Full path uses :meth:`_supertrend`; incremental uses
         :meth:`_supertrend_inc_update`. Same simplified contract as Numba.
         """
-        if len(args) == BINARY and all(
-            isinstance(a, (int, float)) and not isinstance(a, bool) for a in args
-        ):
+        if len(args) == BINARY and all(isinstance(a, (int, float)) and not isinstance(a, bool) for a in args):
             factor = float(args[0])
             atr_period = self._expect_int(args[1], "ta.supertrend atrPeriod must be int")
             highs = self._context_series("high")
@@ -193,6 +191,15 @@ class AdvancedIndicators(TechnicalHelpers):
         if fast_period < min_period or slow_period < min_period:
             msg = "Ichimoku periods must be >= 1"
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._ichimoku_inc_update(
+                self._context_source("high"),
+                self._context_source("low"),
+                fast_period,
+                slow_period,
+                ICHIMOKU_SENKOU_B_PERIOD,
+            )
 
         highs = (getattr(self, "current_series", None) or {}).get("high", [])
         lows = (getattr(self, "current_series", None) or {}).get("low", [])
@@ -261,15 +268,27 @@ class AdvancedIndicators(TechnicalHelpers):
         return {"high": high_val, "low": low_val, "mid": mid_val}
 
     def _builtin_ta_market_condition(self, args: list[Any]) -> str:
-        """Market Condition Detection."""
+        """Market Condition Detection.
+
+        Bar-mode incremental last sample uses ``_market_condition_inc_update``.
+        """
         if len(args) < QUATERNARY:
             msg = "ta.market_condition() requires 4 arguments"
             self._error(msg)
 
-        close_list = args[0] if isinstance(args[0], list) else [args[0]]
-        atr_list = args[1] if isinstance(args[1], list) else [args[1]]
         sma_period = self._expect_int(args[2], "sma_period must be integer")
         stdev_period = self._expect_int(args[3], "stdev_period must be integer")
+
+        if self._use_incremental_ta():
+            return self._market_condition_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                sma_period,
+                stdev_period,
+            )
+
+        close_list = args[0] if isinstance(args[0], list) else [args[0]]
+        atr_list = args[1] if isinstance(args[1], list) else [args[1]]
 
         if len(close_list) < max(sma_period, stdev_period):
             return "ranging"
@@ -290,13 +309,23 @@ class AdvancedIndicators(TechnicalHelpers):
         return "ranging"
 
     def _builtin_ta_volatility_regime(self, args: list[Any]) -> str:
-        """Volatility Regime Classification."""
+        """Volatility Regime Classification.
+
+        Bar-mode incremental last sample uses ``_volatility_regime_inc_update``.
+        """
         if len(args) < BINARY:
             msg = "ta.volatility_regime() requires 2 arguments"
             self._error(msg)
 
-        atr_list = args[0] if isinstance(args[0], list) else [args[0]]
         period = self._expect_int(args[1], "period must be integer")
+
+        if self._use_incremental_ta():
+            return self._volatility_regime_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                period,
+            )
+
+        atr_list = self._as_series(args[0])
 
         if len(atr_list) < period:
             return "medium"
@@ -341,8 +370,14 @@ class AdvancedIndicators(TechnicalHelpers):
             msg = "ta.inside_bar_pattern() requires 2 arguments"
             self._error(msg)
 
-        high_list = args[0] if isinstance(args[0], list) else [args[0]]
-        low_list = args[1] if isinstance(args[1], list) else [args[1]]
+        if self._use_incremental_ta():
+            return self._inside_bar_pattern_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+            )
+
+        high_list = self._as_series(args[0])
+        low_list = self._as_series(args[1])
 
         if len(high_list) < BINARY or len(low_list) < BINARY:
             return False
@@ -503,16 +538,28 @@ class AdvancedIndicators(TechnicalHelpers):
     # -- Tier 6: Market Microstructure ---------------------------------------
 
     def _builtin_ta_order_flow_imbalance(self, args: list[Any]) -> float:
-        """Order Flow Imbalance."""
+        """Order Flow Imbalance.
+
+        Bar-mode incremental last sample uses ``_order_flow_imbalance_inc_update``.
+        """
         msg = "ta.order_flow_imbalance() requires 5 arguments"
         if len(args) < QUINARY:
             self._error(msg)
+
+        period = self._expect_int(args[4], msg)
+        if self._use_incremental_ta():
+            return self._order_flow_imbalance_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+                period,
+            )
 
         high = self._expect_list(args[0], msg)
         low = self._expect_list(args[1], msg)
         close = self._expect_list(args[2], msg)
         volume = self._expect_list(args[3], msg)
-        period = self._expect_int(args[4], msg)
 
         if len(high) < period or len(low) < period or period <= 0:
             return 0.0
@@ -579,8 +626,11 @@ class AdvancedIndicators(TechnicalHelpers):
         if len(close) < period or period <= 0 or levels <= 0:
             return close[-1] if close else 100.0
 
-        data = [(close[i], volume[i]) for i in range(-period, 0)
-                if isinstance(close[i], (int, float)) and isinstance(volume[i], (int, float))]
+        data = [
+            (close[i], volume[i])
+            for i in range(-period, 0)
+            if isinstance(close[i], (int, float)) and isinstance(volume[i], (int, float))
+        ]
 
         if not data:
             return close[-1] if close else 100.0
@@ -711,9 +761,7 @@ class AdvancedIndicators(TechnicalHelpers):
             stochrsi_val = (valid_rsi[-1] - rsi_low) / rsi_range * 100.0
 
         # Signal is EMA of StochRSI
-        signal = stochrsi_val * 0.33 + (
-            getattr(self, "_last_stochrsi_signal", stochrsi_val) * 0.67
-        )
+        signal = stochrsi_val * 0.33 + (getattr(self, "_last_stochrsi_signal", stochrsi_val) * 0.67)
         self._last_stochrsi_signal = signal
 
         return {"stochrsi": stochrsi_val, "signal": signal}
@@ -759,9 +807,7 @@ class AdvancedIndicators(TechnicalHelpers):
         length4 = self._expect_int(args[3], "length4 must be integer")
 
         if self._use_incremental_ta():
-            return self._kst_inc_update(
-                self._context_source("close"), length1, length2, length3, length4
-            )
+            return self._kst_inc_update(self._context_source("close"), length1, length2, length3, length4)
 
         closes = (getattr(self, "current_series", None) or {}).get("close", [])
         if not closes:
@@ -772,26 +818,10 @@ class AdvancedIndicators(TechnicalHelpers):
             return None
 
         # Calculate ROCs (Rate of Change)
-        roc1 = (
-            (closes[-1] - closes[-length1]) / closes[-length1] * 100
-            if len(closes) >= length1
-            else 0
-        )
-        roc2 = (
-            (closes[-1] - closes[-length2]) / closes[-length2] * 100
-            if len(closes) >= length2
-            else 0
-        )
-        roc3 = (
-            (closes[-1] - closes[-length3]) / closes[-length3] * 100
-            if len(closes) >= length3
-            else 0
-        )
-        roc4 = (
-            (closes[-1] - closes[-length4]) / closes[-length4] * 100
-            if len(closes) >= length4
-            else 0
-        )
+        roc1 = (closes[-1] - closes[-length1]) / closes[-length1] * 100 if len(closes) >= length1 else 0
+        roc2 = (closes[-1] - closes[-length2]) / closes[-length2] * 100 if len(closes) >= length2 else 0
+        roc3 = (closes[-1] - closes[-length3]) / closes[-length3] * 100 if len(closes) >= length3 else 0
+        roc4 = (closes[-1] - closes[-length4]) / closes[-length4] * 100 if len(closes) >= length4 else 0
 
         # Weighted sum
         kst_val = roc1 * 1.0 + roc2 * 2.0 + roc3 * 3.0 + roc4 * 4.0
@@ -870,13 +900,21 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.acceleration_factor(momentum_list, period)
         Returns: Factor (-2.0 to 2.0)
+
+        Bar-mode incremental last sample uses ``_acceleration_factor_inc_update``.
         """
         msg = "ta.acceleration_factor() requires 2 arguments"
         if len(args) < BINARY:
             self._error(msg)
 
-        momentum = self._expect_list(args[0], msg)
         period = self._expect_int(args[1], msg)
+        if self._use_incremental_ta():
+            return self._acceleration_factor_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                period,
+            )
+
+        momentum = self._expect_list(args[0], msg)
 
         if len(momentum) < period + 1 or period <= 0:
             return 0.0
@@ -899,15 +937,25 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.mean_reversion_score(close, sma, stdev, period)
         Returns: Score (0-100)
+
+        Bar-mode incremental last sample uses ``_mean_reversion_score_inc_update``.
         """
         msg = "ta.mean_reversion_score() requires 4 arguments"
         if len(args) < QUATERNARY:
             self._error(msg)
 
+        period = self._expect_int(args[3], msg)
+        if self._use_incremental_ta():
+            return self._mean_reversion_score_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                period,
+            )
+
         close = self._expect_list(args[0], msg)
         sma = self._expect_list(args[1], msg)
         stdev = self._expect_list(args[2], msg)
-        period = self._expect_int(args[3], msg)
 
         if len(close) < period or len(sma) < period or period <= 0:
             return 50.0
@@ -929,21 +977,33 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.momentum_filter(momentum_raw, volume, period)
         Returns: Filtered momentum value
+
+        Bar-mode incremental last sample uses ``_momentum_filter_inc_update``.
         """
         msg = "ta.momentum_filter() requires 3 arguments"
         if len(args) < TERNARY:
             self._error(msg)
 
+        period = self._expect_int(args[2], msg)
+        if self._use_incremental_ta():
+            return self._momentum_filter_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                period,
+            )
+
         momentum = self._expect_list(args[0], msg)
         volume = self._expect_list(args[1], msg)
-        period = self._expect_int(args[2], msg)
 
         if len(momentum) < period or len(volume) < period or period <= 0:
             return 0.0
 
         vol_sum = sum([v for v in volume[-period:] if isinstance(v, (int, float))])
-        mom_data = [(momentum[i], volume[i]) for i in range(-period, 0)
-                    if isinstance(momentum[i], (int, float)) and isinstance(volume[i], (int, float))]
+        mom_data = [
+            (momentum[i], volume[i])
+            for i in range(-period, 0)
+            if isinstance(momentum[i], (int, float)) and isinstance(volume[i], (int, float))
+        ]
 
         if not mom_data or vol_sum == 0:
             return 0.0
@@ -995,14 +1055,14 @@ class AdvancedIndicators(TechnicalHelpers):
         # Calculate commodity change
         comm_valid = isinstance(commodities[0], (int, float)) and isinstance(commodities[-1], (int, float))
         if comm_valid and commodities[0] != 0:
-            comm_change = ((commodities[-1] - commodities[0]) / commodities[0] * 100)
+            comm_change = (commodities[-1] - commodities[0]) / commodities[0] * 100
         else:
             comm_change = 0.0
         # Calculate yields change
         yields_valid = isinstance(yields[-1], (int, float)) and isinstance(yields[0], (int, float))
         yields_change = yields[-1] - yields[0] if yields_valid else 0.0
 
-        inflation_pressure = (usd_change * 0.3 + comm_change * 0.4 + yields_change * 0.3)
+        inflation_pressure = usd_change * 0.3 + comm_change * 0.4 + yields_change * 0.3
         return max(-100.0, min(100.0, inflation_pressure * 10))
 
     def _builtin_ta_employment_cycle_indicator(self, args: list[Any]) -> str:
@@ -1070,10 +1130,20 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.fear_greed_index(rsi, vix_proxy, put_call_ratio, breadth)
         Returns: Score (-100 to 100)
+
+        Bar-mode incremental last sample uses ``_fear_greed_index_inc_update``.
         """
         msg = "ta.fear_greed_index() requires 4 arguments"
         if len(args) < QUATERNARY:
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._fear_greed_index_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+            )
 
         rsi = self._expect_list(args[0], msg)
         vix = self._expect_list(args[1], msg)
@@ -1098,10 +1168,19 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.crowd_sentiment(price_agreement, volume_agreement, time_agreement)
         Returns: Score (0-100)
+
+        Bar-mode incremental last sample uses ``_crowd_sentiment_inc_update``.
         """
         msg = "ta.crowd_sentiment() requires 3 arguments"
         if len(args) < TERNARY:
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._crowd_sentiment_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+            )
 
         price_agr = args[0] if isinstance(args[0], (int, float)) else 0.5
         vol_agr = args[1] if isinstance(args[1], (int, float)) else 0.5
@@ -1152,28 +1231,37 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.cumulative_delta(close, volume, period)
         Returns: Cumulative signed volume
+        Duplicate of ``EconomicsIndicators._builtin_ta_cumulative_delta`` — keep in sync.
+        Bar-mode incremental last sample uses ``_cumulative_delta_inc_update``.
         """
         msg = "ta.cumulative_delta() requires 3 arguments"
         if len(args) < TERNARY:
             self._error(msg)
 
-        close = self._expect_list(args[0], msg)
-        volume = self._expect_list(args[1], msg)
         period = self._expect_int(args[2], msg)
+        if self._use_incremental_ta():
+            return self._cumulative_delta_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                period,
+            )
 
-        if len(close) < period or len(volume) < period or period <= 0:
+        close = self._as_series(args[0])
+        volume = self._as_series(args[1])
+
+        if len(close) < period or period <= 0:
             return 0.0
 
         delta = 0.0
         for i in range(-period, 0):
             c = close[i] if isinstance(close[i], (int, float)) else 0
+            c_prev = close[i - 1] if i > -len(close) and isinstance(close[i - 1], (int, float)) else c
             v = volume[i] if isinstance(volume[i], (int, float)) else 0
-            if i > -period:
-                prev_c = close[i-1] if isinstance(close[i-1], (int, float)) else c
-                if c > prev_c:
-                    delta += v
-                elif c < prev_c:
-                    delta -= v
+
+            if c > c_prev:
+                delta += v
+            elif c < c_prev:
+                delta -= v
 
         return delta
 
@@ -1182,23 +1270,31 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.volume_momentum(volume, period)
         Returns: Momentum (-100 to 100)
+        Duplicate of ``EconomicsIndicators._builtin_ta_volume_momentum`` — keep in sync.
+        Bar-mode incremental last sample uses ``_volume_momentum_inc_update``.
         """
         msg = "ta.volume_momentum() requires 2 arguments"
         if len(args) < BINARY:
             self._error(msg)
 
-        volume = self._expect_list(args[0], msg)
         period = self._expect_int(args[1], msg)
+        if self._use_incremental_ta():
+            return self._volume_momentum_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                period,
+            )
+
+        volume = self._as_series(args[0])
 
         if len(volume) < period + 1 or period <= 0:
             return 0.0
 
-        vol_clean = [v for v in volume[-period - 1 :] if isinstance(v, (int, float))]
-        if len(vol_clean) < BINARY:
+        volume = [v for v in volume if isinstance(v, (int, float))]
+        if len(volume) < period + 1:
             return 0.0
 
-        old_vol = sum(vol_clean[:-1]) / len(vol_clean[:-1])
-        new_vol = sum(vol_clean[-1:])
+        old_vol = sum(volume[-period - 1 : -1]) / period if len(volume) > period else 1.0
+        new_vol = sum(volume[-period:]) / period
 
         if old_vol == 0:
             return 0.0
@@ -1211,10 +1307,20 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.smart_money_flow(price_change, volume, time_since_high, time_since_low)
         Returns: Flow intensity (-1.0 to 1.0)
+
+        Bar-mode incremental last sample uses ``_smart_money_flow_inc_update``.
         """
         msg = "ta.smart_money_flow() requires 4 arguments"
         if len(args) < QUATERNARY:
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._smart_money_flow_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+            )
 
         price_change = args[0] if isinstance(args[0], (int, float)) else 0.0
         volume = args[1] if isinstance(args[1], (int, float)) else 1000.0
@@ -1237,15 +1343,25 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.liquidity_score(volume, volatility, bid_ask_spread, period)
         Returns: Score (0-100)
+
+        Bar-mode incremental last sample uses ``_liquidity_score_inc_update``.
         """
         msg = "ta.liquidity_score() requires 4 arguments"
         if len(args) < QUATERNARY:
             self._error(msg)
 
+        period = self._expect_int(args[3], msg)
+        if self._use_incremental_ta():
+            return self._liquidity_score_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                period,
+            )
+
         volume = self._expect_list(args[0], msg)
         volatility = self._expect_list(args[1], msg)
         spread = self._expect_list(args[2], msg)
-        period = self._expect_int(args[3], msg)
 
         if len(volume) < period or len(volatility) < period or len(spread) < period or period <= 0:
             return 50.0
@@ -1261,7 +1377,7 @@ class AdvancedIndicators(TechnicalHelpers):
         spread_avg = sum([s for s in spread[-period:] if isinstance(s, (int, float))]) / period if spread else 0.1
         spread_score = max(0.0, 100.0 - spread_avg * 100.0)
 
-        liquidity = (vol_score * 0.4 + volatility_score * 0.3 + spread_score * 0.3)
+        liquidity = vol_score * 0.4 + volatility_score * 0.3 + spread_score * 0.3
         return max(0.0, min(100.0, liquidity))
 
     def _builtin_ta_volume_thrust(self, args: list[Any]) -> bool:
@@ -1269,15 +1385,25 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.volume_thrust(close, volume, volume_sma, sensitivity)
         Returns: bool
+
+        Bar-mode incremental last sample uses ``_volume_thrust_inc_update``.
         """
         msg = "ta.volume_thrust() requires 4 arguments"
         if len(args) < QUATERNARY:
             self._error(msg)
 
+        sensitivity = args[3] if isinstance(args[3], (int, float)) else 0.3
+        if self._use_incremental_ta():
+            return self._volume_thrust_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                sensitivity,
+            )
+
         close = self._expect_list(args[0], msg)
         volume = self._expect_list(args[1], msg)
         vol_sma = self._expect_list(args[2], msg)
-        sensitivity = args[3] if isinstance(args[3], (int, float)) else 0.3
 
         if not close or not volume or not vol_sma:
             return False
@@ -1298,11 +1424,23 @@ class AdvancedIndicators(TechnicalHelpers):
         ta.trend_confirmation_score(momentum, trend_alignment, strength, rsi,
                                      rsi_alignment, support_distance)
         Returns: float (0-100)
+
+        Bar-mode incremental last sample uses ``_trend_confirmation_score_inc_update``.
+        The sixth argument (support_distance) is unused after the length check.
         """
         senary = 6
         msg = "ta.trend_confirmation_score() requires 6 arguments"
         if len(args) < senary:
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._trend_confirmation_score_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+                self._as_series_or_raw(args[4], last_sample_ok=True),
+            )
 
         momentum = args[0] if isinstance(args[0], (int, float)) else 0.0
         trend_alignment = args[1] if isinstance(args[1], (int, float)) else 0.0
@@ -1316,8 +1454,7 @@ class AdvancedIndicators(TechnicalHelpers):
         rsi_score = min(100.0, abs(rsi - 50.0) * 2.0) if abs(rsi - 50.0) > 10.0 else 40.0
         alignment_bonus = 20.0 if abs(rsi_alignment) > 0.5 else 0.0
 
-        total = (momentum_score * 0.25 + trend_score * 0.3 + strength_score * 0.25
-                 + rsi_score * 0.15 + alignment_bonus)
+        total = momentum_score * 0.25 + trend_score * 0.3 + strength_score * 0.25 + rsi_score * 0.15 + alignment_bonus
         return max(0.0, min(100.0, total))
 
     def _builtin_ta_market_structure_pivot(self, args: list[Any]) -> dict:
@@ -1336,8 +1473,7 @@ class AdvancedIndicators(TechnicalHelpers):
         period = self._expect_int(args[3], msg)
         mode = self._expect_int(args[4], msg)
 
-        if (not high_list or not low_list or not close_list
-                or len(high_list) < period or period <= 0):
+        if not high_list or not low_list or not close_list or len(high_list) < period or period <= 0:
             return {"pivot_price": 100.0, "strength": 50.0, "structure": "neutral"}
 
         h_vals = [h for h in high_list[-period:] if isinstance(h, (int, float))]
@@ -1393,7 +1529,7 @@ class AdvancedIndicators(TechnicalHelpers):
         vol_score = min(100.0, vol_val * 100.0)
         vix_score = min(100.0, vix_val * 2.0)
 
-        volatility_score = (atr_score * 0.4 + vol_score * 0.3 + vix_score * 0.3)
+        volatility_score = atr_score * 0.4 + vol_score * 0.3 + vix_score * 0.3
 
         if volatility_score < threshold * 0.5:
             regime = "low"
@@ -1646,10 +1782,19 @@ class AdvancedIndicators(TechnicalHelpers):
 
         ta.max_loss_level(entry, account, max_loss_pct)
         Returns: Stop price.
+
+        Bar-mode incremental last sample uses ``_max_loss_level_inc_update``.
         """
         msg = "ta.max_loss_level() requires 3 arguments"
         if len(args) < TERNARY:
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._max_loss_level_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+            )
 
         entry = args[0] if isinstance(args[0], (int, float)) else 100.0
         account = args[1] if isinstance(args[1], (int, float)) else 10000.0
@@ -1670,10 +1815,20 @@ class AdvancedIndicators(TechnicalHelpers):
         ta.profit_lock_level(entry, current, trail_pct, direction)
         Direction: 1 for long, -1 for short.
         Returns: Stop price that trails behind price.
+
+        Bar-mode incremental last sample uses ``_profit_lock_level_inc_update``.
         """
         if len(args) < QUATERNARY:
             msg = "ta.profit_lock_level() requires 4 arguments"
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._profit_lock_level_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                self._as_series_or_raw(args[3], last_sample_ok=True),
+            )
 
         entry = args[0] if isinstance(args[0], (int, float)) else 100.0
         current = args[1] if isinstance(args[1], (int, float)) else 100.0
@@ -1716,67 +1871,27 @@ class AdvancedIndicators(TechnicalHelpers):
         momentum_list = self._expect_list(args[1], msg)
         volatility_list = self._expect_list(args[2], msg)
         volume_list = self._expect_list(args[3], msg)
-        market_condition = (
-            args[4]
-            if isinstance(args[4], str)
-            else "ranging"
-        )
-        risk_profile = (
-            args[5]
-            if isinstance(args[5], str)
-            else "balanced"
-        )
+        market_condition = args[4] if isinstance(args[4], str) else "ranging"
+        risk_profile = args[5] if isinstance(args[5], str) else "balanced"
 
         # Extract numeric values from each category
-        trend_vals = [
-            t for t in trend_list
-            if isinstance(t, (int, float))
-        ]
-        momentum_vals = [
-            m for m in momentum_list
-            if isinstance(m, (int, float))
-        ]
-        volatility_vals = [
-            v for v in volatility_list
-            if isinstance(v, (int, float))
-        ]
-        volume_vals = [
-            vol for vol in volume_list
-            if isinstance(vol, (int, float))
-        ]
+        trend_vals = [t for t in trend_list if isinstance(t, (int, float))]
+        momentum_vals = [m for m in momentum_list if isinstance(m, (int, float))]
+        volatility_vals = [v for v in volatility_list if isinstance(v, (int, float))]
+        volume_vals = [vol for vol in volume_list if isinstance(vol, (int, float))]
 
         # Calculate average signals from each category
-        trend_avg = (
-            sum(trend_vals) / len(trend_vals)
-            if trend_vals
-            else 0.0
-        )
-        momentum_avg = (
-            sum(momentum_vals) / len(momentum_vals)
-            if momentum_vals
-            else 0.0
-        )
-        volatility_avg = (
-            sum(volatility_vals) / len(volatility_vals)
-            if volatility_vals
-            else 0.5
-        )
-        volume_avg = (
-            sum(volume_vals) / len(volume_vals)
-            if volume_vals
-            else 0.0
-        )
+        trend_avg = sum(trend_vals) / len(trend_vals) if trend_vals else 0.0
+        momentum_avg = sum(momentum_vals) / len(momentum_vals) if momentum_vals else 0.0
+        volatility_avg = sum(volatility_vals) / len(volatility_vals) if volatility_vals else 0.5
+        volume_avg = sum(volume_vals) / len(volume_vals) if volume_vals else 0.0
 
         # Normalize volatility to 0-1 range
         volatility_normalized = max(0.0, min(1.0, volatility_avg))
 
         # Composite signal calculation
         # Trend: 40%, Momentum: 35%, Volume: 25%
-        composite = (
-            trend_avg * 0.4 +
-            momentum_avg * 0.35 +
-            volume_avg * 0.25
-        )
+        composite = trend_avg * 0.4 + momentum_avg * 0.35 + volume_avg * 0.25
         composite_signal = max(-1.0, min(1.0, composite))
 
         # Confidence scoring based on signal agreement
@@ -1790,10 +1905,7 @@ class AdvancedIndicators(TechnicalHelpers):
 
         base_confidence = agreement_count / 3.0
         volatility_penalty = volatility_normalized * 0.3
-        confidence_level = max(
-            0.1,
-            min(0.99, base_confidence - volatility_penalty)
-        )
+        confidence_level = max(0.1, min(0.99, base_confidence - volatility_penalty))
 
         # Strategy recommendation based on composite signal
         if composite_signal > 0.6:

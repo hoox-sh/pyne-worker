@@ -71,15 +71,13 @@ from typing import Any
 
 from pynescript import stats as _stats
 from pynescript.debug import scope_enabled as _debug_scope
+from pynescript.debug import scoped_debug
 
 
 _log = logging.getLogger(__name__)
 
-
-def _dbg(msg: str, *args: Any) -> None:
-    """Emit one datafeed debug line when ``PYNE_DEBUG`` is enabled."""
-    if _debug_scope(__name__):
-        _log.debug(msg, *args)
+#: Emit one debug line for this module when ``PYNE_DEBUG`` is enabled.
+_dbg = scoped_debug(__name__, _log)
 
 
 class DataFeedError(Exception):
@@ -143,11 +141,55 @@ class DataFeed(ABC):
         """Close the underlying connection(s)."""
         pass  # default no-op for subclasses that do not need explicit close
 
+    def poll_ohlcv(self, symbol: str, timeframe: str = "1m") -> list[Any] | None:
+        """Sync snapshot of the latest forming OHLCV, or ``None``.
+
+        Returns ``[ts_ms, open, high, low, close, volume]``. Default is
+        ``None`` (no-op) so async-only feeds do not block the bar loop.
+        """
+        return None
+
     async def __aenter__(self) -> DataFeed:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
+
+
+def poll_forming_ohlcv(
+    data_feed: Any,
+    symbol: str,
+    timeframe: str = "1m",
+) -> tuple[float, float, float, float, float, float] | None:
+    """Sync poll → ``(time, open, high, low, close, volume)`` or ``None``.
+
+    Shared by interpret ``_apply_feed_forming_bar`` and object-mode compile
+    realtime ticks. Never raises; malformed candles and missing ``poll_ohlcv``
+    are no-ops.
+    """
+    if data_feed is None:
+        return None
+    poll = getattr(data_feed, "poll_ohlcv", None)
+    if not callable(poll):
+        return None
+    try:
+        candle = poll(symbol or "", timeframe)
+    except Exception:
+        return None
+    if not candle:
+        return None
+    try:
+        if isinstance(candle[0], (list, tuple)):
+            candle = candle[-1]
+        ts = float(int(candle[0]))
+        o = float(candle[1])
+        h = float(candle[2])
+        low = float(candle[3])
+        c = float(candle[4])
+        vol = float(candle[5]) if len(candle) > 5 else 0.0
+    except (TypeError, ValueError, IndexError):
+        return None
+    return (ts, o, h, low, c, vol)
 
 
 class CCXTProDataFeed(DataFeed):
@@ -169,7 +211,7 @@ class CCXTProDataFeed(DataFeed):
         api_key: str = "",
         secret: str = "",
         password: str = "",
-        sandbox: bool = False,  # noqa: FBT001,FBT002 - CLI/ factory friendly
+        sandbox: bool = False,  # CLI/ factory friendly
         **options: Any,
     ) -> None:
         """Initialize the CCXT Pro feed.
@@ -189,6 +231,7 @@ class CCXTProDataFeed(DataFeed):
         self._sandbox = sandbox
         self._options = options
         self._exchange: Any | None = None
+        self._ohlcv_cache: dict[tuple[str, str], list[Any]] = {}
         _dbg(
             "CCXTProDataFeed init exchange=%s sandbox=%s has_key=%s options=%s",
             self._exchange_name,
@@ -204,7 +247,7 @@ class CCXTProDataFeed(DataFeed):
             _t_ex0 = time.perf_counter()
             _dbg("connecting ccxt.pro exchange=%s", self._exchange_name)
             try:
-                import ccxt.pro as ccxtpro  # type: ignore[import-not-found]  # noqa: PLC0415 - lazy to avoid hard dep
+                import ccxt.pro as ccxtpro  # type: ignore[import-not-found]  # lazy to avoid hard dep
             except ImportError as e:
                 msg = "ccxt is required for CCXTProDataFeed. Install with: pip install ccxt"
                 _dbg("ccxt.pro unavailable: %s", e)
@@ -232,11 +275,12 @@ class CCXTProDataFeed(DataFeed):
                 params["sandbox"] = True
             if self._exchange_name == "binance":
                 opts = params.get("options") if isinstance(params.get("options"), dict) else {}
-                opts = {**opts, "defaultType": "spot", "fetchMarkets": ["spot"]}
+                default = str(opts.get("defaultType") or "spot")
+                opts = {**opts, "defaultType": default, "fetchMarkets": [default]}
                 params["options"] = opts
 
             self._exchange = exchange_class(params)
-            from pynescript.util.data import tune_ccxt_public_urls  # noqa: PLC0415
+            from pynescript.util.data import tune_ccxt_public_urls
 
             tune_ccxt_public_urls(self._exchange, self._exchange_name)
             _dbg(
@@ -250,11 +294,48 @@ class CCXTProDataFeed(DataFeed):
 
         return self._exchange
 
+    def _cache_ohlcv_bars(self, symbol: str, timeframe: str, ohlcv: Any) -> None:
+        """Store the last candle from a watch/fetch payload (sync, never raises)."""
+        if not ohlcv:
+            return
+        candle: Any = ohlcv
+        try:
+            if isinstance(ohlcv[0], (list, tuple)):
+                candle = ohlcv[-1]
+        except (TypeError, IndexError):
+            return
+        try:
+            cached = [
+                int(candle[0]),
+                float(candle[1]),
+                float(candle[2]),
+                float(candle[3]),
+                float(candle[4]),
+                float(candle[5]) if len(candle) > 5 else 0.0,
+            ]
+        except (TypeError, ValueError, IndexError):
+            return
+        key = (str(symbol or ""), str(timeframe or "1m"))
+        self._ohlcv_cache[key] = cached
+
+    def poll_ohlcv(self, symbol: str, timeframe: str = "1m") -> list[Any] | None:
+        """Last cached watch/fetch candle for *symbol*/*timeframe*, or ``None``.
+
+        Sync and network-free: the bar loop must not open sockets. A live
+        ``watch_ohlcv`` (or ``fetch_latest_ohlcv``) fills the cache; until then
+        this is a no-op like the ABC default.
+        """
+        key = (str(symbol or ""), str(timeframe or "1m"))
+        cached = self._ohlcv_cache.get(key)
+        if cached is None:
+            return None
+        return list(cached)
+
     async def supports_for_symbols(self) -> bool:
         """True when the venue implements ``watchOHLCVForSymbols`` (fan-in)."""
         try:
             exchange = await self._get_exchange()
-        except Exception:  # noqa: BLE001
+        except Exception:
             return False
         has = getattr(exchange, "has", None)
         if isinstance(has, dict):
@@ -284,13 +365,16 @@ class CCXTProDataFeed(DataFeed):
                         if isinstance(per_tf, dict):
                             for tf, candles in per_tf.items():
                                 if candles:
+                                    self._cache_ohlcv_bars(str(sym), str(tf), candles)
                                     yield (sym, tf, candles)
                         elif per_tf:
+                            self._cache_ohlcv_bars(str(sym), "1m", per_tf)
                             yield (sym, "", per_tf)
                 elif grouped:
                     for sym, tf in symbols:
+                        self._cache_ohlcv_bars(str(sym), str(tf), grouped)
                         yield (sym, tf, grouped)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if "closed" in str(e).lower() or "connection" in str(e).lower():
                     await asyncio.sleep(1)
                     continue
@@ -318,6 +402,7 @@ class CCXTProDataFeed(DataFeed):
             try:
                 ohlcv = await exchange.watch_ohlcv(symbol, timeframe, limit=limit)
                 if ohlcv:
+                    self._cache_ohlcv_bars(symbol, timeframe, ohlcv)
                     n_updates += 1
                     if _debug_scope(__name__) and n_updates <= 3:
                         # First few only — steady state would flood the log.
@@ -416,7 +501,7 @@ class CCXTProDataFeed(DataFeed):
             _dbg("closing ccxt.pro exchange=%s", self._exchange_name)
             try:
                 await self._exchange.close()
-            except Exception:  # noqa: S110 - best effort shutdown
+            except Exception:  # best effort shutdown
                 pass
             self._exchange = None
 
@@ -441,11 +526,14 @@ class CCXTProDataFeed(DataFeed):
         # Use watch once to get fresh data, fallback to fetch if needed
         try:
             ohlcv = await exchange.watch_ohlcv(symbol, timeframe, limit=limit)
-            return ohlcv[-limit:] if ohlcv else []
+            out = ohlcv[-limit:] if ohlcv else []
         except Exception:
             # Fallback to REST fetch_ohlcv for latest
             ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            return ohlcv or []
+            out = ohlcv or []
+        if out:
+            self._cache_ohlcv_bars(symbol, timeframe, out)
+        return out
 
     def fetch_latest_ticker(self, symbol: str) -> dict[str, Any]:
         """Synchronous fetch of latest ticker."""
@@ -495,10 +583,17 @@ class MockDataFeed(DataFeed):
     Generates synthetic streaming data.
     """
 
-    def __init__(self, symbol: str = "BTC/USDT", start_price: float = 25000.0):
+    def __init__(
+        self,
+        symbol: str = "BTC/USDT",
+        start_price: float = 25000.0,
+        scripted: list[list[Any]] | None = None,
+    ):
         self.symbol = symbol
         self.price = start_price
         self._closed = False
+        self._scripted = [list(c) for c in scripted] if scripted is not None else None
+        self._poll_i = 0
         _dbg("MockDataFeed init symbol=%s start_price=%s", symbol, start_price)
         _stats.count("datafeed.feeds_created", dim="mock")
 
@@ -595,6 +690,31 @@ class MockDataFeed(DataFeed):
             out.append([ts + i * 60_000, o, h, lo, c, v])
         return out
 
+    def poll_ohlcv(self, symbol: str, timeframe: str = "1m") -> list[Any] | None:
+        """Next forming candle (sync, no sleep). ``scripted`` then ``None``."""
+        _ = symbol
+        _ = timeframe
+        if self._scripted is not None:
+            if self._poll_i >= len(self._scripted):
+                return None
+            candle = list(self._scripted[self._poll_i])
+            self._poll_i += 1
+            try:
+                self.price = float(candle[4])
+            except (TypeError, ValueError, IndexError):
+                pass
+            return candle
+        i = self._poll_i
+        self._poll_i += 1
+        o = float(self.price)
+        h = o + 1.0
+        lo = o - 1.0
+        c = o + 0.5
+        v = 100.0 + i
+        ts = 1_700_000_000_000 + i * 60_000
+        self.price = c
+        return [ts, o, h, lo, c, v]
+
 
 # Composite / unified feed example
 class CompositeDataFeed(DataFeed):
@@ -642,7 +762,7 @@ class CompositeDataFeed(DataFeed):
             if src is not None and hasattr(src, "fetch_latest_ticker"):
                 try:
                     return src.fetch_latest_ticker(symbol)  # type: ignore[attr-defined]
-                except Exception:  # noqa: S110
+                except Exception:  # noqa: S112 - fall through to next source
                     continue
         return {}
 
@@ -651,9 +771,24 @@ class CompositeDataFeed(DataFeed):
             if src is not None and hasattr(src, "fetch_latest_ohlcv"):
                 try:
                     return src.fetch_latest_ohlcv(symbol, timeframe, limit)  # type: ignore[attr-defined]
-                except Exception:  # noqa: S110
+                except Exception:  # noqa: S112 - fall through to next source
                     continue
         return []
+
+    def poll_ohlcv(self, symbol: str, timeframe: str = "1m") -> list[Any] | None:
+        for src in (self.primary, self.fallback):
+            if src is None:
+                continue
+            poll = getattr(src, "poll_ohlcv", None)
+            if not callable(poll):
+                continue
+            try:
+                candle = poll(symbol, timeframe)
+            except Exception:  # noqa: S112 - fall through to next source
+                continue
+            if candle:
+                return candle
+        return None
 
 
 # --- Order execution / position tracking on top of datafeed (point 3) ---

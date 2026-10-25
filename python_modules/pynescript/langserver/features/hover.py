@@ -249,7 +249,7 @@ def _hover_user_decl(
 def _collect_user_decls(tree: Any, source: str) -> dict[str, dict[str, str]]:
     """Map identifier → first declaration (kind + source signature)."""
     found: dict[str, dict[str, str]] = {}
-    # Split once — a per-declaration split is O(decls × doc-size).
+    # Split once — a per-declaration split is O(decls x doc-size).
     lines = source.split("\n") if source else []
 
     def add(name: str | None, kind: str, node: Any, fallback: str) -> None:
@@ -591,10 +591,16 @@ def _build_see_also(info: dict) -> str:
 
 
 def _build_docs_link(name: str) -> str:
-    """Build a link to reference Pine documentation.
+    """Markdown link to the public Pine v6 function reference.
 
-    Note: reference Pine docs links require the full function reference.
-    This is a placeholder that shows how to structure the link.
+    Only dotted builtin labels with a namespace (``ta.sma``,
+    ``strategy.entry``, ``line.fill``) get a link. Empty, undotted
+    (``sma``), or whitespace-only names return ``""``.
     """
-    # Don't include external links in basic hover
-    return ""
+    label = (name or "").strip()
+    if not label or "." not in label:
+        return ""
+    namespace, _, member = label.partition(".")
+    if not namespace or not member:
+        return ""
+    return f"[Pine v6: {label}](https://www.tradingview.com/pine-script-reference/v6/#fun_{label})\n"

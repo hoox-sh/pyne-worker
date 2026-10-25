@@ -140,15 +140,6 @@ class NumericBuiltinsMixin(BuiltinDispatchMixin):
             break
         return value
 
-    def _require_len(
-        self,
-        args: list[Any],
-        expected: int,
-        message: str,
-    ) -> None:
-        if len(args) != expected:
-            self._error(message)
-
     def _builtin_abs(self, args: list[Any]) -> Any:
         self._require_len(args, UNARY, "abs takes exactly one argument")
         n = args[0]
@@ -354,9 +345,8 @@ class NumericBuiltinsMixin(BuiltinDispatchMixin):
         # Multiple values (scalars or series current).
         # Reference Pine: if any argument is ``na``, the result is ``na`` (do not skip).
         values: list[float] = []
-        for a in args:
-            if hasattr(a, "current"):
-                a = a.current
+        for arg in args:
+            a = arg.current if hasattr(arg, "current") else arg
             if a is None:
                 return None
             if isinstance(a, list):

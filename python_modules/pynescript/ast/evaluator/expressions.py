@@ -112,9 +112,7 @@ _PS_OTHER = 9
 
 # Calendar series materialize on first read (LazyCalendarContext). Every other
 # name is a plain dict slot — dict.__getitem__ skips that Python override.
-_CAL_ARG_NAMES = frozenset(
-    {"year", "month", "dayofmonth", "hour", "minute", "second", "dayofweek"}
-)
+_CAL_ARG_NAMES = frozenset({"year", "month", "dayofmonth", "hour", "minute", "second", "dayofweek"})
 
 # Script declarations — constant after bar 0 (host sets ``_pine_defs_locked``).
 _DECL_CALL_NAMES = frozenset({"indicator", "strategy", "library", "study"})
@@ -132,12 +130,12 @@ def _pineseries_type() -> Any:
         return None
     if ps is None:
         try:
-            from pynescript.runtime.series import PineSeries as _PS
+            from pynescript.runtime.series import PineSeries
         except Exception:  # pragma: no cover
             _PineSeries = False
             return None
-        _PineSeries = _PS
-        return _PS
+        _PineSeries = PineSeries
+        return PineSeries
     return ps
 
 
@@ -223,7 +221,7 @@ def _call_site_for_evaluator(node: Any, ev: Any) -> tuple | None:
     if site is None:
         return None
     kind = site[0]
-    if kind == _SITE_QB or kind == _SITE_BB:
+    if kind in {_SITE_QB, _SITE_BB}:
         if len(site) < 6 or site[-1] != _evaluator_generation(ev):
             return None
     return site
@@ -246,7 +244,7 @@ def _arg_plan_all_literal(plan: tuple) -> bool:
         return True
     for op in plan:
         kind = op[0]
-        if kind != _AP_CONST and kind != _AP_KW_CONST:
+        if kind not in {_AP_CONST, _AP_KW_CONST}:
             return False
     return True
 
@@ -379,11 +377,11 @@ def _elementwise_binary(op, a, b):
 
     if ta is list and tb is list:
         if len(a) == len(b):
-            return [_safe_op(x, y) for x, y in zip(a, b)]
+            return [_safe_op(x, y) for x, y in zip(a, b, strict=False)]
         # Align on the trailing edge (most recent bars)
         n = min(len(a), len(b))
         a_tail, b_tail = a[-n:], b[-n:]
-        body = [_safe_op(x, y) for x, y in zip(a_tail, b_tail)]
+        body = [_safe_op(x, y) for x, y in zip(a_tail, b_tail, strict=False)]
         if len(a) > len(b):
             return [None] * (len(a) - n) + body
         return [None] * (len(b) - n) + body
@@ -446,7 +444,7 @@ _OPERATOR_MUL = _na_safe_binary(operator.mul)
 def _safe_truediv(a, b):
     """Division with Pine NA / zero-divisor semantics (returns na, not exception)."""
     try:
-        if b == 0 or b == 0.0:
+        if b == 0:
             return None
         return operator.truediv(a, b)
     except (TypeError, ZeroDivisionError, OverflowError):
@@ -817,7 +815,7 @@ class ExpressionEvaluator:
                             return handler
                         return handler(*args)
                     args, kwargs = self._eval_arg_plan(plan)
-                    if name == "request.security" or name == "security":
+                    if name in {"request.security", "security"}:
                         args = self._maybe_attach_security_simple_ta(name, node, args)
                     if kwargs is not _EMPTY_KW and kwargs:
                         return self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
@@ -868,7 +866,7 @@ class ExpressionEvaluator:
                     kwargs = _EMPTY_KW
                     if args is None:
                         args, kwargs = self._eval_arg_plan(plan)
-                        if name == "request.security" or name == "security":
+                        if name in {"request.security", "security"}:
                             args = self._maybe_attach_security_simple_ta(name, node, args)
                     if kwargs is not _EMPTY_KW and kwargs:
                         return self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
@@ -899,7 +897,7 @@ class ExpressionEvaluator:
         if kind == _SITE_Q:
             name, plan = site[1], site[2]
             args, kwargs = self._eval_arg_plan(plan)
-            if name == "request.security" or name == "security":
+            if name in {"request.security", "security"}:
                 args = self._maybe_attach_security_simple_ta(name, node, args)
             result = self._call_builtin(name, args, kwargs=kwargs)  # type: ignore[attr-defined]
             if (
@@ -931,7 +929,7 @@ class ExpressionEvaluator:
         if kind == _SITE_B:
             name, plan = site[1], site[2]
             args, kwargs = self._eval_arg_plan(plan)
-            if name == "request.security" or name == "security":
+            if name in {"request.security", "security"}:
                 args = self._maybe_attach_security_simple_ta(name, node, args)
             ufuncs = self.__dict__.get("_user_functions")
             if ufuncs:
@@ -1126,11 +1124,10 @@ class ExpressionEvaluator:
                     plan.append((_AP_KW_CONST, kw, val.value))
                 else:
                     plan.append((_AP_CONST, val.value))
+            elif kw:
+                plan.append((_AP_KW_VISIT, kw, val))
             else:
-                if kw:
-                    plan.append((_AP_KW_VISIT, kw, val))
-                else:
-                    plan.append((_AP_VISIT, val))
+                plan.append((_AP_VISIT, val))
         return tuple(plan)
 
     def _resolve_name_arg(self: EvaluatorProtocol, name: str) -> Any:

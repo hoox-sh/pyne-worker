@@ -69,6 +69,7 @@ from pynescript.ast import node as ast
 from pynescript.ast.grammar.antlr4.parser import PinescriptParser
 from pynescript.ast.grammar.antlr4.visitor import PinescriptParserVisitor
 
+
 # Empty context/op nodes are immutable in practice (only type is used). Reuse
 # singletons to cut allocation pressure on the builder hot path.
 _LOAD = ast.Load()
@@ -141,8 +142,6 @@ class PinescriptASTLocator:
     to preserve source location information in AST nodes for error reporting.
     """
 
-    # ruff: noqa: N802
-
     def _setLocations(self, node: ast.AST, ctx: ParserRuleContext) -> ast.AST:
         """Attach location metadata from parser context to AST node.
 
@@ -198,8 +197,6 @@ class PinescriptCommentParser:
     - plain ``// …`` → ``//``
     """
 
-    # ruff: noqa: N802
-
     _ASSIGNMENT_ANNOTATION_PATTERN = re.compile(r"^(//)(\s*)(@)(\s*)(version)(\s*)(=)(\s*)(.+)$")
     _SIMPLE_ANNOTATION_PATTERN = re.compile(
         r"^(//)(\s*)(@)(\s*)(description|function|returns|type|variable|strategy_alert_message)(\s+)(.+)$"
@@ -207,7 +204,7 @@ class PinescriptCommentParser:
     _NAMED_ANNOTATION_PATTERN = re.compile(r"^(//)(\s*)(@)(\s*)(param|field)(\s+)(\w+)(\s+)(.+)$")
     _REGION_BORDER_PATTERN = re.compile(r"^(//)(\s*)(#)(\s*)(region|endregion)$")
 
-    def _parseComment(self, comment: str) -> tuple[str, tuple[str, ...]]:  # noqa: C901
+    def _parseComment(self, comment: str) -> tuple[str, tuple[str, ...]]:
         """Return ``(kind, parts)`` for one comment line.
 
         Kind encoding (first chars + scope suffix) is consumed by
@@ -298,8 +295,6 @@ class PinescriptASTBuilder(
     resource grammar.
     """
 
-    # ruff: noqa: N802
-
     def _set_store_ctx(self, node):
         """Mark an assignment target tree as store (recurse into tuples).
 
@@ -350,9 +345,7 @@ class PinescriptASTBuilder(
         if trail:
             return self.visit(trail)
 
-    def visitTrailing_structure_statements(
-        self, ctx: PinescriptParser.Trailing_structure_statementsContext
-    ):
+    def visitTrailing_structure_statements(self, ctx: PinescriptParser.Trailing_structure_statementsContext):
         """Comma-separated simple statements ending with a structure (for/if/while/switch)."""
         stmts = [self.visit(s) for s in ctx.simple_statement()]
         structure = self.visit(ctx.structure())
@@ -1398,7 +1391,7 @@ class PinescriptASTBuilder(
                 value=ident,
             )
             self._setLocations(ident, ctx)
-        args = complete + [ident]
+        args = [*complete, ident]
         if len(args) == 1:
             return args[0]
         tup = ast.Tuple(

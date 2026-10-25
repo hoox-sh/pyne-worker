@@ -28,14 +28,22 @@ Modules:
 
 - :mod:`.completion` — ``textDocument/completion``, ``completionItem/resolve``
 - :mod:`.hover` — ``textDocument/hover``
+- :mod:`.signature_help` — ``textDocument/signatureHelp``
 - :mod:`.diagnostics` — lint → LSP diagnostic conversion helpers
-- :mod:`.formatting` — ``textDocument/formatting``, ``rangeFormatting``
+- :mod:`.formatting` — ``textDocument/formatting``, ``rangeFormatting``, ``onTypeFormatting``
 - :mod:`.definitions` — ``textDocument/definition``
 - :mod:`.references` — ``textDocument/references``
+- :mod:`.highlight` — ``textDocument/documentHighlight``
+- :mod:`.linked_editing` — ``textDocument/linkedEditingRange``
+- :mod:`.rename` — ``textDocument/prepareRename``, ``textDocument/rename``
 - :mod:`.symbols` — ``textDocument/documentSymbol``
-- :mod:`.semantic_tokens` — ``textDocument/semanticTokens/full``
-- :mod:`.inlay_hints` — ``textDocument/inlayHint``
-- :mod:`.convert` — ``workspace/executeCommand`` Convert-to-v6 + code action
+- :mod:`.semantic_tokens` — ``textDocument/semanticTokens/full``, ``/range``
+- :mod:`.inlay_hints` — ``textDocument/inlayHint``, ``inlayHint/resolve``
+- :mod:`.folding` — ``textDocument/foldingRange``
+- :mod:`.selection_range` — ``textDocument/selectionRange``
+- :mod:`.document_color` — ``textDocument/documentColor``, ``textDocument/colorPresentation``
+- :mod:`.document_link` — ``textDocument/documentLink``, ``documentLink/resolve``
+- :mod:`.convert` — ``workspace/executeCommand`` Convert-to-v6 + code action (incl. W001 QuickFix)
 
 This package re-exports :mod:`.diagnostics` for convenience; other features are
 imported by name from :mod:`pynescript.langserver.server`.
@@ -44,5 +52,6 @@ imported by name from :mod:`pynescript.langserver.server`.
 from __future__ import annotations
 
 from pynescript.langserver.features import diagnostics
+
 
 __all__ = ["diagnostics"]

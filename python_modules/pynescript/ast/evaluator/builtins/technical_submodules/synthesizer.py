@@ -39,8 +39,7 @@ class SynthesizerIndicators(TechnicalHelpers):
         ta.intelligent_strategy_synthesizer(trend, momentum, volatility, volume, market_regime, risk_profile)
         """
         msg = "ta.intelligent_strategy_synthesizer() requires 6 arguments"
-        if len(args) != 6:
-            self._error(msg)
+        self._require_len(args, 6, msg)
 
         try:
             trend = self._expect_list(args[0], msg)

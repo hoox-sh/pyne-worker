@@ -11,7 +11,9 @@ This module no longer duplicates the bar loop. Worker-only deltas:
 
 ``timeout_seconds`` / ``timed_out`` live on the package Runtime so Pro API
 and edge share one circuit breaker. ``libraries`` is forwarded to the package
-host (AXIS ``import ns/Name/ver``).
+host (AXIS ``import ns/Name/ver``). ``realtime_*`` kwargs match
+:meth:`pynescript.runtime.host.Runtime.run` (0.6.14+): last-bar
+``barstate.isrealtime``, multi-tick ``varip``, and a realtime window.
 """
 
 from __future__ import annotations
@@ -95,6 +97,11 @@ class Runtime(_PackageRuntime):
         profiler: bool = False,
         timeout_seconds: float | None = None,
         libraries: list[dict[str, Any]] | None = None,
+        *,
+        realtime_last_bar: bool = False,
+        realtime_ticks: int = 1,
+        realtime_bars: int = 0,
+        realtime_from_bar: int | None = None,
         **kwargs: Any,
     ):
         # Fail closed on malformed bars (handler also validates; this covers
@@ -112,6 +119,10 @@ class Runtime(_PackageRuntime):
             profiler=profiler,
             timeout_seconds=timeout_seconds,
             libraries=libraries,
+            realtime_last_bar=realtime_last_bar,
+            realtime_ticks=realtime_ticks,
+            realtime_bars=realtime_bars,
+            realtime_from_bar=realtime_from_bar,
             **kwargs,
         )
 

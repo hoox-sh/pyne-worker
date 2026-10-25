@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-
 import ast
 import functools
 import itertools
@@ -33,8 +32,6 @@ import pyasdl
 
 
 class PythonGenerator(pyasdl.ASDLVisitor):
-    # ruff: noqa: N802
-
     def __init__(self, *, defaults: str = "all"):
         self._defaults = defaults
         self._base = ast.Name("AST", ast.Load())

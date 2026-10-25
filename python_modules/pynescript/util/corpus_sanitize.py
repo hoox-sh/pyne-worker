@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import re
 
+
 # Minimal script used when scrape content is foreign / empty of real Pine.
 _MINIMAL_STUB = '//@version=5\nindicator("x")\nplot(close)\n'
 
@@ -530,10 +531,10 @@ _TRAILING_BINOP_RE = re.compile(r"^(?P<head>.*\S)\s+(?P<op>or|and|\+|\-|\*|/)\s*
 # Unicode operators / punctuation that break the ANTLR lexer outside strings.
 _UNICODE_OP_MAP = str.maketrans(
     {
-        "\u2212": "-",  # − minus
-        "\u2013": "-",  # –
+        "\u2212": "-",  # - minus
+        "\u2013": "-",  # -
         "\u2014": "-",  # —
-        "\u00d7": "*",  # ×
+        "\u00d7": "*",  # x
         "\u00f7": "/",  # ÷
         "\u00b1": "+/-",  # ± (multi-char via replace below)
         "\u2022": "*",  # •
@@ -1125,7 +1126,11 @@ def _line_filter(source: str) -> str:
             cleaned.strip()
             and not cleaned.lstrip().startswith("//")
             and not _SHELL_IF_RE.match(cleaned)
-            and ("=" in cleaned or "(" in cleaned or cleaned.lstrip().startswith(("if ", "for ", "while ", "switch ", "once ")))
+            and (
+                "=" in cleaned
+                or "(" in cleaned
+                or cleaned.lstrip().startswith(("if ", "for ", "while ", "switch ", "once "))
+            )
         ):
             saw_pine = True
 
@@ -1177,9 +1182,9 @@ def _strip_trailing_loading_ellipsis(line: str) -> str:
     end = len(core)
     while end > 0 and core[end - 1] in " \t":
         end -= 1
-    token = "loading..."
-    tlen = len(token)
-    if end < tlen or core[end - tlen : end].lower() != token:
+    loading_marker = "loading..."
+    tlen = len(loading_marker)
+    if end < tlen or core[end - tlen : end].lower() != loading_marker:
         return line
     pre = end - tlen
     if pre == 0 or core[pre - 1] not in " \t":
@@ -1275,7 +1280,8 @@ def _insert_var_commas(line: str) -> str:
 def _fix_missing_decl_commas(source: str) -> str:
     """Insert commas between space-separated var declarations on one line."""
     out: list[str] = []
-    for line in source.splitlines(keepends=True):
+    for raw_line in source.splitlines(keepends=True):
+        line = raw_line
         if "var" not in line:
             out.append(line)
             continue

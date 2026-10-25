@@ -259,7 +259,7 @@ class BaseEvaluator(NodeVisitor):
         self._history_names_scanned: bool = False
         # bar_index last written for each history-tracked series (same-bar replace).
         self._series_assign_bar: dict[str, int] = {}
-        # Reused positional arg lists for visit_Call (1–3 NAME/CONST args).
+        # Reused positional arg lists for visit_Call (1-3 NAME/CONST args).
         # Unrolled plans never visit nested Calls, so overwrite is safe.
         self._arg1: list[Any] = [None]
         self._arg2: list[Any] = [None, None]

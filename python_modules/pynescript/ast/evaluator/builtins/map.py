@@ -17,7 +17,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Pine ``map`` collection type (key–value store).
+"""Pine ``map`` collection type (key-value store).
 
 Defines the runtime :class:`Map` value used by ``map.*`` builtins. Dispatch
 handlers live in :mod:`map_evaluator` (:class:`MapBuiltinsMixin`); this module
@@ -38,7 +38,7 @@ V = TypeVar("V")
 
 
 class Map(Generic[K, V]):
-    """Mutable ordered-preserving key–value map for Pine ``map.*`` operations.
+    """Mutable ordered-preserving key-value map for Pine ``map.*`` operations.
 
     Backed by a Python ``dict``. Methods mirror reference Pine map semantics
     (``get``/``put``/``remove``/``keys``/``values``/…). Evaluator dispatch is
@@ -97,6 +97,15 @@ class Map(Generic[K, V]):
         new_map: Map[K, V] = Map()
         new_map.data = self.data.copy()
         return new_map
+
+    def copy_contents(self) -> dict[Any, Any]:
+        """One-level snapshot of map items (realtime rollback)."""
+        return self.data.copy()
+
+    def restore_contents(self, snap: dict[Any, Any]) -> None:
+        """Restore from :meth:`copy_contents` into this instance."""
+        self.data.clear()
+        self.data.update(snap)
 
     def __repr__(self) -> str:
         """String representation."""

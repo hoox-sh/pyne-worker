@@ -21,8 +21,7 @@
 
 :func:`get_server_capabilities` is returned from the ``initialize`` handler in
 :mod:`pynescript.langserver.server`. Only declare providers that have working
-handlers — signature help is omitted until implemented; code actions
-expose Convert-to-v6.
+handlers. Code actions expose Convert-to-v6 and the W001 QuickFix.
 
 Semantic token type/modifier order in :func:`semantic_token_types` /
 :func:`semantic_token_modifiers` **must** stay aligned with indices used by
@@ -40,7 +39,7 @@ def get_server_capabilities() -> lsp.ServerCapabilities:
     """Return :class:`lsprotocol.types.ServerCapabilities` for ``initialize``.
 
     Sync mode is incremental open/close/change with save text. Completion
-    triggers on ``.`` with resolve. Semantic tokens: full only (no range).
+    triggers on ``.`` with resolve. Semantic tokens: full and range.
     """
     return lsp.ServerCapabilities(
         text_document_sync=lsp.TextDocumentSyncOptions(
@@ -60,8 +59,17 @@ def get_server_capabilities() -> lsp.ServerCapabilities:
             resolve_provider=True,
         ),
         hover_provider=True,
+        signature_help_provider=lsp.SignatureHelpOptions(
+            trigger_characters=["(", ","],
+            retrigger_characters=[","],
+        ),
         definition_provider=True,
         references_provider=True,
+        document_highlight_provider=True,
+        linked_editing_range_provider=True,
+        rename_provider=lsp.RenameOptions(
+            prepare_provider=True,
+        ),
         document_symbol_provider=lsp.DocumentSymbolOptions(
             work_done_progress=True,
         ),
@@ -70,14 +78,26 @@ def get_server_capabilities() -> lsp.ServerCapabilities:
         ),
         document_formatting_provider=True,
         document_range_formatting_provider=True,
+        document_on_type_formatting_provider=lsp.DocumentOnTypeFormattingOptions(
+            first_trigger_character="\n",
+        ),
+        folding_range_provider=True,
+        selection_range_provider=True,
+        color_provider=True,
+        document_link_provider=lsp.DocumentLinkOptions(
+            resolve_provider=True,
+        ),
         code_action_provider=lsp.CodeActionOptions(
-            code_action_kinds=[lsp.CodeActionKind.RefactorRewrite],
+            code_action_kinds=[
+                lsp.CodeActionKind.QuickFix,
+                lsp.CodeActionKind.RefactorRewrite,
+            ],
         ),
         execute_command_provider=lsp.ExecuteCommandOptions(
             commands=["pynescript.convertToV6"],
         ),
         inlay_hint_provider=lsp.InlayHintOptions(
-            resolve_provider=False,
+            resolve_provider=True,
         ),
         # Legend indices must match semantic_tokens.TOKEN_TYPES order.
         semantic_tokens_provider=lsp.SemanticTokensOptions(
@@ -85,10 +105,9 @@ def get_server_capabilities() -> lsp.ServerCapabilities:
                 token_types=list(semantic_token_types()),
                 token_modifiers=list(semantic_token_modifiers()),
             ),
-            range=False,
+            range=True,
             full=True,
         ),
-        # signatureHelp intentionally omitted until a handler exists.
     )
 
 

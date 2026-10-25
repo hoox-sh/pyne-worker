@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import random
+
 from collections.abc import Sequence
 from typing import Any
 
@@ -58,9 +59,9 @@ def _sample_axis(spec: ParamSpec, rng: random.Random) -> ParamValue:
     lo = spec.min if spec.min is not None else 0.0
     hi = spec.max if spec.max is not None else lo + 1.0
     if spec.kind == "int" and (not spec.step or spec.step == 1):
-        return int(rng.randint(int(round(lo)), int(round(hi))))
+        return int(rng.randint(round(lo), round(hi)))
     if spec.step and spec.step > 0:
-        n = max(1, int(round((float(hi) - float(lo)) / float(spec.step))) + 1)
+        n = max(1, round((float(hi) - float(lo)) / float(spec.step)) + 1)
         raw = float(lo) + rng.randrange(n) * float(spec.step)
         return clamp_value(spec, raw)
     return rng.uniform(float(lo), float(hi))
@@ -133,9 +134,7 @@ class GridSampler(BaseSampler):
         # A single interpolated axis is at most 16 pts; allow that even when
         # it exceeds max_cells. Multi-axis products stay capped.
         if size < 1 or (size > self.max_cells and len(space.params) > 1):
-            raise ValueError(
-                f"grid has {size} cells (cap {self.max_cells}); use random or TPE"
-            )
+            raise ValueError(f"grid has {size} cells (cap {self.max_cells}); use random or TPE")
         points: list[dict[str, ParamValue]] = [{}]
         for spec, vals in zip(space.params, axes, strict=True):
             nxt: list[dict[str, ParamValue]] = []
@@ -200,7 +199,7 @@ class TPESampler(BaseSampler):
         if len(done) < max(2, self.n_startup):
             return self._random.suggest(space, history, rng)
         ranked = sorted(done, key=lambda t: float(t.is_score), reverse=True)
-        n_good = max(1, int(math.ceil(self.gamma * len(ranked))))
+        n_good = max(1, math.ceil(self.gamma * len(ranked)))
         good = ranked[:n_good]
         bad = ranked[n_good:] or ranked[-1:]
         best: dict[str, ParamValue] | None = None

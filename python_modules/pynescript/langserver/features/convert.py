@@ -17,7 +17,15 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Convert the active Pine document toward v6 (editor command + code action)."""
+"""Convert the active Pine document toward v6 (editor command + code action).
+
+``textDocument/codeAction`` also returns QuickFixes via
+:func:`~pynescript.langserver.features.diagnostics.create_quick_fix`:
+
+- W001 — insert ``//@version=6`` when the pragma is missing
+- W002 — replace an existing ``//@version=N`` (N < 5) with ``//@version=6``
+- C002 — whole-document format edit when lint warnings include a long line
+"""
 
 from __future__ import annotations
 
@@ -25,6 +33,8 @@ from typing import Any
 
 from lsprotocol import types as lsp
 
+from pynescript.ast.linter import LintWarning
+from pynescript.langserver.features.diagnostics import create_quick_fix
 from pynescript.util.pine_convert import convert_to_v6
 from pynescript.util.pine_convert import detect_version
 
@@ -69,25 +79,60 @@ def handle_convert_to_v6(source: str | None) -> dict[str, Any]:
 
 
 def handle_code_action(
-    params: lsp.CodeActionParams, source: str | None
+    params: lsp.CodeActionParams,
+    source: str | None,
+    warnings: list[LintWarning] | None = None,
 ) -> list[lsp.CodeAction]:
-    """Offer ``Convert to Pine v6`` when the document is older than v6."""
+    """Offer Convert-to-v6, W001/W002 version QuickFixes, and C002 format."""
     if not source:
         return []
     declared = detect_version(source)
     from_ver = 1 if declared is None else declared
-    if from_ver >= _V6:
-        return []
     uri = params.text_document.uri
-    payload = convert_payload(source)
-    title = f"Convert Pine v{from_ver} to v6"
-    edit = lsp.WorkspaceEdit(
-        changes={uri: [whole_document_edit(source, payload["source"])]},
-    )
-    return [
-        lsp.CodeAction(
-            title=title,
-            kind=lsp.CodeActionKind.RefactorRewrite,
-            edit=edit,
+    actions: list[lsp.CodeAction] = []
+    if from_ver < _V6:
+        payload = convert_payload(source)
+        title = f"Convert Pine v{from_ver} to v6"
+        edit = lsp.WorkspaceEdit(
+            changes={uri: [whole_document_edit(source, payload["source"])]},
         )
-    ]
+        actions.append(
+            lsp.CodeAction(
+                title=title,
+                kind=lsp.CodeActionKind.RefactorRewrite,
+                edit=edit,
+            )
+        )
+    if declared is None:
+        w001 = None
+        if warnings:
+            w001 = next((w for w in warnings if w.code == "W001"), None)
+        if w001 is None:
+            w001 = LintWarning(
+                code="W001",
+                message="Missing @version declaration. Add '//@version=6' at the top.",
+                line=1,
+            )
+        fix = create_quick_fix(w001, uri, source)
+        if fix is not None:
+            actions.append(fix)
+    elif declared < 5:
+        w002 = None
+        if warnings:
+            w002 = next((w for w in warnings if w.code == "W002"), None)
+        if w002 is None:
+            w002 = LintWarning(
+                code="W002",
+                message=f"Pine Script v{declared} is deprecated. Consider upgrading to v6.",
+                line=1,
+            )
+        fix = create_quick_fix(w002, uri, source)
+        if fix is not None:
+            actions.append(fix)
+    if warnings:
+        c002 = next((w for w in warnings if w.code == "C002"), None)
+        if c002 is not None:
+            fix = create_quick_fix(c002, uri, source)
+            if fix is not None:
+                actions.append(fix)
+    return actions

@@ -208,8 +208,8 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
     def _builtin_matrix_new(self, args: list[Any]) -> Matrix[Any]:
         """matrix.new() | matrix.new(rows, cols, default_value?) -> Matrix.
 
-        Zero-arg form creates an empty 0×0 matrix (reference ``matrix.new<T>()``).
-        Soft: ``na`` rows/cols → empty 0×0 (unresolved size inputs).
+        Zero-arg form creates an empty 0x0 matrix (reference ``matrix.new<T>()``).
+        Soft: ``na`` rows/cols → empty 0x0 (unresolved size inputs).
         """
         if not args:
             return Matrix(0, 0, None)
@@ -240,8 +240,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
         ``na`` matrix / row / col → ``na``. Hard OOB still errors (real bounds).
         Wrong non-na type still hard-errors.
         """
-        if len(args) != TERNARY:
-            self._error("matrix.get requires matrix, row, col")
+        self._require_len(args, TERNARY, "matrix.get requires matrix, row, col")
         matrix = self._matrix_or_na(args[0], "matrix.get: first arg must be matrix")
         if matrix is None:
             return None
@@ -259,8 +258,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
         ``na`` matrix / row / col → no-op. Hard OOB still errors.
         """
-        if len(args) != QUATERNARY:
-            self._error("matrix.set requires matrix, row, col, value")
+        self._require_len(args, QUATERNARY, "matrix.set requires matrix, row, col, value")
         matrix = self._matrix_or_na(args[0], "matrix.set: first arg must be matrix")
         if matrix is None:
             return None
@@ -277,8 +275,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_rows(self, args: list[Any]) -> int | None:
         """matrix.rows(matrix) -> int; ``na`` → ``na``."""
-        if len(args) != UNARY:
-            self._error("matrix.rows requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.rows requires one matrix argument")
         matrix = self._matrix_or_na(args[0], "matrix.rows: arg must be matrix")
         if matrix is None:
             return None
@@ -286,8 +283,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_columns(self, args: list[Any]) -> int | None:
         """matrix.columns(matrix) -> int; ``na`` → ``na``."""
-        if len(args) != UNARY:
-            self._error("matrix.columns requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.columns requires one matrix argument")
         matrix = self._matrix_or_na(args[0], "matrix.columns: arg must be matrix")
         if matrix is None:
             return None
@@ -295,8 +291,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_elements_count(self, args: list[Any]) -> int | None:
         """matrix.elements_count(matrix) -> int; ``na`` → ``na``."""
-        if len(args) != UNARY:
-            self._error("matrix.elements_count requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.elements_count requires one matrix argument")
         matrix = self._matrix_or_na(args[0], "matrix.elements_count: arg must be matrix")
         if matrix is None:
             return None
@@ -329,9 +324,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             # (matrix, row_index, array)
             row_index = self._expect_int(args[UNARY], "matrix.add_row: row index must be int")
             row_data = (
-                args[2]
-                if isinstance(args[2], list)
-                else self._expect_list(args[2], "matrix.add_row: array required")
+                args[2] if isinstance(args[2], list) else self._expect_list(args[2], "matrix.add_row: array required")
             )
         else:
             self._error("matrix.add_row requires matrix and optional row data")
@@ -343,8 +336,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_remove_row(self, args: list[Any]) -> None:
         """matrix.remove_row(matrix, index) -> void"""
-        if len(args) != BINARY:
-            self._error("matrix.remove_row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.remove_row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.remove_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.remove_row: index must be int")
         try:
@@ -354,8 +346,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_copy_row(self, args: list[Any]) -> list[Any]:
         """matrix.copy_row(matrix, index) -> array"""
-        if len(args) != BINARY:
-            self._error("matrix.copy_row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.copy_row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.copy_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.copy_row: index must be int")
         try:
@@ -365,8 +356,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_sum_row(self, args: list[Any]) -> float:
         """matrix.sum_row(matrix, index) -> float"""
-        if len(args) != BINARY:
-            self._error("matrix.sum_row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.sum_row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.sum_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.sum_row: index must be int")
         try:
@@ -376,8 +366,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_avg_row(self, args: list[Any]) -> float:
         """matrix.avg_row(matrix, index) -> float"""
-        if len(args) != BINARY:
-            self._error("matrix.avg_row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.avg_row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.avg_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.avg_row: index must be int")
         try:
@@ -387,8 +376,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_min_row(self, args: list[Any]) -> Any:
         """matrix.min_row(matrix, index) -> value"""
-        if len(args) != BINARY:
-            self._error("matrix.min_row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.min_row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.min_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.min_row: index must be int")
         try:
@@ -398,8 +386,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_max_row(self, args: list[Any]) -> Any:
         """matrix.max_row(matrix, index) -> value"""
-        if len(args) != BINARY:
-            self._error("matrix.max_row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.max_row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.max_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.max_row: index must be int")
         try:
@@ -409,8 +396,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_mode_row(self, args: list[Any]) -> Any:
         """matrix.mode_row(matrix, index) -> value"""
-        if len(args) != BINARY:
-            self._error("matrix.mode_row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.mode_row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.mode_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.mode_row: index must be int")
         try:
@@ -420,8 +406,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_fill_row(self, args: list[Any]) -> None:
         """matrix.fill_row(matrix, index, value) -> void"""
-        if len(args) != TERNARY:
-            self._error("matrix.fill_row requires matrix, index, value")
+        self._require_len(args, TERNARY, "matrix.fill_row requires matrix, index, value")
         matrix = self._expect_matrix(args[0], "matrix.fill_row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.fill_row: index must be int")
         value = args[BINARY]
@@ -450,9 +435,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
         elif len(args) >= 3:
             col_index = self._expect_int(args[UNARY], "matrix.add_col: column index must be int")
             col_data = (
-                args[2]
-                if isinstance(args[2], list)
-                else self._expect_list(args[2], "matrix.add_col: array required")
+                args[2] if isinstance(args[2], list) else self._expect_list(args[2], "matrix.add_col: array required")
             )
         else:
             self._error("matrix.add_col requires matrix and optional column data")
@@ -464,8 +447,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_remove_col(self, args: list[Any]) -> None:
         """matrix.remove_col(matrix, index) -> void"""
-        if len(args) != BINARY:
-            self._error("matrix.remove_col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.remove_col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.remove_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.remove_col: index must be int")
         try:
@@ -475,8 +457,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_copy_col(self, args: list[Any]) -> list[Any]:
         """matrix.copy_col(matrix, index) -> array"""
-        if len(args) != BINARY:
-            self._error("matrix.copy_col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.copy_col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.copy_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.copy_col: index must be int")
         try:
@@ -486,8 +467,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_sum_col(self, args: list[Any]) -> float:
         """matrix.sum_col(matrix, index) -> float"""
-        if len(args) != BINARY:
-            self._error("matrix.sum_col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.sum_col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.sum_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.sum_col: index must be int")
         try:
@@ -497,8 +477,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_avg_col(self, args: list[Any]) -> float:
         """matrix.avg_col(matrix, index) -> float"""
-        if len(args) != BINARY:
-            self._error("matrix.avg_col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.avg_col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.avg_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.avg_col: index must be int")
         try:
@@ -508,8 +487,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_min_col(self, args: list[Any]) -> Any:
         """matrix.min_col(matrix, index) -> value"""
-        if len(args) != BINARY:
-            self._error("matrix.min_col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.min_col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.min_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.min_col: index must be int")
         try:
@@ -519,8 +497,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_max_col(self, args: list[Any]) -> Any:
         """matrix.max_col(matrix, index) -> value"""
-        if len(args) != BINARY:
-            self._error("matrix.max_col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.max_col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.max_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.max_col: index must be int")
         try:
@@ -530,8 +507,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_mode_col(self, args: list[Any]) -> Any:
         """matrix.mode_col(matrix, index) -> value"""
-        if len(args) != BINARY:
-            self._error("matrix.mode_col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.mode_col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.mode_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.mode_col: index must be int")
         try:
@@ -541,8 +517,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_fill_col(self, args: list[Any]) -> None:
         """matrix.fill_col(matrix, index, value) -> void"""
-        if len(args) != TERNARY:
-            self._error("matrix.fill_col requires matrix, index, value")
+        self._require_len(args, TERNARY, "matrix.fill_col requires matrix, index, value")
         matrix = self._expect_matrix(args[0], "matrix.fill_col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.fill_col: index must be int")
         value = args[BINARY]
@@ -555,36 +530,31 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_sum_all(self, args: list[Any]) -> float:
         """matrix.sum_all(matrix) -> float"""
-        if len(args) != UNARY:
-            self._error("matrix.sum_all requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.sum_all requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.sum_all: arg must be matrix")
         return matrix.sum_all()
 
     def _builtin_matrix_avg_all(self, args: list[Any]) -> float:
         """matrix.avg_all(matrix) -> float"""
-        if len(args) != UNARY:
-            self._error("matrix.avg_all requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.avg_all requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.avg_all: arg must be matrix")
         return matrix.avg_all()
 
     def _builtin_matrix_min_all(self, args: list[Any]) -> Any:
         """matrix.min_all(matrix) -> value"""
-        if len(args) != UNARY:
-            self._error("matrix.min_all requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.min_all requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.min_all: arg must be matrix")
         return matrix.min_all()
 
     def _builtin_matrix_max_all(self, args: list[Any]) -> Any:
         """matrix.max_all(matrix) -> value"""
-        if len(args) != UNARY:
-            self._error("matrix.max_all requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.max_all requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.max_all: arg must be matrix")
         return matrix.max_all()
 
     def _builtin_matrix_mode_all(self, args: list[Any]) -> Any:
         """matrix.mode_all(matrix) -> value"""
-        if len(args) != UNARY:
-            self._error("matrix.mode_all requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.mode_all requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.mode_all: arg must be matrix")
         return matrix.mode_all()
 
@@ -593,7 +563,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
     def _builtin_matrix_fill(self, args: list[Any]) -> None:
         """matrix.fill(id, value[, from_row, to_row, from_column, to_column]) -> void.
 
-        reference region form uses half-open ``[from_row, to_row)`` × ``[from_col, to_col)``.
+        reference region form uses half-open ``[from_row, to_row)`` x ``[from_col, to_col)``.
         ``na`` matrix → no-op; ``na`` region bound → full extent for that edge.
         """
         n = len(args)
@@ -624,8 +594,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_fill_diagonal(self, args: list[Any]) -> None:
         """matrix.fill_diagonal(matrix, value) -> void"""
-        if len(args) != BINARY:
-            self._error("matrix.fill_diagonal requires matrix and value")
+        self._require_len(args, BINARY, "matrix.fill_diagonal requires matrix and value")
         matrix = self._expect_matrix(args[0], "matrix.fill_diagonal: first arg must be matrix")
         value = args[UNARY]
         matrix.fill_diagonal(value)
@@ -634,29 +603,25 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_transpose(self, args: list[Any]) -> Matrix[Any]:
         """matrix.transpose(matrix) -> Matrix"""
-        if len(args) != UNARY:
-            self._error("matrix.transpose requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.transpose requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.transpose: arg must be matrix")
         return matrix.transpose()
 
     def _builtin_matrix_reverse_rows(self, args: list[Any]) -> None:
         """matrix.reverse_rows(matrix) -> void"""
-        if len(args) != UNARY:
-            self._error("matrix.reverse_rows requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.reverse_rows requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.reverse_rows: arg must be matrix")
         matrix.reverse_rows()
 
     def _builtin_matrix_reverse_cols(self, args: list[Any]) -> None:
         """matrix.reverse_cols(matrix) -> void"""
-        if len(args) != UNARY:
-            self._error("matrix.reverse_cols requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.reverse_cols requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.reverse_cols: arg must be matrix")
         matrix.reverse_cols()
 
     def _builtin_matrix_reshape(self, args: list[Any]) -> Matrix[Any]:
         """matrix.reshape(matrix, rows, cols) -> Matrix"""
-        if len(args) != TERNARY:
-            self._error("matrix.reshape requires matrix, rows, cols")
+        self._require_len(args, TERNARY, "matrix.reshape requires matrix, rows, cols")
         matrix = self._expect_matrix(args[0], "matrix.reshape: first arg must be matrix")
         rows = self._expect_int(args[UNARY], "matrix.reshape: rows must be int")
         cols = self._expect_int(args[BINARY], "matrix.reshape: cols must be int")
@@ -679,16 +644,14 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_matrix_copy(self, args: list[Any]) -> Matrix[Any]:
         """matrix.copy(matrix) -> Matrix"""
-        if len(args) != UNARY:
-            self._error("matrix.copy requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.copy requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.copy: arg must be matrix")
         return matrix.copy()
 
     # ========== OFFICIAL reference v6 SURFACE ==========
 
     def _builtin_matrix_row(self, args: list[Any]) -> list[Any]:
-        if len(args) != BINARY:
-            self._error("matrix.row requires matrix and index")
+        self._require_len(args, BINARY, "matrix.row requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.row: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.row: index must be int")
         try:
@@ -697,8 +660,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.row: {e}")
 
     def _builtin_matrix_col(self, args: list[Any]) -> list[Any]:
-        if len(args) != BINARY:
-            self._error("matrix.col requires matrix and index")
+        self._require_len(args, BINARY, "matrix.col requires matrix and index")
         matrix = self._expect_matrix(args[0], "matrix.col: first arg must be matrix")
         index = self._expect_int(args[UNARY], "matrix.col: index must be int")
         try:
@@ -720,8 +682,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.submatrix: {e}")
 
     def _builtin_matrix_swap_rows(self, args: list[Any]) -> None:
-        if len(args) != TERNARY:
-            self._error("matrix.swap_rows requires matrix, row1, row2")
+        self._require_len(args, TERNARY, "matrix.swap_rows requires matrix, row1, row2")
         matrix = self._expect_matrix(args[0], "matrix.swap_rows: first arg must be matrix")
         r1 = self._expect_int(args[UNARY], "matrix.swap_rows: row1 must be int")
         r2 = self._expect_int(args[BINARY], "matrix.swap_rows: row2 must be int")
@@ -731,8 +692,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.swap_rows: {e}")
 
     def _builtin_matrix_swap_columns(self, args: list[Any]) -> None:
-        if len(args) != TERNARY:
-            self._error("matrix.swap_columns requires matrix, col1, col2")
+        self._require_len(args, TERNARY, "matrix.swap_columns requires matrix, col1, col2")
         matrix = self._expect_matrix(args[0], "matrix.swap_columns: first arg must be matrix")
         c1 = self._expect_int(args[UNARY], "matrix.swap_columns: col1 must be int")
         c2 = self._expect_int(args[BINARY], "matrix.swap_columns: col2 must be int")
@@ -742,8 +702,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.swap_columns: {e}")
 
     def _builtin_matrix_reverse(self, args: list[Any]) -> None:
-        if len(args) != UNARY:
-            self._error("matrix.reverse requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.reverse requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.reverse: arg must be matrix")
         matrix.reverse()
 
@@ -774,20 +733,17 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.sort_indices: {e}")
 
     def _builtin_matrix_median(self, args: list[Any]) -> float | None:
-        if len(args) != UNARY:
-            self._error("matrix.median requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.median requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.median: arg must be matrix")
         return matrix.median()
 
     def _builtin_matrix_stdev(self, args: list[Any]) -> float | None:
-        if len(args) != UNARY:
-            self._error("matrix.stdev requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.stdev requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.stdev: arg must be matrix")
         return matrix.stdev()
 
     def _builtin_matrix_variance(self, args: list[Any]) -> float | None:
-        if len(args) != UNARY:
-            self._error("matrix.variance requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.variance requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.variance: arg must be matrix")
         return matrix.variance()
 
@@ -806,8 +762,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
         self._error("matrix.sum requires one or two matrix arguments")
 
     def _builtin_matrix_diff(self, args: list[Any]) -> Matrix[Any]:
-        if len(args) != BINARY:
-            self._error("matrix.diff requires two matrices")
+        self._require_len(args, BINARY, "matrix.diff requires two matrices")
         m1 = self._expect_matrix(args[0], "matrix.diff: first arg must be matrix")
         m2 = self._expect_matrix(args[UNARY], "matrix.diff: second arg must be matrix")
         try:
@@ -816,8 +771,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.diff: {e}")
 
     def _builtin_matrix_mult(self, args: list[Any]) -> Any:
-        if len(args) != BINARY:
-            self._error("matrix.mult requires two arguments")
+        self._require_len(args, BINARY, "matrix.mult requires two arguments")
         m1 = self._expect_matrix(args[0], "matrix.mult: first arg must be matrix")
         other = args[UNARY]
         try:
@@ -826,8 +780,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.mult: {e}")
 
     def _builtin_matrix_det(self, args: list[Any]) -> float:
-        if len(args) != UNARY:
-            self._error("matrix.det requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.det requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.det: arg must be matrix")
         try:
             return matrix.det()
@@ -835,8 +788,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.det: {e}")
 
     def _builtin_matrix_inv(self, args: list[Any]) -> Matrix[Any]:
-        if len(args) != UNARY:
-            self._error("matrix.inv requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.inv requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.inv: arg must be matrix")
         try:
             return matrix.inv()
@@ -844,8 +796,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.inv: {e}")
 
     def _builtin_matrix_pinv(self, args: list[Any]) -> Matrix[Any]:
-        if len(args) != UNARY:
-            self._error("matrix.pinv requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.pinv requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.pinv: arg must be matrix")
         try:
             return matrix.pinv()
@@ -853,8 +804,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.pinv: {e}")
 
     def _builtin_matrix_eigenvalues(self, args: list[Any]) -> list[float]:
-        if len(args) != UNARY:
-            self._error("matrix.eigenvalues requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.eigenvalues requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.eigenvalues: arg must be matrix")
         try:
             return matrix.eigenvalues()
@@ -862,8 +812,7 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.eigenvalues: {e}")
 
     def _builtin_matrix_eigenvectors(self, args: list[Any]) -> Matrix[Any]:
-        if len(args) != UNARY:
-            self._error("matrix.eigenvectors requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.eigenvectors requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.eigenvectors: arg must be matrix")
         try:
             return matrix.eigenvectors()
@@ -871,15 +820,13 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.eigenvectors: {e}")
 
     def _builtin_matrix_kron(self, args: list[Any]) -> Matrix[Any]:
-        if len(args) != BINARY:
-            self._error("matrix.kron requires two matrices")
+        self._require_len(args, BINARY, "matrix.kron requires two matrices")
         m1 = self._expect_matrix(args[0], "matrix.kron: first arg must be matrix")
         m2 = self._expect_matrix(args[UNARY], "matrix.kron: second arg must be matrix")
         return m1.kron(m2)
 
     def _builtin_matrix_pow(self, args: list[Any]) -> Matrix[Any]:
-        if len(args) != BINARY:
-            self._error("matrix.pow requires matrix and exponent")
+        self._require_len(args, BINARY, "matrix.pow requires matrix and exponent")
         matrix = self._expect_matrix(args[0], "matrix.pow: first arg must be matrix")
         n = self._expect_int(args[UNARY], "matrix.pow: exponent must be int")
         try:
@@ -888,65 +835,53 @@ class MatrixBuiltinsMixin(BuiltinDispatchMixin):
             self._error(f"matrix.pow: {e}")
 
     def _builtin_matrix_trace(self, args: list[Any]) -> float:
-        if len(args) != UNARY:
-            self._error("matrix.trace requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.trace requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.trace: arg must be matrix")
         return matrix.trace()
 
     def _builtin_matrix_rank(self, args: list[Any]) -> int:
-        if len(args) != UNARY:
-            self._error("matrix.rank requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.rank requires one matrix argument")
         matrix = self._expect_matrix(args[0], "matrix.rank: arg must be matrix")
         return matrix.rank()
 
     def _builtin_matrix_is_square(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_square requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_square requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_square").is_square()
 
     def _builtin_matrix_is_zero(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_zero requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_zero requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_zero").is_zero()
 
     def _builtin_matrix_is_identity(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_identity requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_identity requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_identity").is_identity()
 
     def _builtin_matrix_is_diagonal(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_diagonal requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_diagonal requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_diagonal").is_diagonal()
 
     def _builtin_matrix_is_antidiagonal(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_antidiagonal requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_antidiagonal requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_antidiagonal").is_antidiagonal()
 
     def _builtin_matrix_is_symmetric(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_symmetric requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_symmetric requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_symmetric").is_symmetric()
 
     def _builtin_matrix_is_antisymmetric(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_antisymmetric requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_antisymmetric requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_antisymmetric").is_antisymmetric()
 
     def _builtin_matrix_is_triangular(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_triangular requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_triangular requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_triangular").is_triangular()
 
     def _builtin_matrix_is_binary(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_binary requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_binary requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_binary").is_binary()
 
     def _builtin_matrix_is_stochastic(self, args: list[Any]) -> bool:
-        if len(args) != UNARY:
-            self._error("matrix.is_stochastic requires one matrix argument")
+        self._require_len(args, UNARY, "matrix.is_stochastic requires one matrix argument")
         return self._expect_matrix(args[0], "matrix.is_stochastic").is_stochastic()
 
 

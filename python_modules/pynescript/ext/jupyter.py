@@ -48,13 +48,13 @@ def load_ipython_extension(ipython: Any) -> None:
         ipython: IPython instance
     """
     try:
-        from IPython.core.magic import register_cell_magic  # noqa: PLC0415 - optional dep lazy
+        from IPython.core.magic import register_cell_magic  # optional dep lazy
     except ImportError:
         msg = "IPython is required for Jupyter integration"
         raise ImportError(msg)  # noqa: B904
 
     @register_cell_magic
-    def pinescript(line: str, cell: str) -> None:  # noqa: ARG001
+    def pinescript(line: str, cell: str) -> None:
         """Run Pine Script code and display results.
 
         Usage:
@@ -157,7 +157,7 @@ def evaluate_indicator(
         ... '''
         >>> result = evaluate_indicator(code, data)
     """
-    from pynescript.ast.evaluator import NodeLiteralEvaluator  # noqa: PLC0415 - avoid potential circular at top
+    from pynescript.ast.evaluator import NodeLiteralEvaluator  # avoid potential circular at top
 
     context = {
         "close": data["close"],
@@ -193,8 +193,7 @@ def display_indicator_table(
         IPython display object
     """
     try:
-        import pandas as pd  # noqa: PLC0415 - optional dep, lazy import inside func
-
+        import pandas as pd  # optional dep, lazy import inside func
 
         df = pd.DataFrame(data)
         if columns:

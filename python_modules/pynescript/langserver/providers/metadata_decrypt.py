@@ -49,7 +49,8 @@ import os
 import sys
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
+from typing import cast
 
 
 _PROVIDERS_DIR = Path(__file__).parent
@@ -66,7 +67,7 @@ def _get_fernet_key() -> bytes:
         return _fernet_key
 
     if getattr(sys, "_MEIPASS", None):
-        _key_file = Path(getattr(sys, "_MEIPASS")) / "pynescript" / "langserver" / "providers" / ".metadata.key"
+        _key_file = Path(sys._MEIPASS) / "pynescript" / "langserver" / "providers" / ".metadata.key"
     else:
         _key_file = _PROVIDERS_DIR / ".metadata.key"
 

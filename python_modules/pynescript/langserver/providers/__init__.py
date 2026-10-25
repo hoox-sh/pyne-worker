@@ -28,3 +28,5 @@ Modules:
 Feature handlers (completion, hover, inlay types) import these modules by name;
 this package does not re-export.
 """
+
+from __future__ import annotations

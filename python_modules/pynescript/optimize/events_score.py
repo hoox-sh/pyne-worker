@@ -20,7 +20,7 @@
 """Pair Runtime strategy events into closed trades + :class:`StrategyStats`.
 
 Mirrors AXIS ``buildStrategyReport`` enough for HPO scoring: entry/exit
-pairing by id, money PnL from prices × qty, max drawdown on cumulative
+pairing by id, money PnL from prices x qty, max drawdown on cumulative
 equity. Uses bar close (``ohlc[3]``) as the fill when no explicit price.
 """
 
@@ -135,8 +135,7 @@ def build_strategy_stats(
     ) -> None:
         open_qty = float(o["qty"])
         qty = close_qty if close_qty > 0 else open_qty
-        if qty > open_qty:
-            qty = open_qty
+        qty = min(qty, open_qty)
         if qty <= 0:
             return
         leftover = open_qty - qty
@@ -207,11 +206,7 @@ def build_strategy_stats(
         if "entry" in kind or kind in {"long", "short"}:
             open_one(eid, ev, p, t, kind)
             continue
-        if not (
-            "close" in kind
-            or "exit" in kind
-            or kind in {"closelong", "closeshort"}
-        ):
+        if not ("close" in kind or "exit" in kind or kind in {"closelong", "closeshort"}):
             continue
         if ev.get("qty") == 0:
             continue
@@ -245,11 +240,9 @@ def build_strategy_stats(
     max_dd = 0.0
     for x in pnls:
         equity += x
-        if equity > peak:
-            peak = equity
+        peak = max(peak, equity)
         dd = (peak - equity) / max(1.0, abs(peak) + 1.0)
-        if dd > max_dd:
-            max_dd = dd
+        max_dd = max(max_dd, dd)
     n = len(pnls)
     return StrategyStats(
         total_pnl=total,

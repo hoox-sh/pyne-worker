@@ -277,8 +277,7 @@ class TechnicalAnalysisMixin(
         if hasattr(self, "_builtin_math_sum"):
             return self._builtin_math_sum(args)
         # Fallback if numeric mixin not composed (should not happen)
-        if len(args) != 2:
-            self._error("ta.sum takes source and length")  # type: ignore[attr-defined]
+        self._require_len(args, 2, "ta.sum takes source and length")
         series, length = args[0], args[1]
         if hasattr(series, "history"):
             series = list(reversed(series.history))

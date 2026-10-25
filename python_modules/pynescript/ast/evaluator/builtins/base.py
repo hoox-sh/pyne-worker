@@ -28,7 +28,7 @@ Mixin composition
 Each category module (``numeric``, ``arrays``, ``technical``, …) subclasses
 :class:`BuiltinDispatchMixin` and exposes a ``_*_builtin_map()`` method. Those
 maps are merged by :class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`
-into a single name→handler table used by the expression evaluator’s
+into a single name→handler table used by the expression evaluator's
 ``_call_builtin`` path. Keyword-argument merging and list-style vs plain
 ``*args`` handlers are resolved here so individual mixins stay thin.
 """
@@ -213,6 +213,7 @@ def pine_period_or_none(value: Any, message: str, error: Callable[[str], NoRetur
         except ValueError:
             return None
     return pine_expect_int(unwrapped, message, error)
+
 
 # reference Pine keyword parameter names for list-style ``ta.*`` handlers.
 # Used when the Python handler is ``(self, args)`` and has no real param names.
@@ -528,6 +529,16 @@ class BuiltinDispatchMixin:
     @staticmethod
     def _error(message: str) -> NoReturn:
         raise ValueError(message)
+
+    def _require_len(self, args: list[Any], expected: int, message: str) -> None:
+        """Assert an exact positional-argument count for a builtin handler.
+
+        Canonical arity guard: lives on the dispatch base next to ``_error``
+        so every category mixin can use it without importing a sibling, and
+        so the message is the only thing a handler has to spell out.
+        """
+        if len(args) != expected:
+            self._error(message)
 
     def _expect_int(self, value: Any, message: str) -> int:
         """Canonical int coerce for builtins (periods, offsets, indices).

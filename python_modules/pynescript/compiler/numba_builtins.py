@@ -447,14 +447,14 @@ def _register_njit_overload(py_fn, jit_fn):
 
     if n == 1:
 
-        def ol(val):  # noqa: ARG001
+        def ol(val):
             def impl(val):
                 return jit_fn(val)
 
             return impl
     else:
 
-        def ol(a, b):  # noqa: ARG001
+        def ol(a, b):
             def impl(a, b):
                 return jit_fn(a, b)
 
@@ -607,6 +607,20 @@ def numba_store_src(dst, val, i):
     else:
         dst[i] = v
     return dst
+
+
+@numba.njit(cache=True)
+def numba_history_store(arr, i, value, off):
+    """Store this bar's value and return the value ``off`` bars back.
+
+    ``ta.sma(close, 5)[1]`` and ``ta.lowest(src, len)[off]`` have no named
+    series. The subscript writes the current result, then reads the offset.
+    """
+    arr[i] = value + 0.0
+    j = i - off
+    if j < 0 or j >= arr.shape[0]:
+        return np.nan
+    return arr[j]
 
 
 @numba.njit(cache=True)
@@ -818,7 +832,7 @@ def numba_valuewhen(cond_arr, src_arr, occ, i):
     return _valuewhen_py(cond_arr, src_arr, occ, i)
 
 
-def _ol_numba_valuewhen(cond_arr, src_arr, occ, i):  # noqa: ARG001
+def _ol_numba_valuewhen(cond_arr, src_arr, occ, i):
     def impl(cond_arr, src_arr, occ, i):
         return _numba_valuewhen_jit(cond_arr, src_arr, occ, i)
 
@@ -844,7 +858,14 @@ def _numba_pivothigh_jit(arr, left, right, i):
     for j in range(c - left, c + right + 1):
         if j == c:
             continue
-        if arr[j] >= val:
+        other = arr[j]
+        if np.isnan(other):
+            continue
+        # Tie on the left still confirms; the right side must be strictly lower.
+        if j < c:
+            if other > val:
+                return np.nan
+        elif other >= val:
             return np.nan
     return val
 
@@ -860,7 +881,7 @@ def numba_pivothigh(arr, left, right, i):
     return _numba_pivothigh_jit(arr, int(fl), int(fr), i)
 
 
-def _ol_numba_pivothigh(arr, left, right, i):  # noqa: ARG001
+def _ol_numba_pivothigh(arr, left, right, i):
     def impl(arr, left, right, i):
         return _numba_pivothigh_jit(arr, left, right, i)
 
@@ -886,7 +907,14 @@ def _numba_pivotlow_jit(arr, left, right, i):
     for j in range(c - left, c + right + 1):
         if j == c:
             continue
-        if arr[j] <= val:
+        other = arr[j]
+        if np.isnan(other):
+            continue
+        # Tie on the left still confirms; the right side must be strictly higher.
+        if j < c:
+            if other < val:
+                return np.nan
+        elif other <= val:
             return np.nan
     return val
 
@@ -902,7 +930,7 @@ def numba_pivotlow(arr, left, right, i):
     return _numba_pivotlow_jit(arr, int(fl), int(fr), i)
 
 
-def _ol_numba_pivotlow(arr, left, right, i):  # noqa: ARG001
+def _ol_numba_pivotlow(arr, left, right, i):
     def impl(arr, left, right, i):
         return _numba_pivotlow_jit(arr, left, right, i)
 
@@ -932,10 +960,8 @@ def numba_stoch(source, high, low, length, i):
         l = low[i - j]
         if np.isnan(h) or np.isnan(l):
             return np.nan
-        if h > hh:
-            hh = h
-        if l < ll:
-            ll = l
+        hh = max(hh, h)
+        ll = min(ll, l)
     if hh == ll:
         return 50.0
     return 100.0 * (source[i] - ll) / (hh - ll)
@@ -1004,8 +1030,7 @@ def numba_sar(high, low, start, increment, maximum, i):
             if hi > ep:
                 ep = hi
                 af = af + increment
-                if af > maximum:
-                    af = maximum
+                af = min(af, maximum)
             if sar > lo:
                 trend = -1
                 sar = ep
@@ -1016,8 +1041,7 @@ def numba_sar(high, low, start, increment, maximum, i):
             if lo < ep:
                 ep = lo
                 af = af + increment
-                if af > maximum:
-                    af = maximum
+                af = min(af, maximum)
             if sar < hi:
                 trend = 1
                 sar = ep
@@ -1052,10 +1076,8 @@ def numba_percentile_nearest_rank(arr, length, percentage, i):
         window[b + 1] = key
     # Nearest rank: ceil(p/100 * n), 1-indexed
     rank = int((percentage / 100.0) * count + 0.999999)
-    if rank < 1:
-        rank = 1
-    if rank > count:
-        rank = count
+    rank = max(rank, 1)
+    rank = min(rank, count)
     return window[rank - 1]
 
 
@@ -1564,11 +1586,9 @@ def numba_hma(arr, length, i):
     if length <= 0 or i < length - 1:
         return np.nan
     half = length // 2
-    if half < 1:
-        half = 1
+    half = max(half, 1)
     sqrt_n = int(np.sqrt(float(length)))
-    if sqrt_n < 1:
-        sqrt_n = 1
+    sqrt_n = max(sqrt_n, 1)
     # Full WMA needs ``length`` bars at each of last sqrt_n ends
     if i < length + sqrt_n - 2:
         return np.nan
@@ -1623,11 +1643,9 @@ def numba_hma_inc(arr, length, i, st, raw):
     if length <= 0 or i < 0:
         return np.nan
     half = length // 2
-    if half < 1:
-        half = 1
+    half = max(half, 1)
     sqrt_n = int(np.sqrt(float(length)))
-    if sqrt_n < 1:
-        sqrt_n = 1
+    sqrt_n = max(sqrt_n, 1)
     half_tw = half * (half + 1) / 2.0
     full_tw = length * (length + 1) / 2.0
     outer_tw = sqrt_n * (sqrt_n + 1) / 2.0
@@ -2240,6 +2258,88 @@ def chart_timezone():
     return _CHART_TIMEZONE
 
 
+# Host chart timeframe for compile-mode ``timeframe.*``. Read at run time, so
+# the generated code (and its source-keyed caches) stays timeframe-agnostic.
+_CHART_TF_FLAGS: dict = {}
+
+
+def set_chart_timeframe(period=None):
+    """Install the chart timeframe for the next compiled run; ``None`` is a daily chart."""
+    global _CHART_TF_FLAGS
+    from pynescript.ast.evaluator.builtins.timeframe import _period_flags
+
+    p = "" if period is None else str(period).strip()
+    _CHART_TF_FLAGS = _period_flags(p or "1D")
+
+
+def chart_timeframe(attr):
+    """Pine ``timeframe.<attr>`` of the chart (``period``, ``multiplier``, ``isdaily``, …)."""
+    if not _CHART_TF_FLAGS:
+        set_chart_timeframe()
+    return _CHART_TF_FLAGS[attr]
+
+
+def chart_timeframe_in_seconds(timeframe_str=None):
+    """Pine ``timeframe.in_seconds(tf)``; *tf* defaults to the chart period."""
+    from pynescript.ast.evaluator.builtins.timeframe import timeframe_in_seconds
+
+    tf = "" if timeframe_str is None else str(timeframe_str).strip()
+    return float(timeframe_in_seconds(tf or chart_timeframe("period")))
+
+
+def chart_timeframe_from_seconds(seconds):
+    """Pine ``timeframe.from_seconds(seconds)`` (same helper as interpret)."""
+    from pynescript.ast.evaluator.builtins.timeframe import timeframe_from_seconds
+
+    return timeframe_from_seconds(int(seconds))
+
+
+def compile_security_htf_value(
+    kind,
+    field,
+    offset,
+    ta_name,
+    ta_length,
+    timeframe,
+    bar_idx,
+    open_arr,
+    high_arr,
+    low_arr,
+    close_arr,
+    vol_arr,
+    time_arr,
+    gaps_on=False,
+    lookahead_on=False,
+    timezone="UTC",
+    data_feed=None,
+    data_provider=None,
+):
+    """Object-mode per-bar HTF ``request.security`` (interpret resample helpers)."""
+    from pynescript.ast.evaluator.builtins.request import compile_htf_security_value
+
+    return compile_htf_security_value(
+        kind,
+        field,
+        offset,
+        ta_name,
+        ta_length,
+        timeframe,
+        bar_idx,
+        open_arr,
+        high_arr,
+        low_arr,
+        close_arr,
+        vol_arr,
+        time_arr,
+        gaps_on=gaps_on,
+        lookahead_on=lookahead_on,
+        timezone=timezone,
+        data_feed=data_feed,
+        data_provider=data_provider,
+        symbol=chart_tickerid() or chart_ticker(),
+    )
+
+
 _RGBA_RE = re.compile(
     r"^rgba?\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*,"
     r"\s*([+-]?\d+(?:\.\d+)?)"
@@ -2268,7 +2368,7 @@ def _parse_color_rgba(base):
                 a = 255
             else:
                 af = float(m.group(4))
-                a = int(af) if af > 1.0 else int(round(af * 255.0))
+                a = int(af) if af > 1.0 else round(af * 255.0)
             return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)), max(0, min(255, a)))
         if s[0] == "#":
             h = s[1:]
@@ -2304,7 +2404,7 @@ def _parse_color_rgba(base):
 def pine_color_new(base, transp=None):
     """Pine ``color.new(base, transp)`` → interpret-style ``rgba(r, g, b, a)``.
 
-    ``transp`` is 0–100 (100 = fully transparent). Alpha uses the interpret
+    ``transp`` is 0-100 (100 = fully transparent). Alpha uses the interpret
     contract ``int(255 * (1 - transp/100))`` so bgcolor series match.
     """
     parsed = _parse_color_rgba(base)
@@ -2471,7 +2571,6 @@ def safe_list_clear(arr):
     """Clear a real list; no-op for scalars (avoids float64.clear AttributeError)."""
     if isinstance(arr, list):
         arr.clear()
-    return None
 
 
 def safe_list_pop(arr, index=None):
@@ -2618,10 +2717,8 @@ def array_fill(arr, value, index_from=None, index_to=None):
             end = int(index_to)
         except (TypeError, ValueError):
             end = n
-    if start < 0:
-        start = 0
-    if end > n:
-        end = n
+    start = max(start, 0)
+    end = min(end, n)
     if end < start:
         return arr
     for i in range(start, end):
@@ -3002,10 +3099,9 @@ def matrix_add_col(m, *rest):
 
     ncols = _matrix_ncols(m)
     insert_at = ncols if col_idx is None else max(0, min(int(col_idx), ncols))
-    for i, row in enumerate(m):
-        if not isinstance(row, list):
-            row = list(row)
-            m[i] = row
+    for i, raw_row in enumerate(m):
+        row = raw_row if isinstance(raw_row, list) else list(raw_row)
+        m[i] = row
         row.insert(insert_at, col_data[i])
     return m
 
@@ -3281,25 +3377,24 @@ def numba_atr_inc(high, low, close, period, i, st):
                     abs(low[k] - close[k - 1]),
                 )
             acc = s / period
+        elif np.isnan(acc) or last < period:
+            s = 0.0
+            for k in range(1, period + 1):
+                s += max(
+                    high[k] - low[k],
+                    abs(high[k] - close[k - 1]),
+                    abs(low[k] - close[k - 1]),
+                )
+            acc = s / period
+            for k in range(period + 1, j + 1):
+                trk = max(
+                    high[k] - low[k],
+                    abs(high[k] - close[k - 1]),
+                    abs(low[k] - close[k - 1]),
+                )
+                acc = alpha * trk + (1.0 - alpha) * acc
         else:
-            if np.isnan(acc) or last < period:
-                s = 0.0
-                for k in range(1, period + 1):
-                    s += max(
-                        high[k] - low[k],
-                        abs(high[k] - close[k - 1]),
-                        abs(low[k] - close[k - 1]),
-                    )
-                acc = s / period
-                for k in range(period + 1, j + 1):
-                    trk = max(
-                        high[k] - low[k],
-                        abs(high[k] - close[k - 1]),
-                        abs(low[k] - close[k - 1]),
-                    )
-                    acc = alpha * trk + (1.0 - alpha) * acc
-            else:
-                acc = alpha * tr + (1.0 - alpha) * acc
+            acc = alpha * tr + (1.0 - alpha) * acc
 
     st[0] = acc
     st[1] = float(i)
@@ -3560,8 +3655,7 @@ def numba_vwap_bands_inc(src, vol, anchor, mult, i, st):
         return np.nan, np.nan, np.nan
     vwap = cum_pv / cum_v
     var = cum_p2v / cum_v - vwap * vwap
-    if var < 0.0:
-        var = 0.0
+    var = max(var, 0.0)
     sd = np.sqrt(var)
     m = float(mult)
     return vwap, vwap + sd * m, vwap - sd * m
@@ -3727,25 +3821,24 @@ def numba_sma_inc(arr, period, i, st):
                 s += v
             if not ok:
                 s = np.nan
+        elif np.isnan(s):
+            s = 0.0
+            ok = True
+            for k in range(period):
+                v = arr[j - k]
+                if np.isnan(v):
+                    ok = False
+                    break
+                s += v
+            if not ok:
+                s = np.nan
         else:
-            if np.isnan(s):
-                s = 0.0
-                ok = True
-                for k in range(period):
-                    v = arr[j - k]
-                    if np.isnan(v):
-                        ok = False
-                        break
-                    s += v
-                if not ok:
-                    s = np.nan
+            old = arr[j - period]
+            new = arr[j]
+            if np.isnan(old) or np.isnan(new):
+                s = np.nan
             else:
-                old = arr[j - period]
-                new = arr[j]
-                if np.isnan(old) or np.isnan(new):
-                    s = np.nan
-                else:
-                    s = s - old + new
+                s = s - old + new
     st[0] = s
     st[1] = float(i)
     if i < period - 1 or np.isnan(s):
@@ -3782,25 +3875,24 @@ def numba_sum_inc(arr, period, i, st):
                 s += v
             if not ok:
                 s = np.nan
+        elif np.isnan(s):
+            s = 0.0
+            ok = True
+            for k in range(period):
+                v = arr[j - k]
+                if np.isnan(v):
+                    ok = False
+                    break
+                s += v
+            if not ok:
+                s = np.nan
         else:
-            if np.isnan(s):
-                s = 0.0
-                ok = True
-                for k in range(period):
-                    v = arr[j - k]
-                    if np.isnan(v):
-                        ok = False
-                        break
-                    s += v
-                if not ok:
-                    s = np.nan
+            old = arr[j - period]
+            new = arr[j]
+            if np.isnan(old) or np.isnan(new):
+                s = np.nan
             else:
-                old = arr[j - period]
-                new = arr[j]
-                if np.isnan(old) or np.isnan(new):
-                    s = np.nan
-                else:
-                    s = s - old + new
+                s = s - old + new
     st[0] = s
     st[1] = float(i)
     if i < period - 1 or np.isnan(s):
@@ -3842,30 +3934,29 @@ def numba_stdev_inc(arr, period, i, st):
             if not ok:
                 s = np.nan
                 sq = np.nan
+        elif np.isnan(s):
+            s = 0.0
+            sq = 0.0
+            ok = True
+            for k in range(period):
+                v = arr[j - k]
+                if np.isnan(v):
+                    ok = False
+                    break
+                s += v
+                sq += v * v
+            if not ok:
+                s = np.nan
+                sq = np.nan
         else:
-            if np.isnan(s):
-                s = 0.0
-                sq = 0.0
-                ok = True
-                for k in range(period):
-                    v = arr[j - k]
-                    if np.isnan(v):
-                        ok = False
-                        break
-                    s += v
-                    sq += v * v
-                if not ok:
-                    s = np.nan
-                    sq = np.nan
+            old = arr[j - period]
+            new = arr[j]
+            if np.isnan(old) or np.isnan(new):
+                s = np.nan
+                sq = np.nan
             else:
-                old = arr[j - period]
-                new = arr[j]
-                if np.isnan(old) or np.isnan(new):
-                    s = np.nan
-                    sq = np.nan
-                else:
-                    s = s - old + new
-                    sq = sq - old * old + new * new
+                s = s - old + new
+                sq = sq - old * old + new * new
     st[0] = s
     st[1] = sq
     st[2] = float(i)
@@ -3873,9 +3964,8 @@ def numba_stdev_inc(arr, period, i, st):
         return np.nan
     mean = s / period
     var = (sq - s * mean) / (period - 1)
-    if var < 0.0:
-        # floating cancellation
-        var = 0.0
+    # floating cancellation
+    var = max(var, 0.0)
     return np.sqrt(var)
 
 
@@ -3913,30 +4003,29 @@ def numba_variance_inc(arr, period, i, st):
             if not ok:
                 s = np.nan
                 sq = np.nan
+        elif np.isnan(s):
+            s = 0.0
+            sq = 0.0
+            ok = True
+            for k in range(period):
+                v = arr[j - k]
+                if np.isnan(v):
+                    ok = False
+                    break
+                s += v
+                sq += v * v
+            if not ok:
+                s = np.nan
+                sq = np.nan
         else:
-            if np.isnan(s):
-                s = 0.0
-                sq = 0.0
-                ok = True
-                for k in range(period):
-                    v = arr[j - k]
-                    if np.isnan(v):
-                        ok = False
-                        break
-                    s += v
-                    sq += v * v
-                if not ok:
-                    s = np.nan
-                    sq = np.nan
+            old = arr[j - period]
+            new = arr[j]
+            if np.isnan(old) or np.isnan(new):
+                s = np.nan
+                sq = np.nan
             else:
-                old = arr[j - period]
-                new = arr[j]
-                if np.isnan(old) or np.isnan(new):
-                    s = np.nan
-                    sq = np.nan
-                else:
-                    s = s - old + new
-                    sq = sq - old * old + new * new
+                s = s - old + new
+                sq = sq - old * old + new * new
     st[0] = s
     st[1] = sq
     st[2] = float(i)
@@ -3944,8 +4033,7 @@ def numba_variance_inc(arr, period, i, st):
         return np.nan
     mean = s / period
     var = (sq - s * mean) / (period - 1)
-    if var < 0.0:
-        var = 0.0
+    var = max(var, 0.0)
     return var
 
 
@@ -4026,31 +4114,30 @@ def numba_rsi_inc(arr, period, i, st):
                     l -= delta
             avg_gain = g / period
             avg_loss = l / period
-        else:
-            if np.isnan(avg_gain):
-                # Catch-up seed if state was lost
-                g = 0.0
-                l = 0.0
-                for k in range(1, period + 1):
-                    delta = arr[k] - arr[k - 1]
-                    if delta >= 0.0:
-                        g += delta
-                    else:
-                        l -= delta
-                avg_gain = g / period
-                avg_loss = l / period
-                for k in range(period + 1, j + 1):
-                    delta = arr[k] - arr[k - 1]
-                    gain = delta if delta >= 0.0 else 0.0
-                    loss = -delta if delta < 0.0 else 0.0
-                    avg_gain = alpha * gain + (1.0 - alpha) * avg_gain
-                    avg_loss = alpha * loss + (1.0 - alpha) * avg_loss
-            else:
-                delta = arr[j] - arr[j - 1]
+        elif np.isnan(avg_gain):
+            # Catch-up seed if state was lost
+            g = 0.0
+            l = 0.0
+            for k in range(1, period + 1):
+                delta = arr[k] - arr[k - 1]
+                if delta >= 0.0:
+                    g += delta
+                else:
+                    l -= delta
+            avg_gain = g / period
+            avg_loss = l / period
+            for k in range(period + 1, j + 1):
+                delta = arr[k] - arr[k - 1]
                 gain = delta if delta >= 0.0 else 0.0
                 loss = -delta if delta < 0.0 else 0.0
                 avg_gain = alpha * gain + (1.0 - alpha) * avg_gain
                 avg_loss = alpha * loss + (1.0 - alpha) * avg_loss
+        else:
+            delta = arr[j] - arr[j - 1]
+            gain = delta if delta >= 0.0 else 0.0
+            loss = -delta if delta < 0.0 else 0.0
+            avg_gain = alpha * gain + (1.0 - alpha) * avg_gain
+            avg_loss = alpha * loss + (1.0 - alpha) * avg_loss
     st[0] = avg_gain
     st[1] = avg_loss
     st[2] = float(i)
@@ -4287,33 +4374,32 @@ def numba_vwma_inc(src, vol, length, i, st):
             if not ok:
                 sp = np.nan
                 sv = np.nan
+        elif np.isnan(sp):
+            sp = 0.0
+            sv = 0.0
+            ok = True
+            for k in range(length):
+                p = src[j - k]
+                v = vol[j - k]
+                if np.isnan(p) or np.isnan(v):
+                    ok = False
+                    break
+                sp += p * v
+                sv += v
+            if not ok:
+                sp = np.nan
+                sv = np.nan
         else:
-            if np.isnan(sp):
-                sp = 0.0
-                sv = 0.0
-                ok = True
-                for k in range(length):
-                    p = src[j - k]
-                    v = vol[j - k]
-                    if np.isnan(p) or np.isnan(v):
-                        ok = False
-                        break
-                    sp += p * v
-                    sv += v
-                if not ok:
-                    sp = np.nan
-                    sv = np.nan
+            po = src[j - length]
+            vo = vol[j - length]
+            pn = src[j]
+            vn = vol[j]
+            if np.isnan(po) or np.isnan(vo) or np.isnan(pn) or np.isnan(vn):
+                sp = np.nan
+                sv = np.nan
             else:
-                po = src[j - length]
-                vo = vol[j - length]
-                pn = src[j]
-                vn = vol[j]
-                if np.isnan(po) or np.isnan(vo) or np.isnan(pn) or np.isnan(vn):
-                    sp = np.nan
-                    sv = np.nan
-                else:
-                    sp = sp - po * vo + pn * vn
-                    sv = sv - vo + vn
+                sp = sp - po * vo + pn * vn
+                sv = sv - vo + vn
     st[0] = sp
     st[1] = sv
     st[2] = float(i)
@@ -4344,8 +4430,7 @@ def numba_stoch_inc(source, high, low, length, i, st):
     li = -1 if np.isnan(st[3]) else int(st[3])
     for j in range(last + 1, i + 1):
         start = j - length + 1
-        if start < 0:
-            start = 0
+        start = max(start, 0)
         # high max
         if j == 0 or np.isnan(hh) or hi < start:
             hh = high[start]
@@ -4430,33 +4515,32 @@ def numba_wma_inc(arr, length, i, st):
             if not ok:
                 s = np.nan
                 ws = np.nan
+        elif np.isnan(s):
+            s = 0.0
+            ws = 0.0
+            ok = True
+            for k in range(length):
+                v = arr[j - length + 1 + k]
+                if np.isnan(v):
+                    ok = False
+                    break
+                s += v
+                ws += v * (k + 1)
+            if not ok:
+                s = np.nan
+                ws = np.nan
         else:
-            if np.isnan(s):
-                s = 0.0
-                ws = 0.0
-                ok = True
-                for k in range(length):
-                    v = arr[j - length + 1 + k]
-                    if np.isnan(v):
-                        ok = False
-                        break
-                    s += v
-                    ws += v * (k + 1)
-                if not ok:
-                    s = np.nan
-                    ws = np.nan
+            old = arr[j - length]
+            new = arr[j]
+            if np.isnan(old) or np.isnan(new):
+                s = np.nan
+                ws = np.nan
             else:
-                old = arr[j - length]
-                new = arr[j]
-                if np.isnan(old) or np.isnan(new):
-                    s = np.nan
-                    ws = np.nan
-                else:
-                    # Drop oldest (weight 1), demote remaining weights by 1, add new at length
-                    # ws_new = ws - old*1 - (s - old) + new*length
-                    # = ws - old - s + old + new*length = ws - s + new*length
-                    ws = ws - s + new * length
-                    s = s - old + new
+                # Drop oldest (weight 1), demote remaining weights by 1, add new at length
+                # ws_new = ws - old*1 - (s - old) + new*length
+                # = ws - old - s + old + new*length = ws - s + new*length
+                ws = ws - s + new * length
+                s = s - old + new
     st[0] = s
     st[1] = ws
     st[2] = float(i)
@@ -4527,31 +4611,30 @@ def numba_linreg_inc(arr, length, offset, i, st):
             if not ok:
                 sy = np.nan
                 sxy = np.nan
+        elif np.isnan(sy):
+            sy = 0.0
+            sxy = 0.0
+            ok = True
+            base = j - length + 1
+            for k in range(length):
+                y = arr[base + k]
+                if np.isnan(y):
+                    ok = False
+                    break
+                sy += y
+                sxy += float(k) * y
+            if not ok:
+                sy = np.nan
+                sxy = np.nan
         else:
-            if np.isnan(sy):
-                sy = 0.0
-                sxy = 0.0
-                ok = True
-                base = j - length + 1
-                for k in range(length):
-                    y = arr[base + k]
-                    if np.isnan(y):
-                        ok = False
-                        break
-                    sy += y
-                    sxy += float(k) * y
-                if not ok:
-                    sy = np.nan
-                    sxy = np.nan
+            y0 = arr[j - length]
+            yn = arr[j]
+            if np.isnan(y0) or np.isnan(yn):
+                sy = np.nan
+                sxy = np.nan
             else:
-                y0 = arr[j - length]
-                yn = arr[j]
-                if np.isnan(y0) or np.isnan(yn):
-                    sy = np.nan
-                    sxy = np.nan
-                else:
-                    sxy = sxy - sy + y0 + yn * (n - 1.0)
-                    sy = sy - y0 + yn
+                sxy = sxy - sy + y0 + yn * (n - 1.0)
+                sy = sy - y0 + yn
     st[0] = sy
     st[1] = sxy
     st[2] = float(i)
@@ -4609,8 +4692,7 @@ def numba_sar_inc(high, low, start, increment, maximum, i, st):
             if hi > ep:
                 ep = hi
                 af = af + increment
-                if af > maximum:
-                    af = maximum
+                af = min(af, maximum)
             if sar > lo:
                 trend = -1.0
                 sar = ep
@@ -4621,8 +4703,7 @@ def numba_sar_inc(high, low, start, increment, maximum, i, st):
             if lo < ep:
                 ep = lo
                 af = af + increment
-                if af > maximum:
-                    af = maximum
+                af = min(af, maximum)
             if sar < hi:
                 trend = 1.0
                 sar = ep
@@ -4669,25 +4750,24 @@ def numba_cci_inc(arr, length, i, st):
                 s += v
             if not ok:
                 s = np.nan
+        elif np.isnan(s):
+            s = 0.0
+            ok = True
+            for k in range(length):
+                v = arr[j - k]
+                if np.isnan(v):
+                    ok = False
+                    break
+                s += v
+            if not ok:
+                s = np.nan
         else:
-            if np.isnan(s):
-                s = 0.0
-                ok = True
-                for k in range(length):
-                    v = arr[j - k]
-                    if np.isnan(v):
-                        ok = False
-                        break
-                    s += v
-                if not ok:
-                    s = np.nan
+            old = arr[j - length]
+            new = arr[j]
+            if np.isnan(old) or np.isnan(new):
+                s = np.nan
             else:
-                old = arr[j - length]
-                new = arr[j]
-                if np.isnan(old) or np.isnan(new):
-                    s = np.nan
-                else:
-                    s = s - old + new
+                s = s - old + new
     st[0] = s
     st[1] = float(i)
     if i < length - 1 or np.isnan(s):
@@ -4733,25 +4813,24 @@ def numba_dev_inc(arr, period, i, st):
                 s += v
             if not ok:
                 s = np.nan
+        elif np.isnan(s):
+            s = 0.0
+            ok = True
+            for k in range(period):
+                v = arr[j - k]
+                if np.isnan(v):
+                    ok = False
+                    break
+                s += v
+            if not ok:
+                s = np.nan
         else:
-            if np.isnan(s):
-                s = 0.0
-                ok = True
-                for k in range(period):
-                    v = arr[j - k]
-                    if np.isnan(v):
-                        ok = False
-                        break
-                    s += v
-                if not ok:
-                    s = np.nan
+            old = arr[j - period]
+            new = arr[j]
+            if np.isnan(old) or np.isnan(new):
+                s = np.nan
             else:
-                old = arr[j - period]
-                new = arr[j]
-                if np.isnan(old) or np.isnan(new):
-                    s = np.nan
-                else:
-                    s = s - old + new
+                s = s - old + new
     st[0] = s
     st[1] = float(i)
     if i < period - 1 or np.isnan(s):
@@ -4806,53 +4885,52 @@ def numba_mfi_inc(high, low, close, vol, length, i, st):
             if not ok:
                 pos = np.nan
                 neg = np.nan
+        elif np.isnan(pos):
+            pos = 0.0
+            neg = 0.0
+            ok = True
+            for k in range(j - length + 1, j + 1):
+                tp = (high[k] + low[k] + close[k]) / 3.0
+                tp_prev = (high[k - 1] + low[k - 1] + close[k - 1]) / 3.0
+                vv = vol[k]
+                if np.isnan(tp) or np.isnan(tp_prev) or np.isnan(vv):
+                    ok = False
+                    break
+                mf = tp * vv
+                if tp > tp_prev:
+                    pos += mf
+                elif tp < tp_prev:
+                    neg += mf
+            if not ok:
+                pos = np.nan
+                neg = np.nan
         else:
-            if np.isnan(pos):
-                pos = 0.0
-                neg = 0.0
-                ok = True
-                for k in range(j - length + 1, j + 1):
-                    tp = (high[k] + low[k] + close[k]) / 3.0
-                    tp_prev = (high[k - 1] + low[k - 1] + close[k - 1]) / 3.0
-                    vv = vol[k]
-                    if np.isnan(tp) or np.isnan(tp_prev) or np.isnan(vv):
-                        ok = False
-                        break
-                    mf = tp * vv
-                    if tp > tp_prev:
-                        pos += mf
-                    elif tp < tp_prev:
-                        neg += mf
-                if not ok:
-                    pos = np.nan
-                    neg = np.nan
+            k_old = j - length
+            tp = (high[k_old] + low[k_old] + close[k_old]) / 3.0
+            tp_prev = (high[k_old - 1] + low[k_old - 1] + close[k_old - 1]) / 3.0
+            vv = vol[k_old]
+            if np.isnan(tp) or np.isnan(tp_prev) or np.isnan(vv):
+                pos = np.nan
+                neg = np.nan
             else:
-                k_old = j - length
-                tp = (high[k_old] + low[k_old] + close[k_old]) / 3.0
-                tp_prev = (high[k_old - 1] + low[k_old - 1] + close[k_old - 1]) / 3.0
-                vv = vol[k_old]
+                mf = tp * vv
+                if tp > tp_prev:
+                    pos -= mf
+                elif tp < tp_prev:
+                    neg -= mf
+                k = j
+                tp = (high[k] + low[k] + close[k]) / 3.0
+                tp_prev = (high[k - 1] + low[k - 1] + close[k - 1]) / 3.0
+                vv = vol[k]
                 if np.isnan(tp) or np.isnan(tp_prev) or np.isnan(vv):
                     pos = np.nan
                     neg = np.nan
                 else:
                     mf = tp * vv
                     if tp > tp_prev:
-                        pos -= mf
+                        pos += mf
                     elif tp < tp_prev:
-                        neg -= mf
-                    k = j
-                    tp = (high[k] + low[k] + close[k]) / 3.0
-                    tp_prev = (high[k - 1] + low[k - 1] + close[k - 1]) / 3.0
-                    vv = vol[k]
-                    if np.isnan(tp) or np.isnan(tp_prev) or np.isnan(vv):
-                        pos = np.nan
-                        neg = np.nan
-                    else:
-                        mf = tp * vv
-                        if tp > tp_prev:
-                            pos += mf
-                        elif tp < tp_prev:
-                            neg += mf
+                        neg += mf
 
     st[0] = pos
     st[1] = neg
@@ -4889,8 +4967,7 @@ def numba_highestbars_inc(arr, length, i, st):
     mi = -1 if np.isnan(st[1]) else int(st[1])
     for j in range(last + 1, i + 1):
         start = j - length + 1
-        if start < 0:
-            start = 0
+        start = max(start, 0)
         if j == 0 or np.isnan(m) or mi < start:
             m = np.nan
             mi = -1
@@ -4943,8 +5020,7 @@ def numba_lowestbars_inc(arr, length, i, st):
     mi = -1 if np.isnan(st[1]) else int(st[1])
     for j in range(last + 1, i + 1):
         start = j - length + 1
-        if start < 0:
-            start = 0
+        start = max(start, 0)
         if j == 0 or np.isnan(m) or mi < start:
             m = np.nan
             mi = -1
@@ -5028,48 +5104,47 @@ def numba_correlation_inc(a, b, period, i, st):
                 saa = np.nan
                 sbb = np.nan
                 sab = np.nan
+        elif np.isnan(sa):
+            sa = 0.0
+            sb = 0.0
+            saa = 0.0
+            sbb = 0.0
+            sab = 0.0
+            ok = True
+            for k in range(period):
+                va = a[j - k]
+                vb = b[j - k]
+                if np.isnan(va) or np.isnan(vb):
+                    ok = False
+                    break
+                sa += va
+                sb += vb
+                saa += va * va
+                sbb += vb * vb
+                sab += va * vb
+            if not ok:
+                sa = np.nan
+                sb = np.nan
+                saa = np.nan
+                sbb = np.nan
+                sab = np.nan
         else:
-            if np.isnan(sa):
-                sa = 0.0
-                sb = 0.0
-                saa = 0.0
-                sbb = 0.0
-                sab = 0.0
-                ok = True
-                for k in range(period):
-                    va = a[j - k]
-                    vb = b[j - k]
-                    if np.isnan(va) or np.isnan(vb):
-                        ok = False
-                        break
-                    sa += va
-                    sb += vb
-                    saa += va * va
-                    sbb += vb * vb
-                    sab += va * vb
-                if not ok:
-                    sa = np.nan
-                    sb = np.nan
-                    saa = np.nan
-                    sbb = np.nan
-                    sab = np.nan
+            oa = a[j - period]
+            ob = b[j - period]
+            na_ = a[j]
+            nb_ = b[j]
+            if np.isnan(oa) or np.isnan(ob) or np.isnan(na_) or np.isnan(nb_):
+                sa = np.nan
+                sb = np.nan
+                saa = np.nan
+                sbb = np.nan
+                sab = np.nan
             else:
-                oa = a[j - period]
-                ob = b[j - period]
-                na_ = a[j]
-                nb_ = b[j]
-                if np.isnan(oa) or np.isnan(ob) or np.isnan(na_) or np.isnan(nb_):
-                    sa = np.nan
-                    sb = np.nan
-                    saa = np.nan
-                    sbb = np.nan
-                    sab = np.nan
-                else:
-                    sa = sa - oa + na_
-                    sb = sb - ob + nb_
-                    saa = saa - oa * oa + na_ * na_
-                    sbb = sbb - ob * ob + nb_ * nb_
-                    sab = sab - oa * ob + na_ * nb_
+                sa = sa - oa + na_
+                sb = sb - ob + nb_
+                saa = saa - oa * oa + na_ * na_
+                sbb = sbb - ob * ob + nb_ * nb_
+                sab = sab - oa * ob + na_ * nb_
     st[0] = sa
     st[1] = sb
     st[2] = saa
@@ -5208,7 +5283,7 @@ def numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):
     return numba_valuewhen(cond_arr, src_arr, occ, i)
 
 
-def _ol_numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):  # noqa: ARG001
+def _ol_numba_valuewhen_inc(cond_arr, src_arr, occ, i, st):
     def impl(cond_arr, src_arr, occ, i, st):
         return _numba_valuewhen_inc_jit(cond_arr, src_arr, occ, i, st)
 
@@ -5270,8 +5345,7 @@ def _running_ext_py(arr, i, st, *, want_max: bool):
         return np.nan
     end = min(idx + 1, n)
     start = 0 if last < -1 else last + 1
-    if start < 0:
-        start = 0
+    start = max(start, 0)
     for j in range(start, end):
         v = safe_float(arr[j])
         if m != m:
@@ -5294,7 +5368,7 @@ def numba_running_max_inc(arr, i, st):
     return _running_ext_py(arr, i, st, want_max=True)
 
 
-def _ol_numba_running_max_inc(arr, i, st):  # noqa: ARG001
+def _ol_numba_running_max_inc(arr, i, st):
     def impl(arr, i, st):
         return _numba_running_max_inc_jit(arr, i, st)
 
@@ -5336,7 +5410,7 @@ def numba_running_min_inc(arr, i, st):
     return _running_ext_py(arr, i, st, want_max=False)
 
 
-def _ol_numba_running_min_inc(arr, i, st):  # noqa: ARG001
+def _ol_numba_running_min_inc(arr, i, st):
     def impl(arr, i, st):
         return _numba_running_min_inc_jit(arr, i, st)
 
@@ -6001,13 +6075,12 @@ def numba_dmi_inc(high, low, close, di_len, adx_smooth, i, st):
                 md_f = 0.0 if np.isnan(md) else md
                 plus_di = 100.0 * pd_f / atr_v
                 minus_di = 100.0 * md_f / atr_v
+        elif atr_v == 0.0:
+            plus_di = 0.0
+            minus_di = 0.0
         else:
-            if atr_v == 0.0:
-                plus_di = 0.0
-                minus_di = 0.0
-            else:
-                plus_di = 100.0 * pd / atr_v
-                minus_di = 100.0 * md / atr_v
+            plus_di = 100.0 * pd / atr_v
+            minus_di = 100.0 * md / atr_v
 
         st[38] = plus_di
         st[39] = minus_di
@@ -6246,10 +6319,8 @@ def numba_wpr(high, low, close, period, i):
     for j in range(1, period):
         h = high[i - j]
         l_ = low[i - j]
-        if h > hh:
-            hh = h
-        if l_ < ll:
-            ll = l_
+        hh = max(hh, h)
+        ll = min(ll, l_)
     c = close[i]
     if hh == ll:
         return 0.0
@@ -6590,10 +6661,8 @@ def numba_stochrsi(arr, rsi_len, stoch_len, i):
         rsi_low = rsi_buf[0]
         for k in range(1, stoch_len):
             v = rsi_buf[k]
-            if v > rsi_high:
-                rsi_high = v
-            if v < rsi_low:
-                rsi_low = v
+            rsi_high = max(rsi_high, v)
+            rsi_low = min(rsi_low, v)
         span = rsi_high - rsi_low
         if span == 0.0:
             sr = 0.0
@@ -6652,10 +6721,8 @@ def numba_stochrsi_inc(arr, rsi_len, stoch_len, i, st):
         rsi_low = st[3]
         for k in range(1, stoch_len):
             v = st[3 + k]
-            if v > rsi_high:
-                rsi_high = v
-            if v < rsi_low:
-                rsi_low = v
+            rsi_high = max(rsi_high, v)
+            rsi_low = min(rsi_low, v)
         span = rsi_high - rsi_low
         if span == 0.0:
             sr = 0.0
@@ -6702,8 +6769,7 @@ def numba_cmf(high, low, close, vol, period, i):
     if period <= 0 or i < 0:
         return np.nan
     start = i - period + 1
-    if start < 0:
-        start = 0
+    start = max(start, 0)
     clv_sum = 0.0
     vol_sum = 0.0
     for j in range(start, i + 1):
@@ -6797,8 +6863,7 @@ def numba_wvad(high, low, close, vol, period, i):
         return 0.0
     wad = numba_wad(high, low, close, vol, i)
     start = i - period + 1
-    if start < 0:
-        start = 0
+    start = max(start, 0)
     vol_sum = 0.0
     for j in range(start, i + 1):
         v = vol[j]
@@ -6810,7 +6875,7 @@ def numba_wvad(high, low, close, vol, period, i):
 
 
 def array_range(arr):
-    """Pine ``array.range(id)`` — max − min of numeric elements; empty → na.
+    """Pine ``array.range(id)`` — max - min of numeric elements; empty → na.
 
     Not Python ``range`` / ``list(range(...))``. Used by compile object-mode
     so ``float_range / n`` never becomes ``list / int``.
@@ -6931,8 +6996,7 @@ def array_percentile_nearest_rank(arr, percentile):
     nums.sort()
     n = len(nums)
     rank = max(1, int((p / 100.0) * n + 0.5))
-    if rank > n:
-        rank = n
+    rank = min(rank, n)
     return nums[rank - 1]
 
 
@@ -7026,7 +7090,7 @@ def matrix_inv(m):
 
 
 def matrix_pinv(m):
-    """Moore–Penrose pseudoinverse; bad input → []."""
+    """Moore-Penrose pseudoinverse; bad input → []."""
     arr = _matrix_float_array(m)
     if arr is None or arr.ndim != 2:
         return []
@@ -7211,7 +7275,7 @@ def matrix_pow(m, n):
 
 
 def matrix_is_square(m):
-    """True when rows == cols (including 0×0). Bad input → False."""
+    """True when rows == cols (including 0x0). Bad input → False."""
     m = _matrix_ensure(m)
     if not isinstance(m, list):
         return False
@@ -7396,10 +7460,8 @@ def _numba_timestamp_jit(y, m, d, h=0.0, mi=0.0, s=0.0):
     while mo < 1:
         mo += 12
         yi -= 1
-    if yi < 1:
-        yi = 1
-    if yi > 9999:
-        yi = 9999
+    yi = max(yi, 1)
+    yi = min(yi, 9999)
     # day/hour/min/sec may overflow; fold into epoch days + rem seconds
     total_sec = (di - 1) * 86400 + hi * 3600 + mni * 60 + si
     add_days = total_sec // 86400
@@ -7444,7 +7506,7 @@ def numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):
     return _numba_timestamp_jit(fy, fm, fd, fh, fmi, fs)
 
 
-def _ol_numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):  # noqa: ARG001
+def _ol_numba_timestamp(y, m, d, h=0.0, mi=0.0, s=0.0):
     def impl(y, m, d, h=0.0, mi=0.0, s=0.0):
         return _numba_timestamp_jit(y, m, d, h, mi, s)
 

@@ -644,7 +644,7 @@ class DrawingRegistry:
             if t is None or y is None:
                 continue
             size_raw = getattr(lb, "size", None)
-            if size_raw is None or size_raw == "" or size_raw == "auto":
+            if size_raw is None or size_raw in {"", "auto"}:
                 size_raw = getattr(lb, "text_size", None) or "auto"
             yloc_raw = str(getattr(lb, "yloc", None) or "price")
             if yloc_raw.startswith("#") or yloc_raw.startswith("rgb"):
@@ -953,7 +953,7 @@ class DrawingRegistry:
                 if t is None or y is None:
                     continue
                 size_raw = item.get("size", item.get("text_size"))
-                if size_raw is None or size_raw == "" or size_raw == "auto":
+                if size_raw is None or size_raw in {"", "auto"}:
                     size_raw = "auto"
                 yloc_raw = str(item.get("yloc") or "price")
                 if yloc_raw.startswith("#") or yloc_raw.startswith("rgb"):

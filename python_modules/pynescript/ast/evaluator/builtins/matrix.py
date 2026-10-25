@@ -102,7 +102,7 @@ class Matrix(Generic[T]):
     def add_row(self, row_data: list[Any], index: int | None = None) -> None:
         """Add row at *index* (or append when *index* is None / past end).
 
-        Empty (0×0) matrices adopt column count from *row_data* so reference form
+        Empty (0x0) matrices adopt column count from *row_data* so reference form
         ``matrix.add_row(m, 0, array.from(...))`` works on ``matrix.new<T>()``.
         """
         row = list(row_data)
@@ -184,7 +184,7 @@ class Matrix(Generic[T]):
         """
         col = list(col_data)
         if self.rows_count == 0 and self.cols_count == 0:
-            # 0×0 → N×1 from column values
+            # 0x0 → Nx1 from column values
             for v in col:
                 self.data.append([v])
             self.rows_count = len(col)
@@ -197,8 +197,7 @@ class Matrix(Generic[T]):
         if insert_at < 0:
             msg = f"Column index {insert_at} out of range"
             raise IndexError(msg)
-        if insert_at > self.cols_count:
-            insert_at = self.cols_count
+        insert_at = min(insert_at, self.cols_count)
         for i in range(self.rows_count):
             self.data[i].insert(insert_at, col[i])
         self.cols_count += 1
@@ -416,10 +415,20 @@ class Matrix(Generic[T]):
                 result.set(i, j, self.get(i, j))
         return result
 
+    def copy_contents(self) -> tuple[int, int, list[list[Any]]]:
+        """One-level snapshot of dimensions and row lists (realtime rollback)."""
+        return (self.rows_count, self.cols_count, [list(row) for row in self.data])
+
+    def restore_contents(self, snap: tuple[int, int, list[list[Any]]]) -> None:
+        """Restore from :meth:`copy_contents` into this instance."""
+        rows, cols, data = snap
+        self.rows_count = rows
+        self.cols_count = cols
+        self.data[:] = [list(row) for row in data]
+
     def __repr__(self) -> str:
         """String representation."""
         return f"matrix({self.rows_count}x{self.cols_count})"
-
 
     # ========== OFFICIAL reference v6 SURFACE ==========
 
@@ -550,7 +559,7 @@ class Matrix(Generic[T]):
     def _comparable_key(value: Any) -> Any:
         """Return a key that sorts without TypeError (string fallback)."""
         try:
-            _ = value < value  # noqa: B015
+            _ = value < value
             return value
         except TypeError:
             return (str(type(value)), str(value))
@@ -594,8 +603,10 @@ class Matrix(Generic[T]):
             non_na.sort(key=key_fn, reverse=reverse)
         except TypeError:
             non_na.sort(
-                key=lambda r: (str(type(self._cell_sort_value(r[column], sort_field))),
-                               str(self._cell_sort_value(r[column], sort_field))),
+                key=lambda r: (
+                    str(type(self._cell_sort_value(r[column], sort_field))),
+                    str(self._cell_sort_value(r[column], sort_field)),
+                ),
                 reverse=reverse,
             )
         self.data = non_na + na_rows
@@ -645,7 +656,7 @@ class Matrix(Generic[T]):
         return result
 
     def mult(self, other: Matrix[T] | list[Any] | float | int) -> Matrix[T] | list[Any]:
-        """Matrix multiplication / scalar multiply / matrix×vector."""
+        """Matrix multiplication / scalar multiply / matrix x vector."""
         if isinstance(other, (int, float)):
             result = self.copy()
             for i in range(self.rows_count):
@@ -742,7 +753,7 @@ class Matrix(Generic[T]):
         return self._from_float_grid(inv.tolist())
 
     def pinv(self) -> Matrix[T]:
-        """Moore–Penrose pseudoinverse."""
+        """Moore-Penrose pseudoinverse."""
         np = self._numpy()
         arr = np.array(self._as_float_grid(), dtype=float)
         pin = np.linalg.pinv(arr)
@@ -878,12 +889,11 @@ class Matrix(Generic[T]):
                 if i == j:
                     if isinstance(a, (int, float)) and a != 0:
                         return False
-                else:
-                    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                        if a != -b:
-                            return False
-                    elif a != b:  # non-numeric mismatch
+                elif isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                    if a != -b:
                         return False
+                elif a != b:  # non-numeric mismatch
+                    return False
         return True
 
     def is_triangular(self) -> bool:

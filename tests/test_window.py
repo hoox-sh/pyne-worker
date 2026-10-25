@@ -32,6 +32,7 @@ def _envelope(n: int = 10) -> dict:
         "bars": n,
         "series": {"plot_0": list(range(n)), "plot_1": [v * 2 for v in range(n)]},
         "plots": list(range(n)),
+        "times": [1_700_000_000 + i * 86_400 for i in range(n)],
         "events": [{"kind": "entry", "bar_index": i, "direction": "long"} for i in range(n)],
         "drawings": [{"id": f"d{i}", "bar_index": i} for i in range(n)],
         "alerts": [{"message": "m", "bar_index": i} for i in range(n)],
@@ -132,6 +133,11 @@ class TestApplyWindow:
         out = apply_window(full, 3, 6)
         assert out["series"]["plot_0"] == full["series"]["plot_0"][3:7]
         assert out["events"] == full["events"][3:7]
+
+    def test_times_axis_is_sliced(self) -> None:
+        full = _envelope()
+        out = apply_window(full, 2, 4)
+        assert out["times"] == full["times"][2:5]
 
 
 def _bars(n: int = 30) -> list[dict]:

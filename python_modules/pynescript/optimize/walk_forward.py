@@ -31,7 +31,7 @@ def holdout_split(n_bars: int, spec: ValidationSpec) -> tuple[slice, slice] | No
     frac = spec.holdout_frac
     if not (0.05 <= frac <= 0.8):
         frac = 0.3
-    test_n = max(1, int(round(n_bars * frac)))
+    test_n = max(1, round(n_bars * frac))
     split = n_bars - test_n
     if split < 2:
         return None

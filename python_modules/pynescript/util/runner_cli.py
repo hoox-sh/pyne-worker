@@ -222,9 +222,7 @@ def list_cmd(ctx: click.Context, as_json: bool) -> None:
         return
     for rec in rows:
         flag = "on" if rec.get("enabled") else "off"
-        click.echo(
-            f"{rec.get('id')}  {flag}  {rec.get('symbol')}/{rec.get('timeframe')}  {rec.get('data_source')}"
-        )
+        click.echo(f"{rec.get('id')}  {flag}  {rec.get('symbol')}/{rec.get('timeframe')}  {rec.get('data_source')}")
 
 
 @runner_group.command("show", short_help="Show one hosted script and cron state.")

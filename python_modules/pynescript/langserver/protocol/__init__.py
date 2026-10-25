@@ -26,3 +26,5 @@ Modules:
 
 Feature modules import these helpers by name; this package does not re-export.
 """
+
+from __future__ import annotations

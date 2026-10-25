@@ -34,6 +34,8 @@ from lsprotocol import types as lsp
 from pynescript.ast import NodeVisitor
 from pynescript.ast import node as ast
 
+from ._ranges import node_to_range
+
 
 def handle_document_symbols(
     params: lsp.DocumentSymbolParams,
@@ -177,7 +179,7 @@ class DocumentSymbolCollector(NodeVisitor):
                 if parent.children is None:
                     parent.children = [field]
                 else:
-                    parent.children = list(parent.children) + [field]
+                    parent.children = [*list(parent.children), field]
             elif isinstance(node.target, ast.Tuple):
                 for elt in node.target.elts:
                     if isinstance(elt, ast.Name):
@@ -192,7 +194,7 @@ class DocumentSymbolCollector(NodeVisitor):
                         if parent.children is None:
                             parent.children = [field]
                         else:
-                            parent.children = list(parent.children) + [field]
+                            parent.children = [*list(parent.children), field]
 
     def visit_Assign(self, node: ast.Assign) -> Any:
         """Handle variable assignments."""
@@ -254,17 +256,14 @@ class DocumentSymbolCollector(NodeVisitor):
         :meth:`_name_to_range`; clients (VS Code) reject symbols whose
         selection range is not contained in the full range.
         """
-        lineno = getattr(node, "lineno", 1) or 1
-        col_offset = getattr(node, "col_offset", 0) or 0
-        end_lineno = getattr(node, "end_lineno", lineno) or lineno
-        end_col_offset = getattr(node, "end_col_offset", None)
-        if end_col_offset is None:
-            # Defensive fallback for nodes lacking span info: keep the range
-            # wide enough to contain any name-based selection range.
-            end_col_offset = col_offset + 1 if end_lineno == lineno else 1 << 31
+        span = node_to_range(node)
+        if span is not None:
+            return span
+        # Defensive fallback for nodes lacking span info: keep the range
+        # wide enough to contain any name-based selection range.
         return lsp.Range(
-            start=lsp.Position(line=max(0, lineno - 1), character=max(0, col_offset)),
-            end=lsp.Position(line=max(0, end_lineno - 1), character=max(0, end_col_offset)),
+            start=lsp.Position(line=0, character=0),
+            end=lsp.Position(line=0, character=1),
         )
 
     def _name_to_range(self, node: Any) -> lsp.Range:

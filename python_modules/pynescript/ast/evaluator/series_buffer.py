@@ -53,17 +53,17 @@ from __future__ import annotations
 
 import operator
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
+from collections.abc import Sequence
 from typing import Any
 
-from pynescript.runtime.series import (
-    DEFAULT_PINESERIES_HISTORY,
-    PineSeries,
-    _coerce_pine_offset,
-    _normalize_history_length,
-    pineseries_history_length,
-    series_ring_enabled,
-)
+from pynescript.runtime.series import DEFAULT_PINESERIES_HISTORY
+from pynescript.runtime.series import PineSeries
+from pynescript.runtime.series import _coerce_pine_offset
+from pynescript.runtime.series import _normalize_history_length
+from pynescript.runtime.series import pineseries_history_length
+from pynescript.runtime.series import series_ring_enabled
+
 
 __all__ = [
     "ChronoTailView",
@@ -87,7 +87,7 @@ class ChronologicalSeriesBuffer:
         unbounded (plain list append — still O(1) lookback).
     """
 
-    __slots__ = ("_data", "_start", "_len", "maxlen")
+    __slots__ = ("_data", "_len", "_start", "maxlen")
     # Marker for hosts / ``_as_series`` migration (chrono, not newest-first).
     chrono_order: bool = True
 

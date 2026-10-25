@@ -43,8 +43,8 @@ from typing import Any
 from pynescript.ast import node as ast
 from pynescript.ast.evaluator.builtins.declarations import ScriptDeclaration
 from pynescript.ast.evaluator.libraries import STUB_KNOWN_EXPORTS
-from pynescript.ast.evaluator.libraries import bind_tradingview_ta_stub_exports
 from pynescript.ast.evaluator.libraries import LibraryModule
+from pynescript.ast.evaluator.libraries import bind_tradingview_ta_stub_exports
 from pynescript.ast.evaluator.names import ast_qualified_name
 from pynescript.ast.helper import parse as parse_pine
 from pynescript.ast.type_system import BuiltinType
@@ -55,6 +55,7 @@ from pynescript.ast.type_system import ObjectInstance
 from pynescript.ast.type_system import Type
 from pynescript.ast.type_system import TypeRegistry
 from pynescript.ast.type_system import UserDefinedType
+
 
 # Sentinel: param was not present in context before binding (pop on unbind).
 _CONTEXT_MISSING: Any = object()
@@ -514,7 +515,7 @@ class StatementEvaluator:
             if value is None:
                 return None
             try:
-                return int(value) if not isinstance(value, float) else int(value)
+                return int(value)
             except (TypeError, ValueError):
                 return None
         if type_name == "bool":
@@ -543,15 +544,7 @@ class StatementEvaluator:
             # Floats / ints from ta.* are the common assign. Skip the
             # PineSeries hasattr probes those values can never satisfy.
             vt = type(value)
-            if (
-                value is None
-                or vt is float
-                or vt is int
-                or vt is bool
-                or vt is str
-                or vt is tuple
-                or vt is list
-            ):
+            if value is None or vt is float or vt is int or vt is bool or vt is str or vt is tuple or vt is list:
                 self.context[name] = value
                 return value
             # Snapshot host/user series (``EP := high``). Storing the handle
@@ -2018,7 +2011,7 @@ class StatementEvaluator:
                             return lambda *_a, **_k: 0
                         return self
 
-                    def __call__(self, *a, **k):  # noqa: ANN001
+                    def __call__(self, *a, **k):
                         return self
 
                     def __bool__(self) -> bool:
@@ -2028,22 +2021,22 @@ class StatementEvaluator:
                         # Support multi-assign unpacking: [a,b,c] = stub.foo()
                         return iter([None] * 8)
 
-                    def __getitem__(self, key):  # noqa: ANN001
+                    def __getitem__(self, key):
                         return None
 
                     def __len__(self) -> int:
                         return 0
 
-                    def __add__(self, other):  # noqa: ANN001
+                    def __add__(self, other):
                         return other
 
-                    def __radd__(self, other):  # noqa: ANN001
+                    def __radd__(self, other):
                         return other
 
-                    def __sub__(self, other):  # noqa: ANN001
+                    def __sub__(self, other):
                         return other
 
-                    def __rsub__(self, other):  # noqa: ANN001
+                    def __rsub__(self, other):
                         return other
 
                     def __repr__(self) -> str:

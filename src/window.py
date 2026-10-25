@@ -31,7 +31,9 @@ from typing import Any
 # NB: no "bars" here — the worker envelope carries ``bars`` as a bar *count*
 # (the Pro API has vector members with that name), and slicing an int would
 # corrupt the response.
-_SERIES_KEYS = ("series", "plots", "seriesMap")
+# ``times`` is the evaluated bar-time axis (pynescript 0.6.16+ session
+# envelope; forwarded on /run when the engine ships it).
+_SERIES_KEYS = ("series", "plots", "seriesMap", "times")
 
 # Envelope members carrying bar-indexed objects (dict or list).
 # ``alerts`` is deliberately absent: firings must never be trimmed away.

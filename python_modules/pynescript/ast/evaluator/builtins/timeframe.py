@@ -50,6 +50,7 @@ SECONDS_PER_MONTH = 2592000  # Approximate 30 days
 
 # Timeframe format mappings
 TIMEFRAME_SUFFIXES = {
+    "S": 1,
     "M": SECONDS_PER_MONTH,
     "H": SECONDS_PER_HOUR,
     "D": SECONDS_PER_DAY,
@@ -185,6 +186,28 @@ def timeframe_calendar_id(ts: object, timeframe_str: str | None, tz: object = No
         iso = d.isocalendar()
         return iso[0] * 100 + iso[1]
     return d.year * 12 + d.month
+
+
+def calendar_day_bucket(ts: object, tz: object = None) -> int | None:
+    """DST-aware midnight-to-midnight day id in *tz* (UTC default).
+
+    Real epoch timestamps use the same ordinal as ``timeframe.change("D")``.
+    Integers ``<= 10_000_000`` are treated as already-bucketed day ids
+    (consecutive-loss-day helpers). Unusable timestamps return None.
+    Unknown zones fall back to UTC (never raise).
+    """
+    if ts is None:
+        return None
+    current = getattr(ts, "current", None)
+    if current is not None and not isinstance(ts, (int, float, bool, str)):
+        ts = current
+    try:
+        t = int(float(ts))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if t <= 10_000_000:
+        return t
+    return timeframe_calendar_id(ts, "D", tz)
 
 
 def _period_id(ts: object, timeframe_str: str | None, tz: object = None) -> int | None:
@@ -417,7 +440,7 @@ def register_timeframe_functions(namespace: dict) -> None:
     # Prefer a bound mixin handler when the dispatcher already registered one.
     namespace.setdefault("timeframe.change", timeframe_change)
     namespace["timeframe.from_seconds"] = timeframe_from_seconds
-    namespace["timeframe.in_seconds"] = timeframe_in_seconds
+    namespace.setdefault("timeframe.in_seconds", timeframe_in_seconds)
 
     # Property defaults (non-callable constants, like color.red). Hosts should
     # still inject flat context keys so local vars that shadow ``timeframe``

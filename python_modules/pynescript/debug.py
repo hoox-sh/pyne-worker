@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import os
 
+from collections.abc import Callable
 from typing import Any
 
 
@@ -54,18 +55,19 @@ __all__ = [
     "debug_enabled",
     "debug_scopes",
     "scope_enabled",
+    "scoped_debug",
 ]
 
 
 #: Environment variable that enables engine debug logging.
-DEBUG_ENV = "PYNE_DEBUG"
+DEBUG_ENV: str = "PYNE_DEBUG"
 
 #: Optional comma-separated allowlist of logger name prefixes.
 #: Only consulted when ``PYNE_DEBUG`` is on. Empty = no filtering (all).
-SCOPE_ENV = "PYNE_DEBUG_SCOPE"
+SCOPE_ENV: str = "PYNE_DEBUG_SCOPE"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-_FALSY = frozenset({"0", "false", "no", "off", ""})
+_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+_FALSY: frozenset[str] = frozenset({"0", "false", "no", "off", ""})
 
 # Cache keyed on the raw env string so a runtime change is picked up without a
 # restart but a stable env costs one dict-compare per call.
@@ -76,7 +78,17 @@ _CACHE: dict[str, Any] = {"raw": None, "value": False, "scope_raw": None, "scope
 
 
 def _parse_flag(raw: str | None) -> bool:
-    """Parse a truthy env string. Unset/empty/``0``/``false``/``no``/``off`` -> False."""
+    """Parse a truthy env string.
+
+    Args:
+        raw: The raw environment variable value, or None if unset.
+
+    Returns:
+        True for truthy values; False for falsy, empty, or unrecognized.
+
+    Raises:
+        Nothing. Unrecognized values are treated conservatively (off).
+    """
     if raw is None:
         return False
     v = raw.strip().lower()
@@ -90,7 +102,11 @@ def _parse_flag(raw: str | None) -> bool:
 
 
 def debug_enabled() -> bool:
-    """Whether detailed engine debug logging is on (``PYNE_DEBUG``)."""
+    """Whether detailed engine debug logging is on (``PYNE_DEBUG``).
+
+    Returns:
+        bool: True if ``PYNE_DEBUG`` is set to a truthy value.
+    """
     raw = os.environ.get(DEBUG_ENV)
     if raw != _CACHE["raw"]:
         _CACHE["raw"] = raw
@@ -103,10 +119,14 @@ def debug_scopes() -> frozenset[str]:
 
     Empty frozenset means "no filter" — every ``pynescript.*`` logger is
     eligible. Multiple scopes are comma (or space) separated.
+
+    Returns:
+        frozenset[str]: The allowed logger prefixes, or empty for no filter.
     """
     raw = os.environ.get(SCOPE_ENV)
     if raw != _CACHE["scope_raw"]:
         _CACHE["scope_raw"] = raw
+        # Normalize spaces to commas, split, and drop empties.
         parts = [p for p in raw.replace(" ", ",").split(",") if p] if raw else []
         _CACHE["scopes"] = frozenset(parts)
     return _CACHE["scopes"]
@@ -119,15 +139,47 @@ def scope_enabled(logger_name: str) -> bool:
     Call sites sit at run / batch / request boundaries — never inside a
     per-bar loop — so the gate stays negligible even on the hot session-append
     path.
+
+    Args:
+        logger_name: The logger/module name to check (e.g., "pynescript.runtime").
+
+    Returns:
+        bool: True if logging should proceed for this scope.
     """
     if not debug_enabled():
         return False
     scopes = debug_scopes()
     if not scopes:
         return True
+    # Exact match or prefix match against the allowlist.
     return any(logger_name == s or logger_name.startswith(s) for s in scopes)
 
 
 def reset_debug_caches() -> None:
     """Drop memoized env values (tests that mutate ``PYNE_DEBUG`` in-process)."""
     _CACHE.update({"raw": None, "value": False, "scope_raw": None, "scopes": frozenset()})
+
+
+def scoped_debug(module: str, logger: logging.Logger) -> Callable[..., None]:
+    """Return a ``_dbg("fmt %s", value)`` helper scoped to *module*.
+
+    Engine modules used to copy the same three-line helper. Keep one
+    implementation so the allocation-free disabled path (and the
+    ``PYNE_DEBUG_SCOPE`` filtering) cannot drift between them.
+
+    Call as ``_dbg("fmt %s", value)`` — arguments are only formatted when the
+    flag is on, so the disabled path stays allocation-free.
+
+    Args:
+        module: The module identifier used for scope filtering.
+        logger: The logging.Logger instance to write to.
+
+    Returns:
+        Callable[..., None]: The scoped debug helper.
+    """
+
+    def _dbg(msg: str, *args: Any) -> None:
+        if scope_enabled(module):
+            logger.debug(msg, *args)
+
+    return _dbg

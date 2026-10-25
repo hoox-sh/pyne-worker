@@ -42,12 +42,7 @@ class OscillatorIndicators(TechnicalHelpers):
 
     def _builtin_ta_rsi(self, args: list[Any]) -> float | None:
         """Relative Strength Index."""
-        if (
-            self._pine_ta_inc_cached is True
-            and len(args) == BINARY
-            and type(args[1]) is int
-            and args[1] > 0
-        ):
+        if self._pine_ta_inc_cached is True and len(args) == BINARY and type(args[1]) is int and args[1] > 0:
             return self._rsi_inc_update(args[0], args[1])
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
         if self._use_incremental_ta():
@@ -98,8 +93,7 @@ class OscillatorIndicators(TechnicalHelpers):
             lows = self._context_series("low")
             return self._stoch_k(source, highs, lows, length)
         msg = "ta.stoch expects source, high, low, length (or high, low, close, length, smooth)"
-        if len(args) != QUINARY:
-            self._error(msg)
+        self._require_len(args, QUINARY, msg)
         highs = self._expect_list(args[0], msg)
         lows = self._expect_list(args[1], msg)
         closes = self._expect_list(args[2], msg)
@@ -201,8 +195,7 @@ class OscillatorIndicators(TechnicalHelpers):
                 return self._cci_inc_update(series, series, series, period)
             return self._cci(series, series, series, period)
         msg = "ta.cci expects source, length (or high, low, close, length)"
-        if len(args) != QUATERNARY:
-            self._error(msg)
+        self._require_len(args, QUATERNARY, msg)
         highs = self._expect_list(args[0], msg)
         lows = self._expect_list(args[1], msg)
         closes = self._expect_list(args[2], msg)
@@ -234,8 +227,7 @@ class OscillatorIndicators(TechnicalHelpers):
             closes = self._context_series("close")
             return self._wpr(highs, lows, closes, length)
         msg = "ta.wpr expects length (or high, low, close, length)"
-        if len(args) != QUATERNARY:
-            self._error(msg)
+        self._require_len(args, QUATERNARY, msg)
         highs = self._expect_list(args[0], msg)
         lows = self._expect_list(args[1], msg)
         closes = self._expect_list(args[2], msg)
@@ -342,13 +334,10 @@ class OscillatorIndicators(TechnicalHelpers):
             short_period = self._expect_int(args[0], msg)
             long_period = self._expect_int(args[1], msg)
             if self._use_incremental_ta():
-                return self._tsi_inc_update(
-                    self._context_source("close"), long_period, short_period
-                )
+                return self._tsi_inc_update(self._context_source("close"), long_period, short_period)
             series = self._context_series("close")
             return self._tsi(series, long_period, short_period)
-        if len(args) != TERNARY:
-            self._error(msg)
+        self._require_len(args, TERNARY, msg)
         # reference Pine docs: ta.tsi(source, short_length, long_length)
         short_period = self._expect_int(args[1], msg)
         long_period = self._expect_int(args[2], msg)
@@ -375,14 +364,23 @@ class OscillatorIndicators(TechnicalHelpers):
 
         ta.rsi_oversold_overbought(rsi_series, oversold_level, overbought_level)
         Returns boolean flags for oversold/overbought conditions.
+        Bar-mode incremental last sample uses ``_rsi_oversold_overbought_inc_update``.
         """
         if len(args) < TERNARY:
             msg = "ta.rsi_oversold_overbought() requires 3 arguments: rsi_series, oversold, overbought"
             self._error(msg)
 
-        rsi_series = args[0] if isinstance(args[0], list) else [args[0]]
         oversold = self._expect_int(args[1], "oversold must be integer")
         overbought = self._expect_int(args[2], "overbought must be integer")
+
+        if self._use_incremental_ta():
+            return self._rsi_oversold_overbought_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                oversold,
+                overbought,
+            )
+
+        rsi_series = args[0] if isinstance(args[0], list) else [args[0]]
 
         if not rsi_series or len(rsi_series) == 0:
             return {"is_oversold": False, "is_overbought": False, "rsi": None}
@@ -396,25 +394,47 @@ class OscillatorIndicators(TechnicalHelpers):
 
         return {"is_oversold": is_oversold, "is_overbought": is_overbought, "rsi": rsi_current}
 
-    def _builtin_ta_rsi_divergence(self, args: list[Any]) -> list[float | None]:
-        """RSI Divergence Detector."""
+    def _builtin_ta_rsi_divergence(self, args: list[Any]) -> Any:
+        """RSI Divergence Detector.
+
+        Last-(period+1) min/max of numeric RSI scaled to [-1, 1]:
+        ``(rsi - min) / (max - min) * 2 - 1``. 0.0 while ``i < period``,
+        when fewer than 2 numeric values are in the window, when the current
+        sample is non-numeric, or when the range is 0. Bar-mode incremental
+        returns the last sample.
+        """
         if len(args) < BINARY:
             msg = "ta.rsi_divergence() requires 2 arguments: rsi_series, period"
             self._error(msg)
 
-        rsi_series = args[0] if isinstance(args[0], list) else [args[0]]
         period = self._expect_int(args[1], "ta.rsi_divergence period must be integer")
 
-        divergence_values = []
+        if self._use_incremental_ta():
+            return self._rsi_divergence_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                period,
+            )
+
+        rsi_series = self._as_series(args[0])
+        divergence_values: list[float] = []
         for i in range(len(rsi_series)):
             if i < period:
                 divergence_values.append(0.0)
                 continue
 
             start_idx = max(0, i - period)
-            rsi_values = [rsi_series[j] for j in range(start_idx, i + 1) if rsi_series[j] is not None]
+            rsi_values: list[float] = []
+            for j in range(start_idx, i + 1):
+                v = self._finite_or_none(rsi_series[j])
+                if v is not None:
+                    rsi_values.append(v)
 
             if len(rsi_values) < BINARY:
+                divergence_values.append(0.0)
+                continue
+
+            cur = self._finite_or_none(rsi_series[i])
+            if cur is None:
                 divergence_values.append(0.0)
                 continue
 
@@ -423,13 +443,13 @@ class OscillatorIndicators(TechnicalHelpers):
             rsi_range = rsi_max - rsi_min
 
             if rsi_range > 0:
-                divergence = (rsi_series[i] - rsi_min) / rsi_range * BINARY - 1
+                divergence = (cur - rsi_min) / rsi_range * BINARY - 1
             else:
                 divergence = 0.0
 
             divergence_values.append(divergence)
 
-        return divergence_values
+        return self._finalize_series(divergence_values)
 
     def _builtin_ta_macd_signal(self, args: list[Any]) -> float | None:
         """MACD Signal Strength."""
@@ -446,41 +466,69 @@ class OscillatorIndicators(TechnicalHelpers):
         strength = float(macd_line) - float(signal_line)
         return strength
 
-    def _builtin_ta_stoch_smooth(self, args: list[Any]) -> list[float | None]:
-        """Smoothed Stochastic Oscillator."""
+    def _builtin_ta_stoch_smooth(self, args: list[Any]) -> Any:
+        """Smoothed Stochastic Oscillator.
+
+        ``ta.stoch_smooth(high, low, close, period, smooth_k, smooth_d)``:
+        raw stochastic per bar, then ``EMA(stoch, smooth_k)``, then
+        ``EMA(that, smooth_d)``. Bar-mode incremental returns the last
+        sample of the second EMA.
+        """
         senary = 6
         if len(args) < senary:
             msg = "ta.stoch_smooth() requires 6 arguments: high, low, close, period, smooth_k, smooth_d"
             self._error(msg)
 
-        high_series = args[0] if isinstance(args[0], list) else [args[0]]
-        low_series = args[1] if isinstance(args[1], list) else [args[1]]
-        close_series = args[2] if isinstance(args[2], list) else [args[2]]
         period = self._expect_int(args[3], "ta.stoch_smooth period must be integer")
         smooth_k = self._expect_int(args[4], "ta.stoch_smooth smooth_k must be integer")
         smooth_d = self._expect_int(args[5], "ta.stoch_smooth smooth_d must be integer")
 
-        # Calculate raw stochastic
-        stoch_values = []
-        for i in range(len(close_series)):
-            start_idx = max(0, i - period + 1)
-            high_max = max(high_series[j] for j in range(start_idx, i + 1) if j < len(high_series))
-            low_min = min(low_series[j] for j in range(start_idx, i + 1) if j < len(low_series))
-            c = close_series[i] if i < len(close_series) else 0
+        if self._use_incremental_ta():
+            return self._stoch_smooth_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                period,
+                smooth_k,
+                smooth_d,
+            )
 
+        high_series = self._as_series(args[0])
+        low_series = self._as_series(args[1])
+        close_series = self._as_series(args[2])
+
+        stoch_values: list[float | None] = []
+        n_close = len(close_series)
+        n_high = len(high_series)
+        n_low = len(low_series)
+        for i in range(n_close):
+            start_idx = max(0, i - period + 1)
+            window_h: list[float] = []
+            window_l: list[float] = []
+            poisoned = False
+            for j in range(start_idx, i + 1):
+                hf = self._finite_or_none(high_series[j] if j < n_high else None)
+                lf = self._finite_or_none(low_series[j] if j < n_low else None)
+                if hf is None or lf is None:
+                    poisoned = True
+                    break
+                window_h.append(hf)
+                window_l.append(lf)
+            c = self._finite_or_none(close_series[i])
+            if poisoned or c is None or not window_h or not window_l:
+                stoch_values.append(None)
+                continue
+            high_max = max(window_h)
+            low_min = min(window_l)
             hl_range = high_max - low_min
             if hl_range != 0:
-                stoch = 100 * (c - low_min) / hl_range
+                stoch_values.append(100.0 * (c - low_min) / hl_range)
             else:
-                stoch = 50.0
+                stoch_values.append(50.0)
 
-            stoch_values.append(stoch)
-
-        # Smooth stochastic
         smooth_k_ema = self._ema(stoch_values, smooth_k)
         smooth_d_ema = self._ema(smooth_k_ema, smooth_d)
-
-        return smooth_d_ema
+        return self._finalize_series(smooth_d_ema)
 
     def _builtin_ta_stochrsi(self, args: list[Any]) -> dict[str, float | None]:
         """Stochastic RSI.
@@ -586,9 +634,7 @@ class OscillatorIndicators(TechnicalHelpers):
         length4 = self._expect_int(args[3], "length4 must be integer")
 
         if self._use_incremental_ta():
-            return self._kst_inc_update(
-                self._context_source("close"), length1, length2, length3, length4
-            )
+            return self._kst_inc_update(self._context_source("close"), length1, length2, length3, length4)
 
         closes = (getattr(self, "current_series", None) or {}).get("close", [])
         if not closes:

@@ -60,8 +60,7 @@ class VolatilityIndicators(TechnicalHelpers):
                 return self._atr_inc_update(highs, lows, closes, length)
             return self._finalize_series(self._atr(highs, lows, closes, length))
         msg = "ta.atr expects length, or high, low, close, and length"
-        if len(args) != QUATERNARY:
-            self._error(msg)
+        self._require_len(args, QUATERNARY, msg)
         highs = self._expect_list(args[0], msg)
         lows = self._expect_list(args[1], msg)
         closes = self._expect_list(args[2], msg)
@@ -80,8 +79,7 @@ class VolatilityIndicators(TechnicalHelpers):
                 return self._tr_inc_update(highs, lows, closes)
             return self._finalize_series(self._tr(highs, lows, closes))
         msg = "ta.tr expects high, low, and close"
-        if len(args) != TERNARY:
-            self._error(msg)
+        self._require_len(args, TERNARY, msg)
         highs = self._expect_list(args[0], msg)
         lows = self._expect_list(args[1], msg)
         closes = self._expect_list(args[2], msg)
@@ -208,8 +206,7 @@ class VolatilityIndicators(TechnicalHelpers):
 
         ta.correlation(source1, source2, length)
         """
-        if len(args) != TERNARY:
-            self._error("ta.correlation requires source1, source2, length")
+        self._require_len(args, TERNARY, "ta.correlation requires source1, source2, length")
         length = self._expect_int(args[2], "length")
         if self._use_incremental_ta():
             s1 = self._as_series_or_raw(args[0], last_sample_ok=True)
@@ -224,14 +221,14 @@ class VolatilityIndicators(TechnicalHelpers):
             return None
         a = s1[-length:]
         b = s2[-length:]
-        pairs = [(float(x), float(y)) for x, y in zip(a, b) if x is not None and y is not None]
+        pairs = [(float(x), float(y)) for x, y in zip(a, b, strict=False) if x is not None and y is not None]
         if len(pairs) < 2:
             return None
         xs = [p[0] for p in pairs]
         ys = [p[1] for p in pairs]
         mx = sum(xs) / len(xs)
         my = sum(ys) / len(ys)
-        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False))
         denx = sum((x - mx) ** 2 for x in xs) ** 0.5
         deny = sum((y - my) ** 2 for y in ys) ** 0.5
         if denx == 0 or deny == 0:
@@ -266,11 +263,7 @@ class VolatilityIndicators(TechnicalHelpers):
             lows = self._context_series("low") or closes
         elif len(args) in {TERNARY, QUATERNARY} and not self._is_period_like(args[1]):
             # Legacy: high, low, close [, length]
-            length = (
-                self._expect_int(args[3], "ta.kc length must be integer")
-                if len(args) > TERNARY
-                else 20
-            )
+            length = self._expect_int(args[3], "ta.kc length must be integer") if len(args) > TERNARY else 20
             if use_inc:
                 return self._kc_inc_update(args[0], args[1], args[2], length, mult)
             highs = self._expect_list(args[0], "ta.kc takes high, low, close series, length")
@@ -355,34 +348,25 @@ class VolatilityIndicators(TechnicalHelpers):
         # reference Pine endpoint at x = n-1 (offset=0): mean_y + slope * ((n-1) - mean_x)
         return mean_y + slope * ((n - 1) - mean_x)
 
-    def _builtin_ta_rci(self, args: list[Any]) -> float:
-        """Rank Correlation Index (Spearman's correlation)."""
-        if len(args) != BINARY:
-            self._error("ta.rci takes source series and length")
+    def _builtin_ta_rci(self, args: list[Any]) -> float | None:
+        """Rank Correlation Index (Spearman rho of time vs value ranks).
 
-        series = self._expect_list(args[0], "ta.rci takes source series and length")
-        length = self._expect_int(args[1], "ta.rci takes source series and length")
-
-        if length < BINARY:
+        Duplicate of ``BasicIndicators._builtin_ta_rci`` — keep in sync.
+        Bar-mode incremental last sample uses ``_rci_inc_update``.
+        """
+        series, length = self._expect_series(args, length=BINARY, last_sample_ok=True)
+        if length < 2:
             self._error("ta.rci length must be at least 2")
+        if self._use_incremental_ta():
+            return self._rci_inc_update(series, length)
+        # Bar-mode locals (input.source) are last-sample scalars.
+        if self._bar_mode() and (not isinstance(series, list) or len(series) < length):
+            return self._rci_inc_update(series, length)
+        if not isinstance(series, list):
+            series = self._as_series(series)
         if len(series) < length:
             return None
-
-        window = series[-length:]
-        valid_values = [(i, v) for i, v in enumerate(window) if v is not None]
-
-        if len(valid_values) < BINARY:
-            return None
-
-        ranks_idx = sorted(range(len(valid_values)), key=lambda i: i)
-        ranks_val = sorted(range(len(valid_values)), key=lambda i: valid_values[i][1])
-
-        rank_dict_idx = {idx: rank for rank, idx in enumerate(ranks_idx)}
-        rank_dict_val = {idx: rank for rank, idx in enumerate(ranks_val)}
-
-        d_squared = sum((rank_dict_idx[i] - rank_dict_val[i]) ** 2 for i in range(len(valid_values)))
-        n = len(valid_values)
-        return 1 - (6 * d_squared) / (n * (n * n - 1)) if n > 1 else None
+        return self._rci_spearman(series[-length:])
 
     def _builtin_ta_dpo(self, args: list[Any]) -> float | None:
         """Detrended Price Oscillator."""
@@ -425,13 +409,16 @@ class VolatilityIndicators(TechnicalHelpers):
         length = self._expect_int(args[0], "length must be integer")
         std_dev = float(args[1]) if isinstance(args[1], (int, float)) else 2.0
 
+        if self._use_incremental_ta():
+            return self._bb_pct_inc_update(self._context_source("close"), length, std_dev)
+
         closes = (getattr(self, "current_series", None) or {}).get("close", [])
         if not closes or len(closes) < length:
             return None
 
         sma_val = sum(closes[-length:]) / length
         variance = sum((v - sma_val) ** 2 for v in closes[-length:]) / length
-        std_val = variance ** 0.5
+        std_val = variance**0.5
 
         upper = sma_val + (std_val * std_dev)
         lower = sma_val - (std_val * std_dev)
@@ -452,9 +439,16 @@ class VolatilityIndicators(TechnicalHelpers):
             msg = "ta.beta() requires 3 arguments: series1, series2, length"
             self._error(msg)
 
-        series1 = args[0] if isinstance(args[0], list) else [args[0]]
-        series2 = args[1] if isinstance(args[1], list) else [args[1]]
         length = self._expect_int(args[2], "length must be integer")
+        if self._use_incremental_ta():
+            return self._beta_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                length,
+            )
+
+        series1 = self._as_series(args[0])
+        series2 = self._as_series(args[1])
 
         if len(series1) < length or len(series2) < length:
             return None
@@ -484,9 +478,16 @@ class VolatilityIndicators(TechnicalHelpers):
             msg = "ta.r_squared() requires 3 arguments: series1, series2, length"
             self._error(msg)
 
-        series1 = args[0] if isinstance(args[0], list) else [args[0]]
-        series2 = args[1] if isinstance(args[1], list) else [args[1]]
         length = self._expect_int(args[2], "length must be integer")
+        if self._use_incremental_ta():
+            return self._r_squared_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                length,
+            )
+
+        series1 = self._as_series(args[0])
+        series2 = self._as_series(args[1])
 
         if len(series1) < length or len(series2) < length:
             return None
@@ -505,7 +506,7 @@ class VolatilityIndicators(TechnicalHelpers):
             return 0.0
 
         correlation = covariance / ((var1 * var2) ** 0.5)
-        r_squared = correlation ** 2
+        r_squared = correlation**2
 
         return max(0.0, min(1.0, r_squared))
 
@@ -519,9 +520,16 @@ class VolatilityIndicators(TechnicalHelpers):
             msg = "ta.comovement() requires 3 arguments: series1, series2, length"
             self._error(msg)
 
-        series1 = args[0] if isinstance(args[0], list) else [args[0]]
-        series2 = args[1] if isinstance(args[1], list) else [args[1]]
         length = self._expect_int(args[2], "length must be integer")
+        if self._use_incremental_ta():
+            return self._comovement_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                length,
+            )
+
+        series1 = self._as_series(args[0])
+        series2 = self._as_series(args[1])
 
         if len(series1) < length or len(series2) < length:
             return None
@@ -539,10 +547,17 @@ class VolatilityIndicators(TechnicalHelpers):
 
         ta.atr_stop(atr_value, multiplier)
         Calculate stop levels based on ATR.
+        Bar-mode incremental last sample uses ``_atr_stop_inc_update``.
         """
         if len(args) < BINARY:
             msg = "ta.atr_stop() requires 2 arguments: atr_value, multiplier"
             self._error(msg)
+
+        if self._use_incremental_ta():
+            return self._atr_stop_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+            )
 
         atr_val = float(args[0]) if isinstance(args[0], (int, float)) else None
         multiplier = float(args[1]) if isinstance(args[1], (int, float)) else 2.0
@@ -622,10 +637,18 @@ class VolatilityIndicators(TechnicalHelpers):
             msg = "ta.atr_normalized() requires 4 arguments: high, low, close, period"
             self._error(msg)
 
-        highs = args[0] if isinstance(args[0], list) else [args[0]]
-        lows = args[1] if isinstance(args[1], list) else [args[1]]
-        closes = args[2] if isinstance(args[2], list) else [args[2]]
         period = self._expect_int(args[3], "period must be integer")
+        if self._use_incremental_ta():
+            return self._atr_normalized_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                self._as_series_or_raw(args[2], last_sample_ok=True),
+                period,
+            )
+
+        highs = self._as_series(args[0])
+        lows = self._as_series(args[1])
+        closes = self._as_series(args[2])
 
         if len(closes) == 0 or not isinstance(closes[-1], (int, float)):
             return None

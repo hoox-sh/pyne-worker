@@ -504,9 +504,7 @@ def _rewrite_tickerid_call(span: str) -> str:
     return _rewrite_named_calls(span, "tickerid", replacer)
 
 
-def _convert_v3_to_v4_span(
-    span: str, *, tf_names: tuple[str, ...] = _TF_IDENTS, skip_n: bool = False
-) -> str:
+def _convert_v3_to_v4_span(span: str, *, tf_names: tuple[str, ...] = _TF_IDENTS, skip_n: bool = False) -> str:
     span = re.sub(r"(?<![\w.])color\s*\(", "color.new(", span)
     span = _prefix_idents(span, _COLOR_NAMES, "color")
     span = _prefix_idents(span, _DOW_NAMES, "dayofweek")

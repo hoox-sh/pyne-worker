@@ -107,6 +107,8 @@ need=(
   "$DEST/compiler/engine.py"
   "$DEST/ast/helper.py"
   "$DEST/runtime/host.py"
+  "$DEST/runtime/axb1.py"
+  "$DEST/strategy_risk_core.py"
   "$DEST/__init__.py"
 )
 for f in "${need[@]}"; do

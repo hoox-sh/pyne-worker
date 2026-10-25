@@ -49,6 +49,7 @@ from pynescript.ast.evaluator.builtins.drawing import LineFill
 from pynescript.ast.evaluator.builtins.drawing import Polyline
 from pynescript.ast.evaluator.builtins.drawing import Table
 
+
 # Sentinel for context.get — distinguishes missing key from stored None (na).
 _MISSING = object()
 from pynescript.ast.evaluator.builtins.matrix import Matrix
@@ -265,10 +266,7 @@ class NameEvaluator:
             # (motion: ``timer.isset(timer.new())``, ``option.isset(...)``).
             # Must run *before* field lookup so missing fields don't shadow them.
             ext = self.context.get(node.attr) if hasattr(self, "context") else None
-            if callable(ext) and (
-                getattr(ext, "__pine_method__", False)
-                or getattr(ext, "__pine_overloads__", None)
-            ):
+            if callable(ext) and (getattr(ext, "__pine_method__", False) or getattr(ext, "__pine_overloads__", None)):
                 return ("_ext_method", value, node.attr)
             # Otherwise try to get field (property or attribute of the UDT instance)
             return value.get_field(node.attr)
@@ -335,11 +333,7 @@ class NameEvaluator:
         # (``this.__theme.isset(theme.new())``). Skipping None previously
         # surfaced as ``Unknown built-in function: '__theme.isset'``.
         ext = self.context.get(node.attr) if hasattr(self, "context") else None
-        if (
-            callable(ext)
-            and not isinstance(ext, type)
-            and getattr(ext, "__pine_method__", False)
-        ):
+        if callable(ext) and not isinstance(ext, type) and getattr(ext, "__pine_method__", False):
             # ObjectInstance already handled via UDT methods / fields above.
             if not isinstance(value, ObjectInstance):
                 return ("_ext_method", value, node.attr)
@@ -498,11 +492,10 @@ class NameEvaluator:
                             ps.update(current)
                 elif hasattr(ps, "update"):
                     ps.update(current)
+            elif hasattr(ps, "update"):
+                ps.update(current)
             else:
-                if hasattr(ps, "update"):
-                    ps.update(current)
-                else:
-                    ps.current = current
+                ps.current = current
             last_map[site] = bar_i
             try:
                 return ps[slice_]
@@ -519,9 +512,7 @@ class NameEvaluator:
                 slice_ = ctx.get(slice_node.id, _MISSING)
                 if slice_ is _MISSING:
                     slice_ = self.visit(slice_node)  # type: ignore[attr-defined]
-            elif st_node is ast.Constant and (
-                slice_node.kind is None or slice_node.kind == "#"
-            ):
+            elif st_node is ast.Constant and (slice_node.kind is None or slice_node.kind == "#"):
                 slice_ = slice_node.value
             else:
                 slice_ = self.visit(slice_node)  # type: ignore[attr-defined]

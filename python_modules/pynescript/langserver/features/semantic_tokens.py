@@ -17,11 +17,13 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Semantic tokens — ``textDocument/semanticTokens/full``.
+"""Semantic tokens — ``textDocument/semanticTokens/full`` and ``/range``.
 
-Public handler: :func:`handle_semantic_tokens`. Walks the AST and emits an LSP
+Public handlers: :func:`handle_semantic_tokens`,
+:func:`handle_semantic_tokens_range`. Walks the AST and emits an LSP
 delta-encoded token stream (line, start, length, type, modifiers) for builtins,
-user functions, types, and variables beyond TextMate alone.
+user functions, types, and variables beyond TextMate alone. Range clips to
+tokens whose start falls inside the requested LSP range.
 
 **Contract:** token type indices must match
 :func:`pynescript.langserver.config.semantic_token_types` (and modifiers
@@ -98,20 +100,64 @@ def handle_semantic_tokens(
         :class:`~lsprotocol.types.SemanticTokens` with encoded ``data``
         (empty list if source missing or parse fails).
     """
+    return lsp.SemanticTokens(data=_encode(_collect_tokens(source, tree)))
+
+
+def handle_semantic_tokens_range(
+    params: lsp.SemanticTokensRangeParams,
+    source: str | None,
+    tree: Any | None = ...,
+) -> lsp.SemanticTokens | None:
+    """Return semantic tokens whose start falls inside *params.range*.
+
+    Inclusive start, exclusive end (typical LSP). Empty source, unparsed
+    documents, or ``tree=None`` yield an empty ``data`` array.
+
+    Args:
+        params: Client range params (document URI unused; source is passed in).
+        source: Document text, or ``None``.
+        tree: Pre-parsed AST from the workspace cache. Pass ``None`` when the
+            workspace already failed to parse (skips a redundant re-parse).
+            Omit (default ``...``) to parse from *source*.
+
+    Returns:
+        :class:`~lsprotocol.types.SemanticTokens` with encoded ``data``
+        (empty list if source missing, parse fails, or no tokens in range).
+    """
+    raw = _collect_tokens(source, tree)
+    clipped = [t for t in raw if _start_in_range(t[0], t[1], params.range)]
+    return lsp.SemanticTokens(data=_encode(clipped))
+
+
+def _collect_tokens(
+    source: str | None,
+    tree: Any | None,
+) -> list[tuple[int, int, int, int, int]]:
     if tree is ...:
         if not source:
-            return lsp.SemanticTokens(data=[])
+            return []
         try:
             tree = ast_helper.parse(source)
         except Exception:
-            return lsp.SemanticTokens(data=[])
+            return []
     if tree is None:
-        return lsp.SemanticTokens(data=[])
+        return []
 
     raw: list[tuple[int, int, int, int, int]] = []
     _collect(tree, raw)
     raw.sort(key=lambda t: (t[0], t[1]))
-    return lsp.SemanticTokens(data=_encode(raw))
+    return raw
+
+
+def _start_in_range(line: int, col: int, rng: lsp.Range) -> bool:
+    """True if token start (line, col) is in *rng* (inclusive start, exclusive end)."""
+    start = rng.start
+    end = rng.end
+    if (line, col) < (start.line, start.character):
+        return False
+    if (line, col) >= (end.line, end.character):
+        return False
+    return True
 
 
 def _collect(node: Any, out: list[tuple[int, int, int, int, int]]) -> None:

@@ -91,8 +91,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
         Motion uses ``str.length(seqArr.get(pointer))``; out-of-range / unset
         ``array.get`` yields ``na`` and must not hard-fail the bar.
         """
-        if len(args) != UNARY:
-            self._error("str.length takes a string argument")
+        self._require_len(args, UNARY, "str.length takes a string argument")
         value = args[0]
         if value is None:
             return None
@@ -102,16 +101,14 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_str_upper(self, args: list[Any]) -> str | None:
         """``str.upper(string)`` → uppercased string; ``na`` → ``na``."""
-        if len(args) != UNARY:
-            self._error("str.upper takes a string argument")
+        self._require_len(args, UNARY, "str.upper takes a string argument")
         if args[0] is None:
             return None
         return self._coerce_str_arg(args[0]).upper()
 
     def _builtin_str_lower(self, args: list[Any]) -> str | None:
         """``str.lower(string)`` → lowercased string; ``na`` → ``na``."""
-        if len(args) != UNARY:
-            self._error("str.lower takes a string argument")
+        self._require_len(args, UNARY, "str.lower takes a string argument")
         if args[0] is None:
             return None
         return self._coerce_str_arg(args[0]).lower()
@@ -122,8 +119,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
         Soft-coerces non-strings (numbers / series scalars) via ``str(...)`` so
         corpus residual paths that leak non-string types do not hard-fail.
         """
-        if len(args) != BINARY:
-            self._error("str.contains takes two string arguments")
+        self._require_len(args, BINARY, "str.contains takes two string arguments")
         if args[0] is None or args[1] is None:
             return None
         haystack = self._coerce_str_arg(args[0])
@@ -132,8 +128,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_str_startswith(self, args: list[Any]) -> bool | None:
         """Reference Pine: ``str.startswith(source, str)`` → bool; either arg ``na`` → ``na``."""
-        if len(args) != BINARY:
-            self._error("str.startswith takes two string arguments")
+        self._require_len(args, BINARY, "str.startswith takes two string arguments")
         if args[0] is None or args[1] is None:
             return None
         value = self._coerce_str_arg(args[0])
@@ -166,8 +161,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_str_endswith(self, args: list[Any]) -> bool | None:
         """Reference Pine: ``str.endswith(source, str)`` → bool; either arg ``na`` → ``na``."""
-        if len(args) != BINARY:
-            self._error("str.endswith takes two string arguments")
+        self._require_len(args, BINARY, "str.endswith takes two string arguments")
         if args[0] is None or args[1] is None:
             return None
         value = self._coerce_str_arg(args[0])
@@ -176,15 +170,13 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_str_repeat(self, args: list[Any]) -> str | None:
         """str.repeat(source, num) → string, or ``na`` if either arg is ``na``."""
-        if len(args) != BINARY:
-            self._error("str.repeat takes string and int")
+        self._require_len(args, BINARY, "str.repeat takes string and int")
         raw, count = args[0], args[1]
         if raw is None or count is None:
             return None
         value = raw if isinstance(raw, str) else str(raw)
         n = self._expect_int(count, "str.repeat takes string and int")
-        if n < 0:
-            n = 0
+        n = max(n, 0)
         return value * n
 
     @staticmethod
@@ -251,8 +243,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_str_replace_all(self, args: list[Any]) -> str | None:
         """Reference Pine: ``str.replace_all(source, target, replacement)``."""
-        if len(args) != TERNARY:
-            self._error("str.replace_all takes three strings")
+        self._require_len(args, TERNARY, "str.replace_all takes three strings")
         if args[0] is None and args[1] is None and args[2] is None:
             return None
         value = self._coerce_str_arg(args[0])
@@ -292,8 +283,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
 
     def _builtin_str_trim(self, args: list[Any]) -> str | None:
         """``str.trim(string)`` → strip whitespace; ``na`` → ``na``."""
-        if len(args) != UNARY:
-            self._error("str.trim takes a string argument")
+        self._require_len(args, UNARY, "str.trim takes a string argument")
         if args[0] is None:
             return None
         return self._coerce_str_arg(args[0]).strip()
@@ -308,8 +298,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
         Soft-coerces ``na`` / non-string (array.get miss, numbers) → ``na`` or
         ``float(value)`` rather than hard-failing ``takes a string argument``.
         """
-        if len(args) != UNARY:
-            self._error("str.tonumber takes a string argument")
+        self._require_len(args, UNARY, "str.tonumber takes a string argument")
         value = args[0]
         if value is None:
             return None
@@ -432,8 +421,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
         Note: returns the matched *string* (not a bool). Either arg ``na`` → ``na``.
         Invalid regex → ``na`` rather than hard-fail (corpus residual resilience).
         """
-        if len(args) != BINARY:
-            self._error("str.match takes source string and regex")
+        self._require_len(args, BINARY, "str.match takes source string and regex")
         if args[0] is None or args[1] is None:
             return None
         source = self._coerce_str_arg(args[0])
@@ -452,8 +440,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
         Either arg ``na`` → ``na`` (reference soft-na). Aligns with compile emit
         ``str(source).find(str(needle))``.
         """
-        if len(args) != BINARY:
-            self._error("str.pos takes source string and substring")
+        self._require_len(args, BINARY, "str.pos takes source string and substring")
         if args[0] is None or args[1] is None:
             return None
         haystack = self._coerce_str_arg(args[0])
@@ -518,8 +505,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
 
         ``na`` array → ``na``; ``na`` separator → ``""``; ``na`` elements → empty.
         """
-        if len(args) != BINARY:
-            self._error("str.join takes an array and a separator string")
+        self._require_len(args, BINARY, "str.join takes an array and a separator string")
         sequence = args[0]
         if sequence is None:
             return None
@@ -555,12 +541,7 @@ class StringBuiltinsMixin(BuiltinDispatchMixin):
                 if z in {"syminfo.timezone", "UTC", "utc", "Etc/UTC", "GMT"}:
                     tz = datetime.timezone.utc
                 elif "GMT" in z.upper() or z.startswith(("UTC+", "UTC-", "utc+", "utc-")):
-                    offset_str = (
-                        z.upper()
-                        .replace("GMT", "")
-                        .replace("UTC", "")
-                        .strip()
-                    )
+                    offset_str = z.upper().replace("GMT", "").replace("UTC", "").strip()
                     if offset_str:
                         # Accept "+2", "-5", "2"
                         offset = int(offset_str)

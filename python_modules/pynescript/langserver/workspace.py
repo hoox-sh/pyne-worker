@@ -85,6 +85,7 @@ class Workspace:
     Public surface used by the server:
 
     - :meth:`get_document` / :meth:`get_source` / :attr:`documents`
+    - :meth:`list_open_documents` — snapshot of currently open states
     - :meth:`put_document` / :meth:`update_document` / :meth:`remove_document`
     - :meth:`get_all_diagnostics` — LSP diagnostics for every open URI
     """
@@ -102,6 +103,10 @@ class Workspace:
         """Return buffer text for *uri*, or ``None`` if not open."""
         doc = self._documents.get(uri)
         return doc.source if doc else None
+
+    def list_open_documents(self) -> list[TextDocumentState]:
+        """Return a snapshot of currently open document states."""
+        return list(self._documents.values())
 
     def put_document(self, uri: str, source: str, version: int = 1) -> TextDocumentState:
         """Insert or replace a document, then parse and lint."""

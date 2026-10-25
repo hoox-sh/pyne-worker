@@ -40,6 +40,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from pynescript.ast import parse
+from pynescript.ast.helper import walk
+from pynescript.ast.node import Arg
+from pynescript.ast.node import Attribute
+from pynescript.ast.node import Call
+from pynescript.ast.node import Conditional
+from pynescript.ast.node import Constant
+from pynescript.ast.node import If
+from pynescript.ast.node import Name
+from pynescript.ast.node import While
 
 
 @dataclass
@@ -93,11 +102,14 @@ class PineLinter:
         self.warnings = []
 
         if tree is None:
-            self._check_syntax(source, filename)
+            tree = self._check_syntax(source, filename)
         self._check_version(source)
         self._check_deprecated(source)
         self._check_naming(source)
         self._check_style(source)
+        if tree is not None:
+            self._check_v6_kwargs(tree)
+            self._check_bool_conditions(tree)
 
         return self.warnings
 
@@ -112,10 +124,14 @@ class PineLinter:
         """Append a :class:`LintWarning` to :attr:`warnings`."""
         self.warnings.append(LintWarning(code=code, message=message, line=line, column=column, severity=severity))
 
-    def _check_syntax(self, source: str, filename: str) -> None:
-        """Parse *source*; emit ``E001`` if :func:`~pynescript.ast.helper.parse` fails."""
+    def _check_syntax(self, source: str, filename: str) -> Any | None:
+        """Parse *source*; emit ``E001`` if :func:`~pynescript.ast.helper.parse` fails.
+
+        Returns the parsed tree on success (reused by AST-based rules),
+        else ``None``.
+        """
         try:
-            parse(source, filename)
+            return parse(source, filename)
         except Exception as e:
             line: int | None = None
             column: int | None = None
@@ -144,6 +160,7 @@ class PineLinter:
                 column=column,
                 severity="error",
             )
+        return None
 
     def _check_version(self, source: str) -> None:
         """Require ``//@version=…``; warn if version is below 5 (``W001``/``W002``)."""
@@ -179,6 +196,69 @@ class PineLinter:
             for match in re.finditer(pattern, source, re.IGNORECASE):
                 line_num = source[: match.start()].count("\n") + 1
                 self._add_warning(code, message, line=line_num)
+
+    def _check_v6_kwargs(self, tree: Any) -> None:
+        """Flag v6-removed kwargs that the evaluator silently ignores (``W104``).
+
+        * ``when=`` on ``strategy.*`` order calls (removed in v6; gate with
+          an ``if`` block instead).
+        * ``transp=`` on drawing/plot calls (removed in v6; use
+          ``color.new(color, transp)`` instead). ``color.new`` / ``color()``
+          keep a valid ``transp`` and are never flagged.
+        """
+        for node in walk(tree):
+            if not isinstance(node, Call):
+                continue
+            func = _call_func_name(node.func)
+            if func is None:
+                continue
+            kwargs = {a.name for a in node.args if isinstance(a, Arg) and a.name}
+            if not kwargs:
+                continue
+            line = getattr(node, "lineno", None)
+            head, _, _ = func.partition(".")
+            if head == "strategy" and "when" in kwargs:
+                self._add_warning(
+                    code="W104",
+                    message="strategy.* 'when=' was removed in v6 and is ignored; gate with an 'if' block instead",
+                    line=line,
+                )
+            if "transp" in kwargs and func not in ("color.new", "color"):
+                if head in ("line", "box", "label", "table", "polyline", "linefill") or func in (
+                    "plot",
+                    "plotarrow",
+                    "plotbar",
+                    "plotcandle",
+                    "plotchar",
+                    "plotshape",
+                    "fill",
+                    "bgcolor",
+                    "barcolor",
+                    "hline",
+                ):
+                    self._add_warning(
+                        code="W104",
+                        message="'transp=' was removed in v6 and is ignored; use color.new(color, transp) instead",
+                        line=line,
+                    )
+
+    def _check_bool_conditions(self, tree: Any) -> None:
+        """Flag numeric literals in boolean positions (``W105``).
+
+        The evaluator stays permissive (``if 1`` runs the body), so v6
+        strictness — explicit comparisons or ``bool()`` casts — is nudged
+        here rather than enforced at runtime.
+        """
+        for node in walk(tree):
+            if not isinstance(node, (If, While, Conditional)):
+                continue
+            test = node.test
+            if isinstance(test, Constant) and isinstance(test.value, (int, float)) and not isinstance(test.value, bool):
+                self._add_warning(
+                    code="W105",
+                    message="Numeric literal in boolean condition; use an explicit comparison or bool() cast",
+                    line=getattr(node, "lineno", None),
+                )
 
     def _check_naming(self, source: str) -> None:
         """Heuristic naming checks for ``ta.*`` assignments (``C001``)."""
@@ -228,6 +308,20 @@ class PineLinter:
                 code="C004",
                 message="File should end with a newline",
             )
+
+
+def _call_func_name(func: Any) -> str | None:
+    """Build ``a.b.c`` from Attribute/Name nodes without evaluating values."""
+    parts: list[str] = []
+    cur = func
+    while isinstance(cur, Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, Name):
+        return None
+    parts.append(cur.id)
+    parts.reverse()
+    return ".".join(parts)
 
 
 def _to_camel(name: str) -> str:

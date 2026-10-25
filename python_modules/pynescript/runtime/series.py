@@ -58,8 +58,10 @@ import os
 import re
 
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
+from collections.abc import Sequence
 from typing import Any
+
 
 # Aligns with evaluator TechnicalMixin._SERIES_MAX (TA materialization window).
 DEFAULT_SERIES_MAX = 256
@@ -153,8 +155,7 @@ def resolve_series_cap(
             mbb = int(max_bars_back)
         except (TypeError, ValueError):
             mbb = 0
-        if mbb > base:
-            base = mbb
+        base = max(base, mbb)
     return max(1, base)
 
 
@@ -319,7 +320,7 @@ class PineSeries:
     Out-of-range offsets return ``None`` (Pine ``na``); never invent ``0``.
     """
 
-    __slots__ = ("history", "current")
+    __slots__ = ("current", "history")
     __hash__ = None  # type: ignore
 
     def __init__(self, initial_value: Any = None, history_length: int = DEFAULT_PINESERIES_HISTORY):
@@ -384,8 +385,7 @@ class PineSeries:
     def _binary_op(self, other: Any, op: Callable) -> Any:
         # Duck-type RingPineSeries / other wrappers (flag-on host mix).
         if isinstance(other, PineSeries) or (
-            hasattr(other, "current")
-            and type(other).__name__ in {"PineSeries", "RingPineSeries"}
+            hasattr(other, "current") and type(other).__name__ in {"PineSeries", "RingPineSeries"}
         ):
             other_val = other.current
         else:

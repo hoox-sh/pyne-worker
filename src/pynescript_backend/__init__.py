@@ -9,6 +9,7 @@
 - :class:`Runtime` — package Runtime + strict OHLCV validation
 - ``timeout_seconds`` — package Runtime circuit breaker (shared with Pro API)
 - ``libraries`` — AXIS git-publish emulator (``import ns/Name/ver``)
+- ``realtime_*`` — last-bar ``isrealtime`` / multi-tick ``varip`` (pynescript 0.6.14+)
 
 Keep ``./scripts/sync_vendor.sh`` in the deploy path so ``python_modules/``
 ships the same package tree Wrangler vendors.

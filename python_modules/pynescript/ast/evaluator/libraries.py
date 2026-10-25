@@ -153,9 +153,7 @@ def bind_tradingview_ta_stub_exports(evaluator: Any) -> dict[str, Callable[..., 
             "slow": "slowLen",
         }
         norm_kw = {alias.get(k, k): v for k, v in kwargs.items()}
-        merged = _merge_stub_args(
-            args, norm_kw, ["source", "erLen", "fastLen", "slowLen"]
-        )
+        merged = _merge_stub_args(args, norm_kw, ["source", "erLen", "fastLen", "slowLen"])
         return evaluator._builtin_ta_kama(merged)
 
     return {"aroon": aroon, "kama": kama}

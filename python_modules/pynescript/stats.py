@@ -127,9 +127,18 @@ class _Latency:
 
 
 def _percentile(ordered: list[float], q: float) -> float:
-    """Nearest-rank percentile over a pre-sorted list (0.0 when empty)."""
+    """Nearest-rank percentile over a pre-sorted list (0.0 when empty).
+
+    Args:
+        ordered: Pre-sorted float samples.
+        q: Quantile in [0.0, 1.0].
+
+    Returns:
+        float: The percentile value.
+    """
     if not ordered:
         return 0.0
+    # Nearest-rank index bounded to valid range.
     idx = round(q * (len(ordered) - 1))
     return ordered[max(0, min(idx, len(ordered) - 1))]
 
@@ -142,12 +151,20 @@ _STARTED_AT = time.time()
 
 
 def started_at() -> float:
-    """Unix timestamp of process/module import (uptime anchor)."""
+    """Unix timestamp of process/module import (uptime anchor).
+
+    Returns:
+        float: Unix timestamp when the module was imported.
+    """
     return _STARTED_AT
 
 
 def uptime_seconds() -> float:
-    """Seconds since this module was imported into the process."""
+    """Seconds since this module was imported into the process.
+
+    Returns:
+        float: Elapsed seconds since import.
+    """
     return time.time() - _STARTED_AT
 
 
@@ -160,7 +177,7 @@ def _swallow() -> Iterator[None]:
     """
     try:
         yield
-    except Exception:  # noqa: S110 — see docstring: observability must never raise
+    except Exception:  # see docstring: observability must never raise
         pass
 
 
@@ -238,9 +255,7 @@ def timer(name: str) -> Iterator[None]:
 def snapshot() -> dict[str, Any]:
     """Return a JSON-serializable copy of all metrics collected so far."""
     with _lock:
-        counters = {
-            name: {"total": _num(b.total), **_dim_dict(b)} for name, b in sorted(_counters.items())
-        }
+        counters = {name: {"total": _num(b.total), **_dim_dict(b)} for name, b in sorted(_counters.items())}
         latencies = {name: b.summary() for name, b in sorted(_latencies.items())}
         gauges = {name: _num(v) for name, v in sorted(_gauges.items())}
     return {
@@ -261,13 +276,21 @@ def reset() -> None:
 
 
 def _dim_dict(bucket: _Counter) -> dict[str, Any]:
+    """Build dimension breakdown from a counter bucket."""
     if not bucket.dims:
         return {}
     return {"by": {k: _num(v) for k, v in sorted(bucket.dims.items())}}
 
 
 def _num(value: float) -> float | int:
-    """Return an ``int`` when the float is integral so JSON stays readable."""
+    """Return an ``int`` when the float is integral so JSON stays readable.
+
+    Args:
+        value: Numeric value to normalize.
+
+    Returns:
+        int if integral, else rounded float.
+    """
     if float(value).is_integer():
         return int(value)
     return round(float(value), 3)

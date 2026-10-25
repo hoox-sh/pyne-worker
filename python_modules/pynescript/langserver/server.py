@@ -32,11 +32,14 @@
 
 **Feature handlers** (delegated to :mod:`pynescript.langserver.features`)
 
-- completion (+ resolve), hover, definition, references
+- completion (+ resolve), hover, signatureHelp, definition, references
+- documentHighlight, linkedEditingRange, prepareRename, rename (open workspace documents)
 - documentSymbol, workspace/symbol
-- formatting / rangeFormatting
-- inlayHint, semanticTokens/full
-- codeAction + ``pynescript.convertToV6`` executeCommand
+- formatting / rangeFormatting / onTypeFormatting
+- inlayHint (+ resolve), semanticTokens/full, semanticTokens/range, foldingRange, selectionRange
+- documentColor / colorPresentation (``#hex`` literals)
+- documentLink (+ resolve tooltip) (``http(s)`` URLs in comments and string literals)
+- codeAction (Convert-to-v6 + W001 QuickFix) + ``pynescript.convertToV6`` executeCommand
 
 Advertised capabilities come from :func:`pynescript.langserver.config.get_server_capabilities`
 — only list methods that have implementations here.
@@ -62,11 +65,19 @@ from pynescript.langserver import config
 from pynescript.langserver.features import completion as completion_feature
 from pynescript.langserver.features import convert as convert_feature
 from pynescript.langserver.features import definitions as definitions_feature
+from pynescript.langserver.features import document_color as document_color_feature
+from pynescript.langserver.features import document_link as document_link_feature
+from pynescript.langserver.features import folding as folding_feature
 from pynescript.langserver.features import formatting as formatting_feature
+from pynescript.langserver.features import highlight as highlight_feature
 from pynescript.langserver.features import hover as hover_feature
 from pynescript.langserver.features import inlay_hints as inlay_hints_feature
+from pynescript.langserver.features import linked_editing as linked_editing_feature
 from pynescript.langserver.features import references as references_feature
+from pynescript.langserver.features import rename as rename_feature
+from pynescript.langserver.features import selection_range as selection_range_feature
 from pynescript.langserver.features import semantic_tokens as semantic_tokens_feature
+from pynescript.langserver.features import signature_help as signature_help_feature
 from pynescript.langserver.features import symbols as symbols_feature
 from pynescript.langserver.workspace import Workspace
 
@@ -290,11 +301,12 @@ class PynescriptLanguageServer(LanguageServer):
 
         @self.feature(lsp.TEXT_DOCUMENT_CODE_ACTION)
         def code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction]:
-            """Offer Convert-to-v6 when the script is older than v6."""
+            """Offer Convert-to-v6 and a W001 QuickFix (insert ``//@version=6``)."""
             uri = params.text_document.uri
             doc = self.pine_workspace.get_document(uri)
             source = doc.source if doc else None
-            return convert_feature.handle_code_action(params, source)
+            warnings = doc.diagnostics if doc else None
+            return convert_feature.handle_code_action(params, source, warnings)
 
         @self.feature(lsp.TEXT_DOCUMENT_COMPLETION)
         def text_completion(
@@ -325,6 +337,17 @@ class PynescriptLanguageServer(LanguageServer):
                 return hover_feature.handle_hover(params, None)
             return hover_feature.handle_hover(params, doc.source, tree=doc.ast, cache=doc.feature_cache)
 
+        @self.feature(lsp.TEXT_DOCUMENT_SIGNATURE_HELP)
+        def text_signature_help(
+            params: lsp.SignatureHelpParams,
+        ) -> lsp.SignatureHelp | None:
+            """Handle textDocument/signatureHelp request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return signature_help_feature.handle_signature_help(params, None)
+            return signature_help_feature.handle_signature_help(params, doc.source, tree=doc.ast)
+
         @self.feature(lsp.TEXT_DOCUMENT_DEFINITION)
         def text_definition(
             params: lsp.DefinitionParams,
@@ -347,6 +370,56 @@ class PynescriptLanguageServer(LanguageServer):
             if not doc:
                 return references_feature.handle_references(params, None, uri)
             return references_feature.handle_references(params, doc.source, uri, tree=doc.ast)
+
+        @self.feature(lsp.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT)
+        def text_document_highlight(
+            params: lsp.DocumentHighlightParams,
+        ) -> list[lsp.DocumentHighlight]:
+            """Handle textDocument/documentHighlight request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return highlight_feature.handle_document_highlight(params, None)
+            return highlight_feature.handle_document_highlight(params, doc.source, tree=doc.ast)
+
+        @self.feature(lsp.TEXT_DOCUMENT_LINKED_EDITING_RANGE)
+        def text_linked_editing_range(
+            params: lsp.LinkedEditingRangeParams,
+        ) -> lsp.LinkedEditingRanges | None:
+            """Handle textDocument/linkedEditingRange request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return linked_editing_feature.handle_linked_editing_range(params, None)
+            return linked_editing_feature.handle_linked_editing_range(params, doc.source, tree=doc.ast)
+
+        @self.feature(lsp.TEXT_DOCUMENT_PREPARE_RENAME)
+        def text_prepare_rename(
+            params: lsp.PrepareRenameParams,
+        ) -> lsp.Range | None:
+            """Handle textDocument/prepareRename request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return rename_feature.handle_prepare_rename(params, None)
+            return rename_feature.handle_prepare_rename(params, doc.source, tree=doc.ast)
+
+        @self.feature(lsp.TEXT_DOCUMENT_RENAME)
+        def text_rename(
+            params: lsp.RenameParams,
+        ) -> lsp.WorkspaceEdit | None:
+            """Handle textDocument/rename across currently open documents."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return rename_feature.handle_rename(params, None, uri)
+            return rename_feature.handle_rename(
+                params,
+                doc.source,
+                uri,
+                tree=doc.ast,
+                workspace=self.pine_workspace,
+            )
 
         @self.feature(lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
         def text_document_symbol(
@@ -381,6 +454,17 @@ class PynescriptLanguageServer(LanguageServer):
                 return formatting_feature.handle_range_formatting(params, None)
             return formatting_feature.handle_range_formatting(params, doc.source, tree=doc.ast)
 
+        @self.feature(lsp.TEXT_DOCUMENT_ON_TYPE_FORMATTING)
+        def text_on_type_formatting(
+            params: lsp.DocumentOnTypeFormattingParams,
+        ) -> list[lsp.TextEdit] | None:
+            """Handle textDocument/onTypeFormatting request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return formatting_feature.handle_on_type_formatting(params, None)
+            return formatting_feature.handle_on_type_formatting(params, doc.source, tree=doc.ast)
+
         @self.feature(lsp.TEXT_DOCUMENT_INLAY_HINT)
         def text_inlay_hints(
             params: lsp.InlayHintParams,
@@ -398,6 +482,85 @@ class PynescriptLanguageServer(LanguageServer):
             doc.feature_cache["inlay_hints"] = result
             return result
 
+        @self.feature(lsp.INLAY_HINT_RESOLVE)
+        def inlay_hint_resolve(params: lsp.InlayHint) -> lsp.InlayHint:
+            """Handle inlayHint/resolve request (fill textEdits)."""
+            return inlay_hints_feature.handle_inlay_hint_resolve(params)
+
+        @self.feature(lsp.TEXT_DOCUMENT_FOLDING_RANGE)
+        def text_folding_range(
+            params: lsp.FoldingRangeParams,
+        ) -> list[lsp.FoldingRange]:
+            """Handle textDocument/foldingRange request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return folding_feature.handle_folding_range(params, None)
+            cached = doc.feature_cache.get("folding_range", _MISSING)
+            if cached is not _MISSING:
+                return cached
+            result = folding_feature.handle_folding_range(params, doc.source, tree=doc.ast)
+            doc.feature_cache["folding_range"] = result
+            return result
+
+        @self.feature(lsp.TEXT_DOCUMENT_SELECTION_RANGE)
+        def text_selection_range(
+            params: lsp.SelectionRangeParams,
+        ) -> list[lsp.SelectionRange]:
+            """Handle textDocument/selectionRange request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return selection_range_feature.handle_selection_range(params, None)
+            return selection_range_feature.handle_selection_range(params, doc.source, tree=doc.ast)
+
+        @self.feature(lsp.TEXT_DOCUMENT_DOCUMENT_COLOR)
+        def text_document_color(
+            params: lsp.DocumentColorParams,
+        ) -> list[lsp.ColorInformation]:
+            """Handle textDocument/documentColor request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return document_color_feature.handle_document_color(params, None)
+            cached = doc.feature_cache.get("document_color", _MISSING)
+            if cached is not _MISSING:
+                return cached
+            result = document_color_feature.handle_document_color(params, doc.source, tree=doc.ast)
+            doc.feature_cache["document_color"] = result
+            return result
+
+        @self.feature(lsp.TEXT_DOCUMENT_COLOR_PRESENTATION)
+        def text_color_presentation(
+            params: lsp.ColorPresentationParams,
+        ) -> list[lsp.ColorPresentation]:
+            """Handle textDocument/colorPresentation request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            source = doc.source if doc else None
+            return document_color_feature.handle_color_presentation(params, source)
+
+        @self.feature(lsp.TEXT_DOCUMENT_DOCUMENT_LINK)
+        def text_document_link(
+            params: lsp.DocumentLinkParams,
+        ) -> list[lsp.DocumentLink]:
+            """Handle textDocument/documentLink request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return document_link_feature.handle_document_link(params, None)
+            cached = doc.feature_cache.get("document_link", _MISSING)
+            if cached is not _MISSING:
+                return cached
+            result = document_link_feature.handle_document_link(params, doc.source, tree=doc.ast)
+            doc.feature_cache["document_link"] = result
+            return result
+
+        @self.feature(lsp.DOCUMENT_LINK_RESOLVE)
+        def document_link_resolve(params: lsp.DocumentLink) -> lsp.DocumentLink:
+            """Handle documentLink/resolve request (fill tooltip)."""
+            return document_link_feature.handle_document_link_resolve(params)
+
         @self.feature(lsp.TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL)
         def text_semantic_tokens(
             params: lsp.SemanticTokensParams,
@@ -414,6 +577,17 @@ class PynescriptLanguageServer(LanguageServer):
             result = semantic_tokens_feature.handle_semantic_tokens(params, doc.source, tree=doc.ast)
             doc.feature_cache["semantic_tokens"] = result
             return result
+
+        @self.feature(lsp.TEXT_DOCUMENT_SEMANTIC_TOKENS_RANGE)
+        def text_semantic_tokens_range(
+            params: lsp.SemanticTokensRangeParams,
+        ) -> lsp.SemanticTokens | None:
+            """Handle textDocument/semanticTokens/range request."""
+            uri = params.text_document.uri
+            doc = self.pine_workspace.get_document(uri)
+            if not doc:
+                return semantic_tokens_feature.handle_semantic_tokens_range(params, None)
+            return semantic_tokens_feature.handle_semantic_tokens_range(params, doc.source, tree=doc.ast)
 
     def _schedule_diagnostics(self, uri: str, doc: Any) -> None:
         """Schedule (or re-schedule) a debounced parse+lint+publish for *uri*."""

@@ -1,6 +1,6 @@
 # pyne-worker — Agent Instructions
 
-Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package (engine ≥ 0.6.12: libraries, timeout, drawings, windowing).
+Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package (engine ≥ 0.6.22: libraries, timeout, drawings, windowing, realtime last-bar).
 
 ## Stack
 
@@ -64,7 +64,7 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 | `src/alert_engine.py` | Last-bar alert filter + summary helpers |
 | `src/alert_forwarder.py` | L2 HTTP webhook delivery for alerts |
 | `wrangler.jsonc` | Worker config + cron `* * * * *` |
-| `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars; `libraries` / `timeout_seconds`) |
+| `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars; `libraries` / `timeout_seconds` / `realtime_*`) |
 | `scripts/live_test.py` | Live E2E + latency suite vs deployed worker (`npm run test:live`) |
 | `package.json` | npm shortcuts (`dev`, `deploy`, `test`, `test:live`, `vendor`, `bench`) |
 | `pyproject.toml` | Package config (editable dep on `pynescript`) |

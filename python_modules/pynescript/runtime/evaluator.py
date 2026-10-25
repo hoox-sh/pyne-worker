@@ -26,14 +26,15 @@ plot series, shapes, and bgcolors as JSON-safe columns for AXIS.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
-from typing import Callable
 
 from pynescript.ast.evaluator import NodeLiteralEvaluator
 from pynescript.ast.evaluator.builtins.plot_params import WIRE_PARAMS as WIRE_PARAM_NAMES
 from pynescript.ast.evaluator.builtins.plot_params import extract_wire_meta
 from pynescript.ast.evaluator.builtins.plot_params import param_index
 from pynescript.runtime.series import PineSeries
+
 
 _MISSING: Any = object()
 # Type-identity for plot(close) / host OHLCV series (no getattr).
@@ -369,7 +370,7 @@ class CustomEvaluator(NodeLiteralEvaluator):
         except (TypeError, AttributeError, ValueError, KeyError, IndexError):
             # Optional plot-id plumbing — soft-fail (fill still works without ids).
             return None
-        except Exception:  # noqa: BLE001 — never kill plot capture for registry
+        except Exception:  # never kill plot capture for registry
             return None
 
     def _lazy_plot_color(self, i: int, args: list[Any], kwargs: dict[str, Any] | None) -> None:

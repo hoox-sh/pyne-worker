@@ -40,6 +40,7 @@ from pynescript.optimize.types import StudyResult
 from pynescript.optimize.types import TrialResult
 from pynescript.optimize.types import ValidationSpec
 
+
 __all__ = [
     "MAX_TRIALS",
     "ParamSpec",

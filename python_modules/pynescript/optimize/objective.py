@@ -26,6 +26,7 @@ import math
 from pynescript.optimize.types import ObjectiveId
 from pynescript.optimize.types import StrategyStats
 
+
 REJECT = float("-inf")
 
 

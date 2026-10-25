@@ -53,7 +53,7 @@ from typing import Callable
 
 DEFAULT_URL = "https://pyne-worker.cryptolinx.workers.dev"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-USER_AGENT = "pyne-worker-live-test/0.7.0"
+USER_AGENT = "pyne-worker-live-test/0.8.0"
 
 # Fixed fixture clock — 2026-01-01T00:00:00Z. Deterministic (identical bars on
 # every run → R2 ingest dedupes by time) and inside the reader's ~10-year scan.
@@ -341,7 +341,11 @@ def case_health(s: Suite) -> Outcome:
     if body.get("worker") != "pyne-worker":
         return Outcome.failed(f"worker={body.get('worker')!r}")
     features = body.get("features") or {}
-    missing = [k for k in ("scripts", "cron", "alerts", "libraries", "windowing") if k not in features]
+    missing = [
+        k
+        for k in ("scripts", "cron", "alerts", "libraries", "windowing", "realtime")
+        if k not in features
+    ]
     if missing:
         return Outcome.failed("feature flags missing: " + ", ".join(missing))
     s.health = body

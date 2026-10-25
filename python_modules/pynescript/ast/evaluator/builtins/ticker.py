@@ -176,7 +176,7 @@ def ticker_heikinashi(ticker_str: str) -> TickerInfo:
     return ticker
 
 
-def ticker_kagi(ticker_str: str, short: float = 3.0, style: str = None) -> TickerInfo:
+def ticker_kagi(ticker_str: str, short: float = 3.0, style: str | None = None) -> TickerInfo:
     """Create a Kagi chart ticker from a symbol.
 
     Applies Kagi charting transformation. v6 style support.
@@ -285,9 +285,7 @@ def ticker_pointfigure(
         rev = _as_int_or_none(kwargs["reversal"])
 
     arg1 = source_or_boxsize
-    is_source = isinstance(arg1, str) and (
-        arg1.lower() in _PNF_SOURCES or not _looks_like_number(arg1)
-    )
+    is_source = isinstance(arg1, str) and (arg1.lower() in _PNF_SOURCES or not _looks_like_number(arg1))
     if is_source:
         # Full form: (symbol, source, style, param, reversal)
         source = str(arg1)
@@ -330,7 +328,7 @@ def _looks_like_number(v: Any) -> bool:
         return False
 
 
-def ticker_renko(ticker_str: str, boxsize: float = 1.0, style: str = None) -> TickerInfo:
+def ticker_renko(ticker_str: str, boxsize: float = 1.0, style: str | None = None) -> TickerInfo:
     """Create a Renko chart ticker from a symbol.
 
     Applies Renko charting transformation. v6: supports style="PercentageLTP" etc.
@@ -493,6 +491,7 @@ def register_ticker_functions(namespace: dict) -> None:
     namespace["linebreak"] = _as_builtin_handler(ticker_linebreak)
     namespace["pointfigure"] = _as_builtin_handler(ticker_pointfigure)
     namespace["renko"] = _as_builtin_handler(ticker_renko)
+
     # Dual-mode free-function fallbacks (no host context). Preferred path is
     # UtilityFunctionsMixin bound handlers which read chart ``syminfo``.
     def _prefix_fn(symbol: Any = None, *a: Any, **k: Any) -> str:

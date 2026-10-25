@@ -109,7 +109,7 @@ class _ThreadParseEngine:
     ``_numOpens`` / ``_numSqBrackets`` or leftover tokens.
     """
 
-    __slots__ = ("lexer", "tokens", "parser")
+    __slots__ = ("lexer", "parser", "tokens")
 
     def __init__(self) -> None:
         self.lexer = PinescriptLexer(InputStream(""))
@@ -139,6 +139,7 @@ def _thread_parse_engine() -> _ThreadParseEngine:
         eng = _ThreadParseEngine()
         _PARSE_TLS.engine = eng
     return eng
+
 
 # Cached after first annotation pass (avoids circular import at module load).
 _StatementCollector = None
@@ -290,9 +291,9 @@ def _parse_cache_put(key: tuple[str, str], tree: AST) -> AST:
 def _get_statement_collector_cls():
     global _StatementCollector
     if _StatementCollector is None:
-        from pynescript.ast.collector import StatementCollector as _SC
+        from pynescript.ast.collector import StatementCollector
 
-        _StatementCollector = _SC
+        _StatementCollector = StatementCollector
     return _StatementCollector
 
 
@@ -688,7 +689,8 @@ def dump(
     Raises:
         TypeError: If ``node`` is not an :class:`~pynescript.ast.node.AST`.
     """
-    def _format(node, level=0):  # noqa: PLR0912
+
+    def _format(node, level=0):
         # Prepare indentation and separator based on indent parameter
         if indent is not None:
             level += 1
@@ -746,7 +748,7 @@ def dump(
                     args.append(f"{name}={value}")
 
             # Smart formatting: single-line for simple, short outputs
-            if allsimple and len(args) <= 3:  # noqa: PLR2004
+            if allsimple and len(args) <= 3:
                 return "{}({})".format(node.__class__.__name__, ", ".join(args)), not args
             # Multi-line formatting for complex structures
             return f"{node.__class__.__name__}({prefix}{sep.join(args)})", False
@@ -829,7 +831,7 @@ def iter_child_nodes(node: AST) -> Iterator[AST]:
                     yield item
 
 
-def _fix_locations(  # noqa: PLR0912
+def _fix_locations(
     node: AST,
     lineno: int,
     col_offset: int,

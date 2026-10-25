@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-
 import re
 import sys
 
@@ -36,14 +35,13 @@ from antlr4.Token import CommonToken
 from pynescript.ast.error import IndentationError as PinescriptIndentationError
 from pynescript.ast.error import SyntaxError as PinescriptSyntaxError
 
+
 # Precompiled once — only applied to line-wrapped single/double-quoted strings.
 _STRING_COLLAPSE_NL = re.compile(r"(\r?\n)+")
 _STRING_STRIP_WRAP_INDENT = re.compile(r"(\r?\n)(\s)+")
 
 
 class PinescriptLexerBase(Lexer):
-    # ruff: noqa: N802, N806, A002
-
     """
     - ignore possible leading newlines
     - ignore excessive trailing newlines except a single newline
@@ -268,7 +266,7 @@ class PinescriptLexerBase(Lexer):
             self._setNextInternalTokens()
             following_type = self._followingToken.type
 
-        if following_type == self.NEWLINE or following_type == self.COMMENT:
+        if following_type in {self.NEWLINE, self.COMMENT}:
             self._hideAndAddPendingToken(nl_token)
             if is_looking_ahead:
                 self._addPendingToken(self._currentToken)
@@ -336,7 +334,7 @@ class PinescriptLexerBase(Lexer):
 
     def _insertTrailingTokens(self):
         last = self._lastPendingTokenTypeFromDefaultChannel
-        if last != self.NEWLINE and last != self.DEDENT:
+        if last not in {self.NEWLINE, self.DEDENT}:
             self._createAndAddPendingToken(self.NEWLINE, Token.DEFAULT_CHANNEL, None, self._followingToken)
         self._insertIndentOrDedentToken(0)
 

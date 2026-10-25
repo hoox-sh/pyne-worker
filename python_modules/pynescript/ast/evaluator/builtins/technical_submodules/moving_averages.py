@@ -115,7 +115,7 @@ class MovingAverageIndicators(TechnicalHelpers):
         """Kaufman's Adaptive Moving Average.
 
         reference / community form: ``ta.kama(source, length, fastLength=2, slowLength=30)``.
-        Accepts 2–4 positional args (fast/slow default to Kaufman's 2/30).
+        Accepts 2-4 positional args (fast/slow default to Kaufman's 2/30).
         """
         n = len(args)
         if n < BINARY:
@@ -253,12 +253,17 @@ class MovingAverageIndicators(TechnicalHelpers):
             msg = "ta.sma_weighted() requires at least 2 arguments: series, period"
             self._error(msg)
 
-        series = args[0] if isinstance(args[0], list) else [args[0]]
         period = self._expect_int(args[1], "period must be integer")
         weight_type = args[2] if len(args) > BINARY else "linear"
 
         if not isinstance(weight_type, str):
             weight_type = "linear"
+
+        if self._use_incremental_ta():
+            series = self._as_series_or_raw(args[0], last_sample_ok=True)
+            return self._sma_weighted_inc_update(series, period, weight_type)
+
+        series = self._as_series(args[0])
 
         if len(series) < period:
             return None
@@ -295,9 +300,17 @@ class MovingAverageIndicators(TechnicalHelpers):
             msg = "ta.ema_cross_signal() requires 3 arguments: fast_ema, slow_ema, threshold"
             self._error(msg)
 
-        fast_ema = self._expect_list(args[0], "fast_ema must be a list")
-        slow_ema = self._expect_list(args[1], "slow_ema must be a list")
         threshold = args[2] if isinstance(args[2], (int, float)) else 0.0
+
+        if self._use_incremental_ta():
+            return self._ema_cross_signal_inc_update(
+                self._as_series_or_raw(args[0], last_sample_ok=True),
+                self._as_series_or_raw(args[1], last_sample_ok=True),
+                threshold,
+            )
+
+        fast_ema = self._as_series(args[0])
+        slow_ema = self._as_series(args[1])
 
         if len(fast_ema) < BINARY or len(slow_ema) < BINARY:
             return {"signal": "neutral", "strength": 0.0, "trend_direction": 0}

@@ -24,7 +24,7 @@ backends, tests, and parity tools can inspect visual outputs without a UI.
 ``plot()`` returns the Plot id (needed by ``fill(plot1, plot2)``).
 
 Bar-mode (Runtime) reuses Plot objects by call-site index so N bars do not
-allocate N×M Plot instances / string conversions.
+allocate NxM Plot instances / string conversions.
 
 Also exports :func:`materialize_visual_series_from_drawings` so compile-mode
 ``__drawings`` events (bgcolor / plotshape / plotchar / plotarrow) can be
@@ -37,14 +37,14 @@ from __future__ import annotations
 import math
 
 from collections import defaultdict
+from collections.abc import Iterable
+from collections.abc import Mapping
+from collections.abc import MutableMapping
+from collections.abc import Sequence
 from dataclasses import dataclass
 from sys import intern
 from typing import Any
 from typing import ClassVar
-from typing import Iterable
-from typing import Mapping
-from typing import MutableMapping
-from typing import Sequence
 
 from .base import BuiltinDispatchMixin
 from .base import BuiltinHandler
@@ -83,7 +83,7 @@ class Plot:
     """Plot / visual object captured during evaluation.
 
     ``slots=True`` keeps per-object footprint small; bar-mode reuses instances
-    so the registry stays O(plots) rather than O(bars × plots).
+    so the registry stays O(plots) rather than O(bars x plots).
     """
 
     kind: str = "plot"  # plot, hline, bgcolor, barcolor, fill, plotshape, …
@@ -417,7 +417,7 @@ def materialize_visual_series_from_drawings(
             pairs = zip(sites, events, strict=True)
         else:
             # Fallback: assign in order, pad/truncate
-            pairs = zip(sites, events)
+            pairs = zip(sites, events, strict=False)
         for site, ev in pairs:
             kind = site["kind"]
             # Prefer event kind if caller reordered (should not)

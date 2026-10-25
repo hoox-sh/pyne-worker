@@ -52,7 +52,7 @@ from window import apply_window
 # Limits
 # ---------------------------------------------------------------------------
 
-_WORKER_VERSION = "0.7.0"
+_WORKER_VERSION = "0.8.0"
 _MAX_SCRIPT_LENGTH = 100_000  # characters
 _MAX_BARS = 100_000
 _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -130,6 +130,42 @@ def _validate_ohlcv(ohlcv: list[dict[str, Any]]) -> str | None:
             if not isinstance(val, (int, float)):
                 return f"Bar at index {i} '{field}' is not a number"
     return None
+
+
+def _parse_optional_bool(
+    data: dict[str, Any],
+    field: str,
+    *,
+    default: bool = False,
+) -> tuple[bool, tuple[dict[str, Any], int, dict[str, str]] | None]:
+    value = data.get(field)
+    if value is None:
+        return default, None
+    if not isinstance(value, bool):
+        return default, _json_response({"error": f"'{field}' must be a boolean"}, 400)
+    return value, None
+
+
+def _parse_optional_int(
+    data: dict[str, Any],
+    field: str,
+    *,
+    default: int | None,
+    min_value: int | None = None,
+    allow_none: bool = False,
+) -> tuple[int | None, tuple[dict[str, Any], int, dict[str, str]] | None]:
+    if field not in data:
+        return default, None
+    value = data.get(field)
+    if value is None:
+        if allow_none:
+            return None, None
+        return default, _json_response({"error": f"'{field}' must be an integer"}, 400)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default, _json_response({"error": f"'{field}' must be an integer"}, 400)
+    if min_value is not None and value < min_value:
+        return default, _json_response({"error": f"'{field}' must be >= {min_value}"}, 400)
+    return value, None
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +542,7 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
                 "drawings": True,
                 "timeout_seconds": True,
                 "windowing": True,
+                "realtime": True,
                 "live_feed": True,
                 "feed_sources": ["bybit", "binance"],
                 "timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
@@ -540,6 +577,9 @@ async def handle_run(
       - ``from_bar`` / ``to_bar`` — optional inclusive bar window (negative
         counts from the end). Trims the serialized envelope only; the bar loop
         still sees every bar. Adds ``window`` metadata when applied.
+      - ``realtime_last_bar`` — last bar is forming (``barstate.isrealtime``)
+      - ``realtime_ticks`` — re-visits per bar in the realtime window (≥ 1)
+      - ``realtime_bars`` / ``realtime_from_bar`` — realtime window extent
     """
     data, err = _parse_body(body)
     if err is not None:
@@ -718,6 +758,21 @@ async def handle_run(
         if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
             return _json_response({"error": f"'{field}' must be an integer"}, 400)
 
+    realtime_last_bar, rt_err = _parse_optional_bool(data, "realtime_last_bar", default=False)
+    if rt_err is not None:
+        return rt_err
+    realtime_ticks, rt_err = _parse_optional_int(data, "realtime_ticks", default=1, min_value=1)
+    if rt_err is not None:
+        return rt_err
+    realtime_bars, rt_err = _parse_optional_int(data, "realtime_bars", default=0, min_value=0)
+    if rt_err is not None:
+        return rt_err
+    realtime_from_bar, rt_err = _parse_optional_int(
+        data, "realtime_from_bar", default=None, min_value=0, allow_none=True
+    )
+    if rt_err is not None:
+        return rt_err
+
     # Execute with timeout via Runtime
     runtime = Runtime(symbol=symbol)
     result = runtime.run(
@@ -728,6 +783,10 @@ async def handle_run(
         inputs=inputs,
         profiler=profiler,
         libraries=libraries or None,
+        realtime_last_bar=bool(realtime_last_bar),
+        realtime_ticks=int(realtime_ticks or 1),
+        realtime_bars=int(realtime_bars or 0),
+        realtime_from_bar=realtime_from_bar,
     )
 
     if "error" in result:
@@ -810,6 +869,8 @@ async def handle_run(
         resp["profile"] = result["profile"]
     if result.get("window") is not None:
         resp["window"] = result["window"]
+    if result.get("times") is not None:
+        resp["times"] = result["times"]
     return _json_response(resp)
 
 

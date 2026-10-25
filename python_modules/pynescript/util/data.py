@@ -53,16 +53,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 from pynescript import stats as _stats
-from pynescript.debug import scope_enabled as _debug_scope
+from pynescript.debug import scoped_debug
 
 
 _log = logging.getLogger(__name__)
 
-
-def _dbg(msg: str, *args: Any) -> None:
-    """Emit one historical-provider debug line when ``PYNE_DEBUG`` is enabled."""
-    if _debug_scope(__name__):
-        _log.debug(msg, *args)
+#: Emit one debug line for this module when ``PYNE_DEBUG`` is enabled.
+_dbg = scoped_debug(__name__, _log)
 
 
 class DataProvider(ABC):
@@ -420,7 +417,7 @@ class AlphaVantageProvider(DataProvider):
         client = self._get_client()
 
         try:
-            data, meta = client["ti"].get_daily(symbol=symbol, outputsize="full" if period == "full" else "compact")
+            data, _meta = client["ti"].get_daily(symbol=symbol, outputsize="full" if period == "full" else "compact")
         except Exception as e:
             msg = f"Failed to fetch data: {e}"
             raise DataProviderError(msg)
@@ -511,6 +508,9 @@ def tune_ccxt_public_urls(exchange: Any, exchange_name: str) -> None:
     opts = getattr(exchange, "options", None)
     if not isinstance(opts, dict):
         opts = {}
+    default = str(opts.get("defaultType") or "spot")
+    if default != "spot":
+        return
     opts["defaultType"] = "spot"
     opts["fetchMarkets"] = ["spot"]
     exchange.options = opts
@@ -546,6 +546,7 @@ class CCXTProvider(DataProvider):
         secret: str = "",
         password: str = "",
         uid: str = "",
+        default_type: str = "spot",
     ):
         """Initialize CCXT provider.
 
@@ -561,6 +562,7 @@ class CCXTProvider(DataProvider):
         self._secret = secret
         self._password = password
         self._uid = uid
+        self._default_type = (default_type or "spot").lower()
         self._exchange: Any | None = None
         _dbg("CCXTProvider init exchange=%s has_key=%s", exchange, bool(api_key and secret))
         _stats.count("provider.created", dim="ccxt")
@@ -587,8 +589,9 @@ class CCXTProvider(DataProvider):
                     params["password"] = self._password
                 if self._uid:
                     params["uid"] = self._uid
-                if self._exchange_name.lower() == "binance":
-                    params["options"] = {"defaultType": "spot", "fetchMarkets": ["spot"]}
+                default = self._default_type if self._default_type in ("spot", "swap", "future") else "spot"
+                if self._exchange_name.lower() == "binance" or default != "spot":
+                    params["options"] = {"defaultType": default, "fetchMarkets": [default]}
 
                 self._exchange = exchange_class(params)
                 tune_ccxt_public_urls(self._exchange, self._exchange_name)

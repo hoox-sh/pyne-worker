@@ -235,8 +235,6 @@ class NodeUnparser(NodeVisitor):
         ``type`` → ``visit_*`` callable (avoids string-based dispatch).
     """
 
-    # ruff: noqa: N802
-
     def __init__(self) -> None:
         """Create an empty unparser (empty buffer, zero indent, cold type cache)."""
         super().__init__()  # Initialize visitor cache
@@ -287,7 +285,7 @@ class NodeUnparser(NodeVisitor):
                 self._source.append(",")
         elif n == 0:
             return
-        elif n == 2:  # noqa: PLR2004  # hot arity fast-path for Call/tuple
+        elif n == 2:  # hot arity fast-path for Call/tuple
             # Common Call/tuple arity: avoid interleave iterator overhead.
             traverser(items[0])
             self._source.append(", ")
@@ -304,7 +302,7 @@ class NodeUnparser(NodeVisitor):
         """Start a new indented line, optionally writing *text* after the indent.
 
         If the buffer already has content, inserts ``\\n`` first, then the
-        current indent prefix (4 spaces × ``_indent``), then *text* when given.
+        current indent prefix (4 spaces x ``_indent``), then *text* when given.
         Statement-level visitors use this so each stmt begins at column 0 of its
         block (including bare indent when *text* is empty).
         """

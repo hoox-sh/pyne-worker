@@ -56,8 +56,6 @@ class StatementCollector(NodeVisitor):
     Return type of each ``visit_*`` is an iterator of AST nodes (generator).
     """
 
-    # ruff: noqa: N802
-
     def visit_Script(self, node: ast.Script) -> Iterator[ast.AST]:
         """Yield every statement under the script body."""
         for stmt in node.body:

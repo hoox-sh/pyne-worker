@@ -36,11 +36,15 @@ Host packing / contracts
 - Generated entry point is always
   ``execute_script_compiled(open, high, low, close, vol, time)`` — the host
   is :mod:`pynescript.compiler.engine` (synthetic ``bar*60_000`` ms when time
-  omitted; Runtime passes real OHLCV bar-open ms).
-- ``request.security`` / ``security``: same-symbol OHLCV passthrough only;
-  foreign tickers and complex numeric expressions emit ``na`` (no
-  close-as-dividend / unpack-as-chart invention). A UDT / object-handle
-  expression is passed through as a stub handle (never ``float`` / ``na``).
+  omitted; Runtime passes real OHLCV bar-open ms). Object-mode adds optional
+  ``rt_first=None, rt_ticks=1, data_feed=None, feed_symbol="", data_provider=None``
+  kwargs (defaults keep 6-arg calls valid).
+- ``request.security`` / ``security``: same-symbol allowlisted HTF OHLCV /
+  ``close[1]`` / simple ``ta.*`` resample in object mode (interpret helpers);
+  same-TF / LTF simple OHLCV still passthrough. Foreign tickers and complex
+  numeric expressions emit ``na`` (no close-as-dividend / unpack-as-chart
+  invention). A UDT / object-handle expression is passed through as a stub
+  handle (never ``float`` / ``na``).
 - nopython fallback: engine re-visits with ``force_object_mode=True`` after a
   TypingError warm-up; this module only implements the emit switch.
 - UDF series state lives in ``__st_{func}_{local}`` arrays; free chart series
@@ -70,6 +74,7 @@ from pynescript.ast.evaluator.builtins.plot_params import WIRE_FLOAT_PARAMS
 from pynescript.ast.evaluator.builtins.plot_params import WIRE_INT_PARAMS
 from pynescript.ast.evaluator.builtins.plot_params import param_index
 from pynescript.ast.visitor import NodeVisitor
+
 
 _NS = frozenset(
     {
@@ -299,7 +304,7 @@ _STYLE_NS = frozenset(
     }
 )
 
-# Bare linestyle / plot style tokens used as identifiers (v3–v4 style)
+# Bare linestyle / plot style tokens used as identifiers (v3-v4 style)
 _LINESTYLE_NAMES = frozenset(
     {
         "solid",
@@ -599,6 +604,8 @@ class CompilerVisitor(NodeVisitor):
     def __init__(self, *, force_object_mode: bool = False):
         super().__init__()
         self.arrays: set[str] = set()
+        # Temp series for history on a call/expression (``ta.lowest(x, n)[k]``).
+        self._hist_expr_n = 0
         self.plots: list[dict] = []
         # Pine ident → last plot()/hline() title (`u = plot(high)` → fill(u, l)).
         self._plot_var_titles: dict[str, str] = {}
@@ -612,6 +619,7 @@ class CompilerVisitor(NodeVisitor):
         self.force_object_mode = bool(force_object_mode)
         self.object_mode = bool(force_object_mode)
         self.uses_strategy = False
+        self.uses_alerts = False
         self.strategy_kwargs: dict[str, str] = {}
         # Name → const-like Python expr for strategy() ctor kwargs (literals / input defvals).
         # reference requires const for most strategy() params; pyne compile mirrors that by folding
@@ -631,6 +639,8 @@ class CompilerVisitor(NodeVisitor):
         # a ``once`` inside a UDF forces object mode + module-level flags.
         self.once_flags: list[str] = []
         self.once_in_function: bool = False
+        # ``varip`` names: re-init when ``__isrealtime`` (object-mode tick loop).
+        self.varip_vars: set[str] = set()
         self.user_funcs: set[str] = set()  # user-defined function names (Pine ids)
         # Pine UDF name → safe Python def name (``from`` → ``from_``)
         self.func_name_map: dict[str, str] = {}
@@ -662,6 +672,9 @@ class CompilerVisitor(NodeVisitor):
         # Numeric/mixed tuples (``f() => [1, 2]``): still sequence-marked so
         # ``a = f()`` is a handle, but multi-unpack stays float series.
         self.func_returns_tuple: set[str] = set()
+        # Per-element kinds of a tuple return ("udt" / "string" / "seq" / "num").
+        # A UDT or string element must not be stored through safe_float.
+        self.func_tuple_kinds: dict[str, tuple[str, ...]] = {}
         # Last expr is ``Type.new(...)`` / UDT handle — never float(dict).
         self.func_returns_udt: set[str] = set()
         self.local_sequence_vars: set[str] = set()
@@ -816,6 +829,12 @@ class CompilerVisitor(NodeVisitor):
     # Pine names that would rebind generated-module imports (``import numpy as np``)
     # or collide with the ``na`` → ``np.nan`` builtin if assigned as locals.
     _MODULE_SHADOW_IDENTS = frozenset({"np", "na"})
+
+    # ``barstate.*`` flags are bar-loop locals. Module-scope UDFs cannot close
+    # over them, so a UDF that reads ``barstate.isrealtime`` / ``isconfirmed``
+    # / ``ishistory`` / ``isnew`` must receive them as trailing context params
+    # (same plumbing as the chart OHLCV arrays and ``__bar_idx``).
+    _BARSTATE_CTX = ("__isrealtime", "__ishistory", "__isnew", "__isconfirmed")
 
     def _series_arr_name(self, name: str) -> str:
         """Python array identifier for a user series (mangles chart collisions)."""
@@ -1080,6 +1099,7 @@ class CompilerVisitor(NodeVisitor):
         self._emit_series_local_state(lines, indent="    ")
         self._emit_fixed_state(lines, indent="    ")
         self._emit_once_flags(lines, indent="    ")
+        self._emit_barstate_flag_inits(lines, indent="    ")
         for idx in range(len(self.plots)):
             lines.append(f"    plot_{idx} = np.full(n_bars, np.nan)")
         lines.append("    for __bar_idx in range(n_bars):")
@@ -1088,8 +1108,8 @@ class CompilerVisitor(NodeVisitor):
                 lines.append(f"        {hl}")
         if not body_lines:
             lines.append("        pass")
-        for line in body_lines:
-            line = line.replace("\n", "\n        ")
+        for raw_line in body_lines:
+            line = raw_line.replace("\n", "\n        ")
             lines.append(f"        {line}")
 
         # Tuple return avoids Numba typed.Dict construction/iteration overhead.
@@ -1107,10 +1127,17 @@ class CompilerVisitor(NodeVisitor):
         lines = [
             "import numpy as np",
             "from pynescript.compiler.numba_builtins import *",
+            "from pynescript.util.datafeed import poll_forming_ohlcv",
             "",
         ]
         if self.uses_strategy:
             lines.append("from pynescript.compiler.strategy_broker import CompileStrategyBroker")
+            lines.append("")
+        if self.uses_alerts:
+            lines.append("from pynescript.ast.evaluator.builtins.alerts import AlertEvent")
+            lines.append("from pynescript.ast.evaluator.builtins.alerts import FREQ_ALL")
+            lines.append("from pynescript.ast.evaluator.builtins.alerts import FREQ_ONCE_PER_BAR_CLOSE")
+            lines.append("from pynescript.ast.evaluator.builtins.alerts import normalize_alert_freq")
             lines.append("")
         self._emit_once_module_globals(lines)
         for func in self.functions:
@@ -1121,7 +1148,7 @@ class CompilerVisitor(NodeVisitor):
 
         lines.extend(
             [
-                "def execute_script_compiled(open_arr, high_arr, low_arr, close_arr, vol_arr, time_arr):",
+                "def execute_script_compiled(open_arr, high_arr, low_arr, close_arr, vol_arr, time_arr, rt_first=None, rt_ticks=1, data_feed=None, feed_symbol='', data_provider=None):",
                 "    n_bars = len(close_arr)",
                 "    open_arr = np.asarray(open_arr, dtype=np.float64)",
                 "    high_arr = np.asarray(high_arr, dtype=np.float64)",
@@ -1129,9 +1156,20 @@ class CompilerVisitor(NodeVisitor):
                 "    close_arr = np.asarray(close_arr, dtype=np.float64)",
                 "    vol_arr = np.asarray(vol_arr, dtype=np.float64)",
                 "    time_arr = np.asarray(time_arr, dtype=np.float64)",
+                "    if data_feed is not None:",
+                "        open_arr = np.array(open_arr, dtype=np.float64, copy=True)",
+                "        high_arr = np.array(high_arr, dtype=np.float64, copy=True)",
+                "        low_arr = np.array(low_arr, dtype=np.float64, copy=True)",
+                "        close_arr = np.array(close_arr, dtype=np.float64, copy=True)",
+                "        vol_arr = np.array(vol_arr, dtype=np.float64, copy=True)",
+                "        time_arr = np.array(time_arr, dtype=np.float64, copy=True)",
                 "    __drawings = []",
+                "    __alerts = []",
+                "    __alert_fire_bars = {}",
             ]
         )
+        if self.uses_alerts:
+            self._emit_object_alert_helpers(lines)
         self._emit_time_close_init(lines, indent="    ")
         if self.uses_strategy:
             # Broker ctor kwargs from strategy() declaration when present.
@@ -1196,36 +1234,12 @@ class CompilerVisitor(NodeVisitor):
                 lines.append(f"    {name} = None")
         for idx in range(len(self.plots)):
             lines.append(f"    plot_{idx} = np.full(n_bars, np.nan)")
-
-        lines.append("    for __bar_idx in range(n_bars):")
-        if self.needs_heikinashi:
-            for hl in self._heikinashi_bar_update_lines():
-                lines.append(f"        {hl}")
-        if self.uses_strategy:
-            # One-call bar setup + pending fill (same order as Runtime:
-            # process pending → evaluate body). Broker uses _mark for market fills.
-            lines.append(
-                "        __strategy.begin_bar("
-                "__bar_idx, "
-                "open_arr[__bar_idx], high_arr[__bar_idx], "
-                "low_arr[__bar_idx], close_arr[__bar_idx], "
-                "int(time_arr[__bar_idx]) if time_arr[__bar_idx] == time_arr[__bar_idx] else 0)"
-            )
-        if not body_lines and not self.uses_strategy:
-            lines.append("        pass")
-        for line in body_lines:
-            line = line.replace("\n", "\n        ")
-            lines.append(f"        {line}")
-        if not body_lines and self.uses_strategy:
-            lines.append("        pass")
-        if self.uses_strategy:
-            lines.append("        __strategy_position_size_arr[__bar_idx] = float(__strategy.position_size)")
-            lines.append("        __strategy_position_avg_price_arr[__bar_idx] = float(__strategy.position_avg_price)")
-            lines.append("        __strategy_closed_trades_arr[__bar_idx] = float(__strategy.closed_trades)")
+        self._emit_object_realtime_prelude(lines, indent="    ")
+        self._emit_object_mode_bar_loop(lines, body_lines)
 
         # Use repr so titles with apostrophes (Spearman's Rho) stay valid Python.
         dict_items = [f"{p['title']!r}: plot_{i}" for i, p in enumerate(self.plots)]
-        extras = ["'__drawings': __drawings"]
+        extras = ["'__drawings': __drawings", "'__alerts': __alerts"]
         if self.uses_strategy:
             extras.append("'__events': __strategy.to_events()")
             extras.append("'__position_size': __strategy.position_size")
@@ -1234,6 +1248,72 @@ class CompilerVisitor(NodeVisitor):
         ret_parts = dict_items + extras
         lines.append("    return {" + ", ".join(ret_parts) + "}")
         return "\n".join(lines)
+
+    def _emit_object_alert_helpers(self, lines: list[str]) -> None:
+        """Nested object-mode helpers: frequency-gated ``AlertEvent`` append."""
+        lines.extend(
+            [
+                "    def __alert_truthy(cond):",
+                "        if cond is None:",
+                "            return False",
+                "        try:",
+                "            if cond != cond:",
+                "                return False",
+                "        except Exception:",
+                "            pass",
+                "        try:",
+                "            return bool(cond)",
+                "        except Exception:",
+                "            return False",
+                "    def __emit_alert(message, freq='once_per_bar', title=None, source='alert', bar_idx=0, time_ms=None, confirmed=True):",
+                "        freq_n = normalize_alert_freq(freq)",
+                "        if freq_n == FREQ_ONCE_PER_BAR_CLOSE and not confirmed:",
+                "            return",
+                "        try:",
+                "            bar_index = int(bar_idx)",
+                "        except (TypeError, ValueError):",
+                "            bar_index = None",
+                "        if freq_n != FREQ_ALL and bar_index is not None:",
+                "            key = (str(source or 'alert'), str(title or ''), str('' if message is None else message), freq_n)",
+                "            last = __alert_fire_bars.get(key)",
+                "            if last is not None and last == bar_index:",
+                "                return",
+                "            __alert_fire_bars[key] = bar_index",
+                "        try:",
+                "            time_val = int(time_ms) if time_ms is not None and time_ms == time_ms else None",
+                "        except (TypeError, ValueError):",
+                "            time_val = None",
+                "        title_s = None if title is None else str(title)",
+                "        __alerts.append(AlertEvent(message='' if message is None else str(message), freq=freq_n, bar_index=bar_index, time=time_val, title=title_s, source=str(source or 'alert')).to_dict())",
+            ]
+        )
+
+    def _emit_alert_call(self, func_name: str, args: list[str], kwargs: dict[str, str]) -> str:
+        """Lower ``alert()`` / ``alertcondition()``; force object mode."""
+        self.object_mode = True
+        self.uses_alerts = True
+        loc = '__bar_idx, time_arr[__bar_idx], locals().get("__isconfirmed", True)'
+        if func_name == "alert":
+            message = kwargs.get("message")
+            if message is None:
+                message = args[0] if args else None
+            if message is None:
+                return ""
+            freq = kwargs.get("freq")
+            if freq is None:
+                freq = args[1] if len(args) > 1 else repr("once_per_bar")
+            return f"__emit_alert({message}, {freq}, None, 'alert', {loc})"
+        cond = kwargs.get("condition")
+        if cond is None:
+            cond = args[0] if args else "False"
+        title = kwargs.get("title")
+        if title is None:
+            title = args[1] if len(args) > 1 else repr("Alert")
+        message = kwargs.get("message")
+        if message is None:
+            message = args[2] if len(args) > 2 else repr("Alert")
+        fire = f"__emit_alert({message}, 'once_per_bar', {title}, 'alertcondition', {loc})"
+        return f"({fire} if __alert_truthy({cond}) else None)"
 
     def _emit_series_local_state(self, lines: list[str], *, indent: str = "    ") -> None:
         """Preallocate persistent arrays for UDF series locals (history across bars)."""
@@ -1280,6 +1360,151 @@ class CompilerVisitor(NodeVisitor):
             return
         for name in self.once_flags:
             lines.append(f"{indent}{name} = False")
+
+    def _emit_barstate_flag_inits(self, lines: list[str], *, indent: str = "    ") -> None:
+        """Historical barstate defaults (numeric loop never updates these)."""
+        lines.append(f"{indent}__isrealtime = False")
+        lines.append(f"{indent}__isconfirmed = True")
+        lines.append(f"{indent}__ishistory = True")
+        lines.append(f"{indent}__isnew = True")
+
+    def _var_init_cond(self, is_varip: bool) -> str:
+        """First-bar (and realtime-varip) predicate for ``var`` / ``varip`` init."""
+        if is_varip:
+            return "(__bar_idx == 0 or __isrealtime)"
+        return "(__bar_idx == 0)"
+
+    def _rt_snap_scalars(self) -> list[str]:
+        """Python locals rolled back on unconfirmed realtime ticks (not varip)."""
+        names = (self.scalar_vars | self.map_vars) - self.varip_vars
+        return [n for n in sorted(names) if n.isidentifier()]
+
+    def _emit_object_realtime_prelude(self, lines: list[str], *, indent: str = "    ") -> None:
+        """Normalize ``rt_first`` / ``rt_ticks`` and seed barstate flags."""
+        self._emit_barstate_flag_inits(lines, indent=indent)
+        lines.append(f"{indent}try:")
+        lines.append(f"{indent}    __rt_ticks = int(rt_ticks)")
+        lines.append(f"{indent}except (TypeError, ValueError):")
+        lines.append(f"{indent}    __rt_ticks = 1")
+        lines.append(f"{indent}if __rt_ticks < 1:")
+        lines.append(f"{indent}    __rt_ticks = 1")
+        lines.append(f"{indent}if rt_first is None:")
+        lines.append(f"{indent}    __rt_first = n_bars")
+        lines.append(f"{indent}else:")
+        lines.append(f"{indent}    try:")
+        lines.append(f"{indent}        __rt_first = int(rt_first)")
+        lines.append(f"{indent}    except (TypeError, ValueError):")
+        lines.append(f"{indent}        __rt_first = 0")
+        lines.append(f"{indent}    if __rt_first < 0:")
+        lines.append(f"{indent}        __rt_first = 0")
+
+    def _emit_rt_tick_snapshot(self, lines: list[str], *, indent: str) -> None:
+        """Snapshot var/once/TA before an unconfirmed realtime tick (varip skipped)."""
+        scalars = self._rt_snap_scalars()
+        lines.append(f"{indent}__rt_snap_ndraw = len(__drawings)")
+        for name in scalars:
+            lines.append(f"{indent}__rt_snap_{name} = {name}")
+            lines.append(f"{indent}if isinstance({name}, list):")
+            lines.append(
+                f"{indent}    __rt_snap_{name}_c = "
+                f"[__r.copy() if isinstance(__r, (list, dict)) else __r for __r in {name}]"
+            )
+            lines.append(f"{indent}elif isinstance({name}, dict):")
+            lines.append(
+                f"{indent}    __rt_snap_{name}_c = "
+                f"{{__k: (__v.copy() if isinstance(__v, (list, dict)) else __v) "
+                f"for __k, __v in {name}.items()}}"
+            )
+            lines.append(f"{indent}else:")
+            lines.append(f"{indent}    __rt_snap_{name}_c = None")
+        for flag in self.once_flags:
+            lines.append(f"{indent}__rt_snap_{flag} = {flag}")
+        for st_name, _size in self.fixed_state:
+            lines.append(f"{indent}__rt_snap_{st_name} = {st_name}.copy()")
+
+    def _emit_rt_tick_restore(self, lines: list[str], *, indent: str) -> None:
+        """Restore var/once/TA after an unconfirmed realtime tick (varip persists)."""
+        lines.append(f"{indent}del __drawings[__rt_snap_ndraw:]")
+        for name in self._rt_snap_scalars():
+            lines.append(f"{indent}{name} = __rt_snap_{name}")
+            lines.append(f"{indent}if __rt_snap_{name}_c is not None:")
+            lines.append(f"{indent}    if isinstance({name}, list):")
+            lines.append(f"{indent}        {name}[:] = __rt_snap_{name}_c")
+            lines.append(f"{indent}    elif isinstance({name}, dict):")
+            lines.append(f"{indent}        {name}.clear()")
+            lines.append(f"{indent}        {name}.update(__rt_snap_{name}_c)")
+        for flag in self.once_flags:
+            lines.append(f"{indent}{flag} = __rt_snap_{flag}")
+        for st_name, _size in self.fixed_state:
+            lines.append(f"{indent}{st_name}[:] = __rt_snap_{st_name}")
+
+    def _emit_object_mode_bar_loop(self, lines: list[str], body_lines: list[str]) -> None:
+        """Object-mode bar loop with optional realtime multi-tick re-visits."""
+        lines.append("    for __bar_idx in range(n_bars):")
+        if self.needs_heikinashi:
+            for hl in self._heikinashi_bar_update_lines():
+                lines.append(f"        {hl}")
+        if self.uses_strategy:
+            # One-call bar setup + pending fill (same order as Runtime:
+            # process pending → evaluate body). Broker uses _mark for market fills.
+            lines.append(
+                "        __strategy.begin_bar("
+                "__bar_idx, "
+                "open_arr[__bar_idx], high_arr[__bar_idx], "
+                "low_arr[__bar_idx], close_arr[__bar_idx], "
+                "int(time_arr[__bar_idx]) if time_arr[__bar_idx] == time_arr[__bar_idx] else 0)"
+            )
+        lines.append("        __bar_rt = __bar_idx >= __rt_first")
+        lines.append("        __n_ticks = __rt_ticks if __bar_rt else 1")
+        lines.append("        for __tick_i in range(__n_ticks):")
+        lines.append("            __isrealtime = __bar_rt")
+        lines.append("            __ishistory = (not __bar_rt)")
+        lines.append("            __isnew = (not __bar_rt) or (__tick_i == 0)")
+        lines.append("            __isconfirmed = (not __bar_rt) or (__tick_i == __n_ticks - 1)")
+        lines.append("            if __bar_rt and data_feed is not None:")
+        lines.append("                __polled = poll_forming_ohlcv(data_feed, feed_symbol)")
+        lines.append("                if __polled is not None:")
+        lines.append("                    time_arr[__bar_idx] = __polled[0]")
+        lines.append("                    open_arr[__bar_idx] = __polled[1]")
+        lines.append("                    high_arr[__bar_idx] = __polled[2]")
+        lines.append("                    low_arr[__bar_idx] = __polled[3]")
+        lines.append("                    close_arr[__bar_idx] = __polled[4]")
+        lines.append("                    vol_arr[__bar_idx] = __polled[5]")
+        if self.uses_strategy:
+            lines.append("            if __bar_rt:")
+            lines.append(
+                "                __strategy.ratchet_trails(high_arr[__bar_idx], low_arr[__bar_idx])"
+            )
+            lines.append(
+                "                __strategy.update_open_trade_extremes("
+                "high_arr[__bar_idx], low_arr[__bar_idx])"
+            )
+        lines.append("            if __bar_rt and __tick_i < __n_ticks - 1:")
+        if self.uses_strategy:
+            lines.append("                __st_snap = __strategy.snapshot()")
+        self._emit_rt_tick_snapshot(lines, indent="                ")
+        if not body_lines and not self.uses_strategy:
+            lines.append("            pass")
+        for raw_line in body_lines:
+            line = raw_line.replace("\n", "\n            ")
+            lines.append(f"            {line}")
+        if not body_lines and self.uses_strategy:
+            lines.append("            pass")
+        lines.append("            if __bar_rt and __tick_i < __n_ticks - 1:")
+        if self.uses_strategy:
+            lines.append("                __strategy.restore(__st_snap)")
+            lines.append(
+                "                __strategy.ratchet_trails(high_arr[__bar_idx], low_arr[__bar_idx])"
+            )
+            lines.append(
+                "                __strategy.update_open_trade_extremes("
+                "high_arr[__bar_idx], low_arr[__bar_idx])"
+            )
+        self._emit_rt_tick_restore(lines, indent="                ")
+        if self.uses_strategy:
+            lines.append("        __strategy_position_size_arr[__bar_idx] = float(__strategy.position_size)")
+            lines.append("        __strategy_position_avg_price_arr[__bar_idx] = float(__strategy.position_avg_price)")
+            lines.append("        __strategy_closed_trades_arr[__bar_idx] = float(__strategy.closed_trades)")
 
     # ---------------------------------------------------------------- statements
     def visit_TypeDef(self, node: ast.TypeDef):
@@ -1502,6 +1727,28 @@ class CompilerVisitor(NodeVisitor):
             return last_ast.value
         return None
 
+    def _tuple_elem_kind(self, expr) -> str:
+        """Kind of one tuple-return element: udt, string, seq, or num."""
+        if expr is None:
+            return "num"
+        if isinstance(expr, ast.Tuple) or self._ast_expr_is_sequence(expr):
+            return "seq"
+        if isinstance(expr, ast.Name):
+            if expr.id in self.udt_vars:
+                return "udt"
+            if expr.id in self.string_series or expr.id in self.string_scalars:
+                return "string"
+            if expr.id in self.local_sequence_vars:
+                return "seq"
+            return "num"
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return "string"
+        if self._looks_like_udt_ctor(expr) or self._call_returns_udt(expr):
+            return "udt"
+        if self._is_stringy_value(expr) or self._call_returns_string(expr):
+            return "string"
+        return "num"
+
     def _func_body_returns_udt(self, last_ast) -> bool:
         """True when the UDF result is a UDT instance (``Type.new(...)`` / handle)."""
         ret_expr = self._func_last_value_expr(last_ast)
@@ -1637,6 +1884,9 @@ class CompilerVisitor(NodeVisitor):
 
         name = node.target.id
         is_var = hasattr(node, "mode") and isinstance(node.mode, (ast.Var, ast.VarIp))
+        is_varip = hasattr(node, "mode") and isinstance(node.mode, ast.VarIp)
+        if is_varip:
+            self.varip_vars.add(name)
 
         type_node_early = getattr(node, "type", None)
         type_id_early = type_node_early.id if isinstance(type_node_early, ast.Name) else None
@@ -1648,7 +1898,7 @@ class CompilerVisitor(NodeVisitor):
                 return self._emit_loop_assign(name, node.value)
             val = self.visit(node.value)
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
             return f"{name} = {val}"
 
         # Pine for/while used as an expression: last body value → target.
@@ -1791,7 +2041,10 @@ class CompilerVisitor(NodeVisitor):
                 # list handles so array.push mutations accumulate across bars).
                 sl_arr = self._series_local_arr(name)
                 if is_var or name in getattr(self, "var_locals", set()):
-                    return f"{sl_arr}[__bar_idx] = {val} if __bar_idx == 0 else {sl_arr}[__bar_idx - 1]"
+                    return (
+                        f"{sl_arr}[__bar_idx] = {val} if {self._var_init_cond(is_varip)} "
+                        f"else {sl_arr}[__bar_idx - 1]"
+                    )
                 return f"{sl_arr}[__bar_idx] = {val}"
             if self._is_map_new(node.value) or self._is_typed_map(type_node):
                 self.object_mode = True
@@ -1832,7 +2085,7 @@ class CompilerVisitor(NodeVisitor):
             self.arrays.discard(f"{name}_arr")
             self.arrays.discard(f"{loc}_arr")
             if is_var:
-                return f"if __bar_idx == 0:\n    {loc} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {loc} = {val}"
             return f"{loc} = {val}"
 
         # `var table t = na` / `label l = na` / `matrix m = f()` → scalar handle
@@ -1841,7 +2094,7 @@ class CompilerVisitor(NodeVisitor):
             self.scalar_vars.add(name)
             self.arrays.discard(f"{name}_arr")
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
             return f"{name} = {val}"
 
         # `var MyState s = na` / `var chart.point p = na` → object-dtype series
@@ -1854,7 +2107,7 @@ class CompilerVisitor(NodeVisitor):
             self.arrays.add(f"{name}_arr")
             if is_var:
                 return (
-                    f"if __bar_idx == 0:\n"
+                    f"if {self._var_init_cond(is_varip)}:\n"
                     f"    {name}_arr[__bar_idx] = {val}\n"
                     f"else:\n"
                     f"    {name}_arr[__bar_idx] = {name}_arr[__bar_idx - 1]"
@@ -1875,6 +2128,8 @@ class CompilerVisitor(NodeVisitor):
                 self.local_sequence_vars.add(name)
                 return f"{self._py_ident(name)} = {val}"
             if is_var:
+                if is_varip:
+                    return f"if {name} is None or __isrealtime:\n    {name} = {val}"
                 return f"if {name} is None:\n    {name} = {val}"
             return f"{name} = {val}"
 
@@ -1884,7 +2139,7 @@ class CompilerVisitor(NodeVisitor):
             self.scalar_vars.add(name)
             self.string_scalars.add(name)
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
             return f"{name} = {val}"
 
         # String/color RHS: bar-constant → scalar; per-bar (ternary colors, …) →
@@ -1910,7 +2165,7 @@ class CompilerVisitor(NodeVisitor):
                 self.scalar_vars.add(name)
                 self.string_scalars.add(name)
                 if is_var:
-                    return f"if __bar_idx == 0:\n    {name} = {val}"
+                    return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
                 return f"{name} = {val}"
             # Per-bar string/color series (e.g. close > open ? color.green : color.red)
             # Also `color x = f()` where UDF returns a color string.
@@ -1919,7 +2174,7 @@ class CompilerVisitor(NodeVisitor):
             self.arrays.add(arr_n)
             if is_var:
                 return (
-                    f"if __bar_idx == 0:\n"
+                    f"if {self._var_init_cond(is_varip)}:\n"
                     f"    {arr_n}[__bar_idx] = {val}\n"
                     f"else:\n"
                     f"    {arr_n}[__bar_idx] = {arr_n}[__bar_idx - 1]"
@@ -1929,7 +2184,7 @@ class CompilerVisitor(NodeVisitor):
         # Map / scalar object vars (var m = map.new...)
         if name in self.map_vars or name in self.scalar_vars:
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
             return f"{name} = {val}"
 
         # Existing string series re-assign / already tracked
@@ -1939,7 +2194,7 @@ class CompilerVisitor(NodeVisitor):
             self.arrays.add(arr_n)
             if is_var:
                 return (
-                    f"if __bar_idx == 0:\n"
+                    f"if {self._var_init_cond(is_varip)}:\n"
                     f"    {arr_n}[__bar_idx] = {val}\n"
                     f"else:\n"
                     f"    {arr_n}[__bar_idx] = {arr_n}[__bar_idx - 1]"
@@ -1955,7 +2210,7 @@ class CompilerVisitor(NodeVisitor):
             self.arrays.discard(f"{name}_arr")
             rhs = "{}" if self._is_map_new(node.value) else val
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {rhs}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {rhs}"
             return f"{name} = {rhs}"
 
         # UDT series / chart.point dict / udt_index handle / UDT ref (p2 = p1)
@@ -1979,7 +2234,7 @@ class CompilerVisitor(NodeVisitor):
             self.arrays.add(f"{name}_arr")
             if is_var:
                 return (
-                    f"if __bar_idx == 0:\n"
+                    f"if {self._var_init_cond(is_varip)}:\n"
                     f"    {name}_arr[__bar_idx] = {val}\n"
                     f"else:\n"
                     f"    {name}_arr[__bar_idx] = {name}_arr[__bar_idx - 1]"
@@ -1992,7 +2247,7 @@ class CompilerVisitor(NodeVisitor):
             self.scalar_vars.add(name)
             self.arrays.discard(f"{name}_arr")
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
             return f"{name} = {val}"
 
         if self._is_array_or_matrix_handle(node.value):
@@ -2000,7 +2255,7 @@ class CompilerVisitor(NodeVisitor):
             self.scalar_vars.add(name)
             self.arrays.discard(f"{name}_arr")
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
             return f"{name} = {val}"
 
         # Sequence / list RHS must not land in float64 series
@@ -2010,7 +2265,7 @@ class CompilerVisitor(NodeVisitor):
             self.scalar_vars.add(name)
             self.arrays.discard(f"{name}_arr")
             if is_var:
-                return f"if __bar_idx == 0:\n    {name} = {val}"
+                return f"if {self._var_init_cond(is_varip)}:\n    {name} = {val}"
             return f"{name} = {val}"
 
         # Non-numeric cast results / opaque object handles → safe float series
@@ -2018,7 +2273,10 @@ class CompilerVisitor(NodeVisitor):
             self.object_mode = True
             self.arrays.add(f"{name}_arr")
             if is_var:
-                return f"{name}_arr[__bar_idx] = {val} if __bar_idx == 0 else {name}_arr[__bar_idx-1]"
+                return (
+                    f"{name}_arr[__bar_idx] = {val} if {self._var_init_cond(is_varip)} "
+                    f"else {name}_arr[__bar_idx-1]"
+                )
             return f"{name}_arr[__bar_idx] = {val}"
 
         if not val:
@@ -2040,7 +2298,10 @@ class CompilerVisitor(NodeVisitor):
         if self._looks_like_const_expr(store_val):
             self.const_like_values[name] = store_val
         if is_var:
-            return f"{name}_arr[__bar_idx] = {store_val} if __bar_idx == 0 else {name}_arr[__bar_idx-1]"
+            return (
+                f"{name}_arr[__bar_idx] = {store_val} if {self._var_init_cond(is_varip)} "
+                f"else {name}_arr[__bar_idx-1]"
+            )
         return f"{name}_arr[__bar_idx] = {store_val}"
 
     def _looks_like_const_expr(self, expr: str) -> bool:
@@ -2739,6 +3000,8 @@ class CompilerVisitor(NodeVisitor):
                 "range",
                 "__bar_idx",
                 "n_bars",
+                # barstate flags: plain bools (loop locals or UDF ctx params)
+                *self._BARSTATE_CTX,
             ):
                 continue
             if bare.startswith("numba_"):
@@ -2904,6 +3167,29 @@ class CompilerVisitor(NodeVisitor):
             if self.object_mode:
                 return f"{py}_arr[__bar_idx] = safe_float({expr})"
             return f"{py}_arr[__bar_idx] = {expr}"
+
+        def _store_kept(name: str, expr: str, kind: str) -> str:
+            """UDT / string / sequence tuple element: keep the value, no safe_float."""
+            self.object_mode = True
+            py = _target_py(name)
+            if self.in_function:
+                self.local_vars.add(name)
+                if kind == "udt":
+                    self._note_udt_var(name)
+                elif kind == "string":
+                    self.string_scalars.add(name)
+                else:
+                    self.local_sequence_vars.add(name)
+                return f"{py} = {expr}"
+            if kind == "seq":
+                return _store_sequence(name, expr)
+            if kind == "string":
+                self.string_series.add(name)
+            else:
+                self._note_udt_var(name)
+            arr_n = self._series_arr_name(name)
+            self.arrays.add(arr_n)
+            return f"{arr_n}[__bar_idx] = {expr}"
 
         def _store_sequence(name: str, expr: str) -> str:
             """Array/list handle → scalar (or UDF local), never float64 series."""
@@ -3114,6 +3400,18 @@ class CompilerVisitor(NodeVisitor):
                     and uf_name not in getattr(self, "func_returns_udt", set())
                     and not is_import_method
                 )
+                kinds = getattr(self, "func_tuple_kinds", {}).get(uf_name) if uf_name else None
+                if kinds and any(k != "num" for k in kinds):
+                    # [udt, udt, string] = f() must not safe_float the objects away.
+                    lines = [f"__tup = {call_code}"]
+                    for i, name in enumerate(names):
+                        kind = kinds[i] if i < len(kinds) else "num"
+                        expr = _elem_expr(i)
+                        if kind == "num":
+                            lines.append(_store_numeric(name, expr))
+                        else:
+                            lines.append(_store_kept(name, expr, kind))
+                    return "\n".join(lines)
                 numeric_udf = bool(uf_name and uf_name in getattr(self, "func_returns_numeric", set()))
                 if not numeric_udf and not numeric_tuple_udf:
                     self.object_mode = True
@@ -3494,7 +3792,7 @@ class CompilerVisitor(NodeVisitor):
             return "((high_arr[__bar_idx] + low_arr[__bar_idx] + close_arr[__bar_idx] + close_arr[__bar_idx]) / 4.0)"
         if node.id == "bar_index":
             return "__bar_idx"
-        # v1–v3: bare `n` is bar_index unless the script defines its own `n`
+        # v1-v3: bare `n` is bar_index unless the script defines its own `n`
         if node.id == "n" and (
             "n_arr" not in self.arrays
             and "n" not in self.local_vars
@@ -3540,23 +3838,9 @@ class CompilerVisitor(NodeVisitor):
             return "np.nan"
         if node.id.startswith("timeframe_"):
             attr = node.id[len("timeframe_") :]
-            if attr == "period":
-                self.object_mode = True
-                return repr("1D")
-            if attr == "multiplier":
-                return "1"
-            if attr in (
-                "isintraday",
-                "isdaily",
-                "isweekly",
-                "ismonthly",
-                "isseconds",
-                "isminutes",
-                "ishours",
-            ):
-                return "True" if attr == "isdaily" else "False"
-            if attr == "in_seconds":
-                return "86400.0"
+            ident = self._timeframe_compile_expr(attr)
+            if ident is not None:
+                return ident
             self.object_mode = True
             return repr(attr)
         if node.id in (
@@ -3653,7 +3937,7 @@ class CompilerVisitor(NodeVisitor):
             if node.attr == "vwap":
                 st = self._alloc_fixed_state("vwap", 3)
                 return f"numba_vwap_inc(close_arr, vol_arr, __bar_idx, {st})"
-            if node.attr == "accdist" or node.attr == "ad":
+            if node.attr in {"accdist", "ad"}:
                 # Cumulative A/D line (not single-bar CLV*vol).
                 st = self._alloc_fixed_state("ad", 2)
                 return f"numba_accdist_inc(high_arr, low_arr, close_arr, vol_arr, __bar_idx, {st})"
@@ -3757,24 +4041,13 @@ class CompilerVisitor(NodeVisitor):
                 return ident
             # Missing fundamentals (target_price_*, employees, …) are na, not 0.
             return "np.nan"
-        # timeframe.* compile-time stubs
+        # timeframe.* — chart timeframe installed by the host at run time
         if isinstance(node.value, ast.Name) and node.value.id == "timeframe":
-            if node.attr == "period":
-                return repr("1D")
-            if node.attr in (
-                "isintraday",
-                "isdaily",
-                "isweekly",
-                "ismonthly",
-                "isseconds",
-                "isminutes",
-                "ishours",
-            ):
-                return "False" if node.attr != "isdaily" else "True"
-            if node.attr == "multiplier":
-                return "1"
             if node.attr == "in_seconds":
                 return "timeframe_in_seconds"
+            ident = self._timeframe_compile_expr(node.attr)
+            if ident is not None:
+                return ident
             return repr(node.attr)
         if isinstance(node.value, ast.Name) and node.value.id == "chart":
             if node.attr in ("fg_color", "foreground_color"):
@@ -3961,19 +4234,27 @@ class CompilerVisitor(NodeVisitor):
         return _udt_field(orig_val, node.attr)
 
     def _emit_barstate(self, attr: str) -> str:
-        """barstate.* flags for compile path."""
+        """barstate.* flags for compile path.
+
+        ``isrealtime`` / ``isconfirmed`` / ``ishistory`` / ``isnew`` read the
+        per-tick locals set by the object-mode loop (numeric keeps historical
+        constants). ``islast`` stays last index; ``isnew`` is true on the first
+        visit of a bar.
+        """
         if attr in ("isfirst", "isfirstconfirmedhistory"):
             return "(__bar_idx == 0)"
-        if attr in ("islast", "islastconfirmedhistory"):
+        if attr == "islast":
             return "(__bar_idx == n_bars - 1)"
+        if attr == "islastconfirmedhistory":
+            return "((__bar_idx == n_bars - 1) and (not __isrealtime))"
         if attr == "ishistory":
-            return "(__bar_idx < n_bars - 1)"
+            return "__ishistory"
         if attr == "isrealtime":
-            return "False"
+            return "__isrealtime"
         if attr == "isnew":
-            return "True"
+            return "__isnew"
         if attr == "isconfirmed":
-            return "True"
+            return "__isconfirmed"
         return "False"
 
     def _emit_array_or_matrix(self, func_name: str, args: list[str], kwargs: dict[str, str]) -> str:
@@ -4526,6 +4807,38 @@ class CompilerVisitor(NodeVisitor):
         self.uses_strategy = True
         return f"__strategy.{attr}"
 
+    _TIMEFRAME_ATTRS = frozenset(
+        {
+            "period",
+            "main_period",
+            "multiplier",
+            "isintraday",
+            "isdaily",
+            "isweekly",
+            "ismonthly",
+            "isseconds",
+            "isinseconds",
+            "isminutes",
+            "ishours",
+            "isdwm",
+        }
+    )
+
+    def _timeframe_compile_expr(self, attr: str) -> str | None:
+        """Lower ``timeframe.*`` / flattened ``timeframe_*`` to a run-time chart lookup.
+
+        The host installs the chart period (``set_chart_timeframe``) before the
+        run, so generated code is timeframe-agnostic and stays cacheable by
+        source. Unknown attributes return ``None``.
+        """
+        if attr == "in_seconds":
+            self.object_mode = True
+            return "chart_timeframe_in_seconds()"
+        if attr in self._TIMEFRAME_ATTRS:
+            self.object_mode = True
+            return f"chart_timeframe({attr!r})"
+        return None
+
     def _syminfo_compile_expr(self, attr: str) -> str | None:
         """Lower ``syminfo.*`` / flattened ``syminfo_*`` to a compile expression.
 
@@ -4811,7 +5124,7 @@ class CompilerVisitor(NodeVisitor):
                 args.append(self.visit(arg))
                 arg_nodes.append(arg)
         if method_src is not None:
-            args = [method_src] + args
+            args = [method_src, *args]
             recv_node = getattr(func, "value", None)
             arg_nodes = [recv_node, *arg_nodes]
 
@@ -4926,7 +5239,7 @@ class CompilerVisitor(NodeVisitor):
         if func_name in ("max_bars_back", "max_bars_back_all"):
             return ""
         if func_name == "alert":
-            return ""
+            return self._emit_alert_call(func_name, args, kwargs)
 
         if func_name in ("indicator", "study"):
             return ""
@@ -5225,8 +5538,8 @@ class CompilerVisitor(NodeVisitor):
         # Drawing surface → event list (object mode)
         if (
             func_name in _DRAWING_FUNCS
-            or func_name.endswith("_new")
-            and any(func_name.startswith(p) for p in ("label", "line", "box", "table", "polyline"))
+            or (func_name.endswith("_new")
+            and any(func_name.startswith(p) for p in ("label", "line", "box", "table", "polyline")))
         ):
             self.object_mode = True
             return self._emit_drawing(func_name, args, kwargs)
@@ -5271,7 +5584,7 @@ class CompilerVisitor(NodeVisitor):
                 return args[3]
             return repr("#000000")
         if func_name in ("color_new", "color"):
-            # color.new(base, transp) / v3–v4 color(base, transp)
+            # color.new(base, transp) / v3-v4 color(base, transp)
             self.object_mode = True
             if not args:
                 return repr("#000000")
@@ -5288,7 +5601,9 @@ class CompilerVisitor(NodeVisitor):
         if func_name in ("time_close",):
             return self._use_time_close()
         if func_name == "timeframe_from_seconds":
-            return repr("1D")
+            self.object_mode = True
+            seconds = args[0] if args else kwargs.get("seconds", "np.nan")
+            return f"chart_timeframe_from_seconds({seconds})"
         if func_name == "timeframe_change":
             tf_expr = args[0] if args else repr("D")
             # Bare D/W/M resolve on the exchange calendar (tz-aware Python),
@@ -5342,7 +5657,7 @@ class CompilerVisitor(NodeVisitor):
             return "np.nan"
 
         if func_name in ("alertcondition", "alert"):
-            return ""
+            return self._emit_alert_call(func_name, args, kwargs)
 
         # UDF calls win over bare TA aliases (sma, …) and bare math (max/min/abs).
         # ``round`` / ``int`` / ``len`` are also Python builtins — the def is
@@ -5537,12 +5852,25 @@ class CompilerVisitor(NodeVisitor):
 
         # timeframe.in_seconds(...)
         if func_name == "timeframe_in_seconds":
-            # stub: treat as daily-ish (86400s); enough for comparisons / ratios
-            return "86400.0"
+            tf_expr = args[0] if args else kwargs.get("timeframe")
+            s = (tf_expr or "").strip()
+            inner = s[1:-1] if len(s) >= 2 and s[0] == s[-1] and s[0] in {"'", '"'} else None
+            if inner:
+                # Literal frame folds to a constant, so nopython stays available.
+                try:
+                    from pynescript.ast.evaluator.builtins.timeframe import timeframe_in_seconds
 
-        # bare v3 security(...) / request.security — same-symbol OHLCV only.
-        # Complex expressions (UDFs, ta.*, year_sum, …) would invent chart series
-        # as foreign-symbol data (e.g. dividend_yield close-as-dividend). Emit na.
+                    return repr(float(timeframe_in_seconds(inner)))
+                except ValueError:
+                    pass
+            self.object_mode = True
+            return f"chart_timeframe_in_seconds({tf_expr or ''})"
+
+        # bare v3 security(...) / request.security — same-symbol allowlisted
+        # HTF resample (OHLCV / offset / simple ta.*) via object-mode helpers;
+        # same-TF / LTF simple OHLCV still passthrough. Complex expressions
+        # (UDFs, nested ta.*, year_sum, …) would invent chart series as
+        # foreign-symbol data (e.g. dividend_yield close-as-dividend). Emit na.
         # Foreign tickers with simple ``close`` (CVI UPVOL/DNVOL) also invent
         # chart-close as advance/decline volume — require chart-symbol identity.
         if func_name in (
@@ -5551,6 +5879,10 @@ class CompilerVisitor(NodeVisitor):
             "request_security_lower_tf",
             "request_seed",
         ):
+            if func_name in ("security", "request_security"):
+                htf = self._emit_chart_htf_security(node, args, kwargs)
+                if htf is not None:
+                    return htf
             sym = args[0] if args else ""
             expr = args[2] if len(args) >= 3 else kwargs.get("expression", "close_arr[__bar_idx]")
             if self._is_heikinashi_security_symbol(sym) and self._is_simple_security_expr(expr):
@@ -6212,15 +6544,20 @@ class CompilerVisitor(NodeVisitor):
             return f"numba_vwma_inc(close_arr, vol_arr, {self._emit_period(length)}, __bar_idx, {st})"
         if func_name == "ta_mfi":
             # ta.mfi(length) | ta.mfi(source, length) | ta.mfi(h, l, c, v, length)
+            # ``hlc3`` is an expression, not a series array. Treating it as the
+            # length dropped the real period and scored MFI on a daily stub.
             st = self._alloc_fixed_state("mfi", 3)
-            if len(args) >= 5 and _is_series_arr(args[0]):
+            if len(args) >= 5:
                 return (
                     f"numba_mfi_inc({_arr(args[0])}, {_arr(args[1])}, {_arr(args[2])}, "
-                    f"{_arr(args[3])}, int({args[4]}), __bar_idx, {st})"
+                    f"{_arr(args[3])}, {self._emit_period(args[4])}, __bar_idx, {st})"
                 )
-            if len(args) >= 2 and _is_series_arr(args[0]):
+            if len(args) >= 2:
                 src = _arr(args[0])
-                return f"numba_mfi_inc({src}, {src}, {src}, vol_arr, int({args[1]}), __bar_idx, {st})"
+                return (
+                    f"numba_mfi_inc({src}, {src}, {src}, vol_arr, "
+                    f"{self._emit_period(args[1])}, __bar_idx, {st})"
+                )
             length = args[0] if args else "14"
             return f"numba_mfi_inc(high_arr, low_arr, close_arr, vol_arr, {self._emit_period(length)}, __bar_idx, {st})"
         if func_name == "ta_rising":
@@ -6436,7 +6773,7 @@ class CompilerVisitor(NodeVisitor):
             self.object_mode = True
             real = args[0] if args else "0.0"
             imag = args[1] if len(args) > 1 else "0.0"
-            return "{'real': float(%s), 'imag': float(%s)}" % (real, imag)
+            return f"{{'real': float({real}), 'imag': float({imag})}}"
         if func_name in ("math_abs", "abs"):
             return f"numba_abs({args[0]})" if args else "np.nan"
         if func_name in ("math_max", "max"):
@@ -7044,18 +7381,16 @@ class CompilerVisitor(NodeVisitor):
                 call_args.append("np.nan")
             elif sc in self.scalar_vars or sc in self.map_vars:
                 call_args.append(self._py_ident(sc) if sc in self.ident_map else sc)
+            # Outer series written every bar as *_arr, or scalar not yet known
+            elif any(a == arr or a.startswith(sc) for a in self.arrays):
+                call_args.append(f"{arr}[__bar_idx]")
+            # May be input.color scalar assigned later — pass bare name
+            # only when it is a known outer; else None to avoid NameError
+            elif sc in self.scalar_vars or sc in self.map_vars or sc in self.arrays:
+                call_args.append(sc)
             else:
-                # Outer series written every bar as *_arr, or scalar not yet known
-                if any(a == arr or a.startswith(sc) for a in self.arrays):
-                    call_args.append(f"{arr}[__bar_idx]")
-                else:
-                    # May be input.color scalar assigned later — pass bare name
-                    # only when it is a known outer; else None to avoid NameError
-                    if sc in self.scalar_vars or sc in self.map_vars or sc in self.arrays:
-                        call_args.append(sc)
-                    else:
-                        # Unknown free (import alias missed / undeclared) — Pine na
-                        call_args.append("np.nan")
+                # Unknown free (import alias missed / undeclared) — Pine na
+                call_args.append("np.nan")
         free_series = _meta(getattr(self, "func_free_series", {}), [])
         for fs in free_series:
             if self._is_ta_state_buf(fs) or self._is_series_local_state(fs):
@@ -7077,6 +7412,7 @@ class CompilerVisitor(NodeVisitor):
                 "vol_arr",
                 "time_arr",
                 "__bar_idx",
+                *self._BARSTATE_CTX,
             ):
                 call_args.append(extra)
         if _meta(self.func_needs_strategy, False):
@@ -7281,18 +7617,26 @@ class CompilerVisitor(NodeVisitor):
         self.object_mode = True
         fields = self.udt_types.get(type_name, [])
         defaults = self.udt_field_defaults.get(type_name, {})
-        args: list[str] = []
+        positional: list[str] = []
+        named: dict[str, str] = {}
         for arg in node.args:
             if hasattr(arg, "value"):
-                args.append(self.visit(arg.value))
+                expr = self.visit(arg.value)
             else:
-                args.append(self.visit(arg))
+                expr = self.visit(arg)
+            name = getattr(arg, "name", None)
+            if name:
+                named[str(name)] = expr
+            else:
+                positional.append(expr)
         items = [f"'__type__': {type_name!r}"]
         for i, f in enumerate(fields):
-            # Omitted ctor args use the type-body default. ``np.nan`` for
-            # missing bools is ``True`` under ``bool()`` and flips BE/flags.
-            if i < len(args):
-                v = args[i]
+            # Keyword binds by field name and wins over the same-index
+            # positional; omitted fields use the type default.
+            if f in named:
+                v = named[f]
+            elif i < len(positional):
+                v = positional[i]
             else:
                 v = defaults.get(f, "np.nan")
             items.append(f"{f!r}: {v}")
@@ -7844,7 +8188,7 @@ class CompilerVisitor(NodeVisitor):
         ops = []
         wrap_all_numeric = True
         raw_rights: list[str] = []
-        for op, comp in zip(node.ops, node.comparators):
+        for op, comp in zip(node.ops, node.comparators, strict=False):
             op_str = {
                 ast.Gt: ">",
                 ast.Lt: "<",
@@ -8134,6 +8478,87 @@ class CompilerVisitor(NodeVisitor):
             return a2.value if hasattr(a2, "value") else a2
         return None
 
+    def _emit_chart_htf_security(self, node: ast.Call, args: list[str], kwargs: dict[str, str]) -> str | None:
+        """Same-symbol allowlisted security → object-mode interpret HTF helper.
+
+        Returns a Python expression calling ``compile_security_htf_value`` for
+        simple OHLCV / ``close[1]`` / allowlisted ``ta.*``. ``None`` falls
+        through to HA transform, chart passthrough, UDT handle, or ``np.nan``.
+        """
+        from pynescript.ast.evaluator.builtins.request import match_htf_offset_ast
+        from pynescript.ast.evaluator.builtins.request import match_htf_ohlcv_ast
+        from pynescript.ast.evaluator.builtins.request import match_htf_simple_ta_ast
+
+        sym = args[0] if args else ""
+        if self._is_heikinashi_security_symbol(sym) or not self._is_chart_security_symbol(sym):
+            return None
+        tf_expr = args[1] if len(args) >= 2 else (kwargs.get("timeframe") or kwargs.get("tf"))
+        if not tf_expr:
+            return None
+
+        expr_ast = None
+        pos: list = []
+        for raw in node.args or []:
+            if hasattr(raw, "name") and getattr(raw, "name", None):
+                if str(raw.name) in ("expression", "expr"):
+                    expr_ast = raw.value
+            else:
+                pos.append(raw.value if hasattr(raw, "value") else raw)
+        if expr_ast is None and len(pos) >= 3:
+            expr_ast = pos[2]
+        if expr_ast is None:
+            return None
+
+        ta = match_htf_simple_ta_ast(expr_ast)
+        off = None if ta is not None else match_htf_offset_ast(expr_ast)
+        field = None if ta is not None or off is not None else match_htf_ohlcv_ast(expr_ast)
+        if ta is None and off is None and field is None:
+            return None
+
+        gaps_expr = kwargs.get("gaps")
+        lookahead_expr = kwargs.get("lookahead")
+        if gaps_expr is None and len(args) > 3:
+            gaps_expr = args[3]
+        if lookahead_expr is None and len(args) > 4:
+            lookahead_expr = args[4]
+
+        def _bool_arg(expr: str | None) -> str:
+            if expr is None:
+                return "False"
+            s = expr.strip()
+            if s in ("True", "False"):
+                return s
+            return f"bool({s})"
+
+        if ta is not None:
+            kind = "ta"
+            field_s = ta.source
+            offset_i = int(ta.extra) if ta.extra is not None else 0
+            ta_name: str | None = ta.name
+            ta_length = int(ta.length)
+        elif off is not None:
+            kind = "offset"
+            field_s = off.field
+            offset_i = int(off.offset)
+            ta_name = None
+            ta_length = 0
+        else:
+            kind = "ohlcv"
+            field_s = field or "close"
+            offset_i = 0
+            ta_name = None
+            ta_length = 0
+
+        self.object_mode = True
+        return (
+            "compile_security_htf_value("
+            f"{kind!r}, {field_s!r}, {offset_i}, {ta_name!r}, {ta_length}, "
+            f"{tf_expr}, __bar_idx, "
+            "open_arr, high_arr, low_arr, close_arr, vol_arr, time_arr, "
+            f"{_bool_arg(gaps_expr)}, {_bool_arg(lookahead_expr)}, chart_timezone(), "
+            "data_feed=data_feed, data_provider=data_provider)"
+        )
+
     def _security_expr_is_udt(self, node: ast.Call, expr: str) -> bool:
         """True when the security expression is a UDT / object handle, not OHLCV."""
         raw = self._security_expression_node(node)
@@ -8174,11 +8599,12 @@ class CompilerVisitor(NodeVisitor):
         return False
 
     def _scalar_history_fallback(self, value_expr: str, offset_expr: str) -> str:
-        """History on a non-series value.
+        """History on a literal or a value that is not a per-bar numeric series.
 
         Literals/constants are bar-invariant → return the value when the offset
-        is in range, else na. Function results / strategy stubs / other scalars
-        cannot be rewound without a temp series → na (avoids getitem TypeError).
+        is in range, else na. Script-level numeric calls use a temp series
+        (see :meth:`visit_Subscript`). UDF calls and non-numeric values stay na
+        so a float is never indexed.
         """
         off = self._safe_history_offset(offset_expr)
         if self._is_numeric_or_bool_literal(value_expr):
@@ -8309,6 +8735,22 @@ class CompilerVisitor(NodeVisitor):
                 f"if (__bar_idx >= ({off}) and "
                 f"(__bar_idx - ({off})) < len({hist_arr})) else np.nan))"
             )
+
+        # Per-bar numeric calls and arithmetic have no series of their own.
+        # Store this bar, then read the offset: ``ta.lowest(src, len)[off]``
+        # is that lowest from ``off`` bars ago. Literals stay in the fallback.
+        # A UDF would share one buffer and advance incremental TA once per call.
+        if (
+            not self.in_function
+            and not self._is_numeric_or_bool_literal(arr)
+            and not arr.startswith(("'", '"', "{", "str("))
+            and "'__type__'" not in arr
+        ):
+            buf = f"__hexpr{self._hist_expr_n}_arr"
+            self._hist_expr_n += 1
+            self.arrays.add(buf)
+            off = self._safe_history_offset(slice_val)
+            return f"numba_history_store({buf}, __bar_idx, ({arr}), {off})"
 
         # Strategy / broker scalars, call results, arithmetic, literals, …
         return self._scalar_history_fallback(arr, slice_val)
@@ -8811,8 +9253,9 @@ class CompilerVisitor(NodeVisitor):
     def visit_Once(self, node: ast.Once):
         """Lower ``once [cond]`` to a persistent fired flag + nested if.
 
-        Compile is historical (``barstate.isconfirmed`` is always true), so the
-        flag is set as soon as the body runs. Realtime rollback is interpret-only.
+        The fired flag latches only when ``__isconfirmed`` (historical bars and
+        the last tick of a realtime bar). Unconfirmed intermediate ticks may
+        re-run the body; snapshot/restore also rolls the flag back.
         """
         flag = self._alloc_once_flag()
         test = "True" if node.test is None else self._as_bool_cond(self.visit(node.test), node=node.test)
@@ -8826,7 +9269,8 @@ class CompilerVisitor(NodeVisitor):
                 n += 1
         if n == 0:
             lines.append("        pass")
-        lines.append(f"        {flag} = True")
+        lines.append("        if __isconfirmed:")
+        lines.append(f"            {flag} = True")
         return "\n".join(lines)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -8976,7 +9420,7 @@ class CompilerVisitor(NodeVisitor):
             elif n in self._CHART_ARR_BASES and n not in arg_set:
                 # ``var vol`` must not emit as ``vol_arr`` (chart volume formal)
                 self.ident_map[n] = f"__user_{n}"
-            elif n in self.user_funcs or n == pine_name or n == func_name:
+            elif n in self.user_funcs or n in {pine_name, func_name}:
                 self.ident_map[n] = f"{self._safe_ident(n)}__loc"
             else:
                 self.ident_map[n] = self._safe_ident(n)
@@ -9078,10 +9522,15 @@ class CompilerVisitor(NodeVisitor):
         if isinstance(last_ret, ast.Tuple) and not self._ast_expr_is_sequence(last_ret):
             # Numeric/mixed tuple return: ``a = f()`` is a handle; ``[p, q] = f()``
             # still unpacks into float series (see _visit_tuple_assign).
+            # A UDT or string element is remembered so that unpack keeps the value.
             self.func_returns_tuple.add(pine_name)
             self.func_returns_tuple.add(func_name)
             self.func_returns_sequence.add(pine_name)
             self.func_returns_sequence.add(func_name)
+            kinds = tuple(self._tuple_elem_kind(el) for el in last_ret.elts)
+            if any(k != "num" for k in kinds):
+                self.func_tuple_kinds[pine_name] = kinds
+                self.func_tuple_kinds[func_name] = kinds
         if self._func_body_returns_udt(last_ast):
             self.func_returns_udt.add(pine_name)
             self.func_returns_udt.add(func_name)
@@ -9129,6 +9578,7 @@ class CompilerVisitor(NodeVisitor):
             "close_arr",
             "vol_arr",
             "time_arr",
+            *self._BARSTATE_CTX,
         )
         # Nested callees may need __st_* state arrays passed through this frame
         st_refs = sorted(set(re.findall(r"__st_[A-Za-z_][A-Za-z0-9_]*", body_text)))
@@ -9240,6 +9690,7 @@ class CompilerVisitor(NodeVisitor):
                 "vol_arr",
                 "time_arr",
                 "__bar_idx",
+                *self._BARSTATE_CTX,
             ]
             param_list.extend(e for e in extra if e not in param_list)
             _bind_func_meta(self.func_needs_bar, True)
@@ -9250,7 +9701,7 @@ class CompilerVisitor(NodeVisitor):
             self.object_mode = True
             self.uses_strategy = True
             if "__strategy" not in param_list:
-                param_list = list(param_list) + ["__strategy"]
+                param_list = [*list(param_list), "__strategy"]
         _bind_func_meta(self.func_needs_strategy, needs_strategy)
 
         deco = "@numba.njit(cache=False)" if not self.object_mode else ""
@@ -9293,9 +9744,9 @@ class CompilerVisitor(NodeVisitor):
                     if m_tail:
                         for_ret_name = m_tail.group(1)
                     break
-            for i, line in enumerate(body_lines):
+            for i, raw_line in enumerate(body_lines):
                 is_last = i == len(body_lines) - 1
-                line = line.replace("\n", "\n    ")
+                line = raw_line.replace("\n", "\n    ")
                 stripped = line.lstrip()
                 # Detect real assignment statements only — never treat kwargs in a
                 # call (``__strategy.close(id=..., qty=...)``) as assignment. A
@@ -9713,20 +10164,18 @@ class CompilerVisitor(NodeVisitor):
             if target not in self.local_vars:
                 self.local_vars.add(target)
                 added_local = True
-        else:
-            if target not in self.scalar_vars:
-                self.scalar_vars.add(target)
-                added_scalar = True
+        elif target not in self.scalar_vars:
+            self.scalar_vars.add(target)
+            added_scalar = True
         end_tmp = f"__end_{target}"
         if has_explicit_step:
             step_expr = step if step is not None else "1"
+        # Evaluate end once; auto-step from start vs end at loop entry.
+        # Numeric path: bare compare (na_num is Python-only — breaks njit).
+        elif self.object_mode:
+            step_expr = f"(1 if (na_num({target}) <= na_num({end_tmp})) else -1)"
         else:
-            # Evaluate end once; auto-step from start vs end at loop entry.
-            # Numeric path: bare compare (na_num is Python-only — breaks njit).
-            if self.object_mode:
-                step_expr = f"(1 if (na_num({target}) <= na_num({end_tmp})) else -1)"
-            else:
-                step_expr = f"(1 if ({target}) <= ({end_tmp}) else -1)"
+            step_expr = f"(1 if ({target}) <= ({end_tmp}) else -1)"
         lines: list[str] = []
         if self._loop_result_target:
             lines.append(f"{self._loop_result_target} = np.nan")
@@ -9818,9 +10267,8 @@ class CompilerVisitor(NodeVisitor):
             if self.in_function:
                 if target not in self.local_vars:
                     self.local_vars.add(target)
-            else:
-                if target not in self.scalar_vars:
-                    self.scalar_vars.add(target)
+            elif target not in self.scalar_vars:
+                self.scalar_vars.add(target)
             # Guard non-iterables (float/NaN from mis-typed series) so the bar loop
             # does not raise ``float is not iterable``.
             lines = [f"for {target} in safe_iter({iterable}):"]

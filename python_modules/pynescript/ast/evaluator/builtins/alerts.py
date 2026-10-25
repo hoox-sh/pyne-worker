@@ -35,6 +35,7 @@ from typing import Any
 from .base import BuiltinDispatchMixin
 from .base import BuiltinHandler
 
+
 # Normalized frequency tokens used in AlertEvent.freq
 FREQ_ONCE_PER_BAR = "once_per_bar"
 FREQ_ONCE_PER_BAR_CLOSE = "once_per_bar_close"
@@ -314,15 +315,13 @@ def export_alerts_from_evaluator(evaluator: Any) -> list[dict[str, Any]]:
         try:
             out = exp()
             return list(out) if out else []
-        except Exception:  # noqa: BLE001
+        except Exception:
             return []
-    raw = getattr(evaluator, "_triggered_alerts", None) or getattr(
-        evaluator, "get_triggered_alerts", None
-    )
+    raw = getattr(evaluator, "_triggered_alerts", None) or getattr(evaluator, "get_triggered_alerts", None)
     if callable(raw):
         try:
             items = raw()
-        except Exception:  # noqa: BLE001
+        except Exception:
             return []
     else:
         items = raw

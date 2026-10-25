@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-
 import re
 
 from antlr4 import FileStream
@@ -38,8 +37,6 @@ from pynescript.ast.error import SyntaxErrorDetails
 
 
 class PinescriptErrorListener(ErrorListener):
-    # ruff: noqa: N802
-
     INSTANCE: PinescriptErrorListener | None = None
 
     def _getFilenameFrom(self, recognizer: Recognizer) -> str:
@@ -105,7 +102,7 @@ class PinescriptErrorListener(ErrorListener):
             msg = f"unexpected type of recognizer: {type(recognizer)}"
             raise TypeError(msg)
 
-    def syntaxError(  # noqa: PLR0913
+    def syntaxError(
         self,
         recognizer: Recognizer,
         offendingSymbol: Token,  # noqa: N803

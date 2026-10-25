@@ -109,19 +109,21 @@ import pickle
 import sys
 import tempfile
 import time
+
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 from typing import Any
-from typing import Callable
 
 import numpy as np
 
 from pynescript import stats as _stats
 from pynescript.ast.helper import parse
 from pynescript.compiler.compiler import CompilerVisitor
-from pynescript.debug import scope_enabled as _debug_scope
+from pynescript.debug import scoped_debug
+
 
 try:
     import numba  # noqa: F401
@@ -132,11 +134,9 @@ except ImportError:  # pragma: no cover
 
 _log = logging.getLogger(__name__)
 
+#: Emit one debug line for this module when ``PYNE_DEBUG`` is enabled.
+_dbg = scoped_debug(__name__, _log)
 
-def _dbg(msg: str, *args: Any) -> None:
-    """Emit one compile-pipeline debug line when ``PYNE_DEBUG`` is enabled."""
-    if _debug_scope(__name__):
-        _log.debug(msg, *args)
 
 # ---------------------------------------------------------------------------
 # Typed exceptions (fail closed / surface cleanly — no silent wrong results)
@@ -179,7 +179,7 @@ _BUILTINS_WARMED = False
 # Bump when generated IR semantics change so source→IR disk index is invalidated
 # (source hash alone is stable across compiler fixes, e.g. fill() series keys).
 # v5: strategy series history + Pine na-aware ==/!=
-_DISK_META_VERSION = 18  # v18: table.new is columns then rows (Pine order)
+_DISK_META_VERSION = 52  # v52: run-time chart timeframe.*
 _NJIT_CACHE_FALSE = "@numba.njit(cache=False)"
 _NJIT_CACHE_TRUE = "@numba.njit(cache=True)"
 
@@ -584,7 +584,7 @@ def prewarm_scripts(
                     (time.perf_counter() - t_script0) * 1000.0,
                     len(src),
                 )
-            except Exception as exc:  # noqa: BLE001 — surface per-script; continue
+            except Exception as exc:  # surface per-script; continue
                 failed += 1
                 msg = f"scripts[{i}]: {type(exc).__name__}: {exc}"
                 if len(msg) > 240:
@@ -688,6 +688,12 @@ class CompiledScript:
         close: np.ndarray | list[float],
         volume: np.ndarray | list[float] | None = None,
         time: np.ndarray | list[float] | None = None,
+        *,
+        rt_first: int | None = None,
+        rt_ticks: int = 1,
+        data_feed: Any = None,
+        feed_symbol: str = "",
+        data_provider: Any = None,
     ) -> dict[str, Any]:
         """Execute over full series; returns plots (+ optional ``__drawings`` / strategy).
 
@@ -697,6 +703,12 @@ class CompiledScript:
         *time* is bar-open Unix ms. When omitted, synthetic ``bar_index * 60_000``
         is used (unit-test / pure-compile default). Runtime hosts should pass
         real OHLCV timestamps for calendar/``timestamp``/``time[n]`` parity.
+
+        *rt_first* / *rt_ticks* are object-mode realtime window kwargs (defaults
+        keep historical 6-arg execute). *data_feed* / *feed_symbol* drive
+        last-bar ``poll_forming_ohlcv`` on object-mode ticks. *data_provider*
+        (and *data_feed* OHLCV) feed object-mode HTF ``request.security`` merge.
+        Numeric nopython ignores them.
         """
         o = _as_f64(open_)
         h = _as_f64(high)
@@ -717,15 +729,37 @@ class CompiledScript:
             if len(t) != n:
                 msg = "time array must have the same length as OHLCV"
                 raise ValueError(msg)
+        rt_kw: dict[str, Any] = {}
+        if self.object_mode:
+            rt_kw["rt_first"] = rt_first
+            rt_kw["rt_ticks"] = rt_ticks
+            if data_feed is not None:
+                rt_kw["data_feed"] = data_feed
+                rt_kw["feed_symbol"] = feed_symbol or ""
+            if data_provider is not None:
+                rt_kw["data_provider"] = data_provider
         # Recover from truncated Numba .nbi/.nbc left after code edits / crashes.
         try:
-            raw = _call_execute_with_recovery(self.execute, o, h, l, c, v, t)
+            raw = _call_execute_with_recovery(self.execute, o, h, l, c, v, t, **rt_kw)
         except Exception as exc:
             # Dummy-OHLCV warm-up can miss nopython typing that only blows up
             # on real bars / object values. Do not leak TypingError to the host.
             if self.object_mode or not _is_numba_nopython_failure(exc):
                 raise
-            raw = self._recover_nopython_at_run(exc, o, h, l, c, v, t)
+            raw = self._recover_nopython_at_run(
+                exc,
+                o,
+                h,
+                l,
+                c,
+                v,
+                t,
+                rt_first=rt_first,
+                rt_ticks=rt_ticks,
+                data_feed=data_feed,
+                feed_symbol=feed_symbol,
+                data_provider=data_provider,
+            )
         return self._pack_result(raw)
 
     def _recover_nopython_at_run(
@@ -737,6 +771,12 @@ class CompiledScript:
         c: np.ndarray,
         v: np.ndarray,
         t: np.ndarray,
+        *,
+        rt_first: int | None = None,
+        rt_ticks: int = 1,
+        data_feed: Any = None,
+        feed_symbol: str = "",
+        data_provider: Any = None,
     ) -> Any:
         """Re-emit object mode after a run-time nopython failure and retry once.
 
@@ -768,7 +808,13 @@ class CompiledScript:
         self.plot_titles = list(recovered.plot_titles)
         self.plot_kinds = list(recovered.plot_kinds)
         self.plot_attrs = [dict(a) for a in recovered.plot_attrs]
-        return _call_execute_with_recovery(self.execute, o, h, l, c, v, t)
+        rec_kw: dict[str, Any] = {"rt_first": rt_first, "rt_ticks": rt_ticks}
+        if data_feed is not None:
+            rec_kw["data_feed"] = data_feed
+            rec_kw["feed_symbol"] = feed_symbol or ""
+        if data_provider is not None:
+            rec_kw["data_provider"] = data_provider
+        return _call_execute_with_recovery(self.execute, o, h, l, c, v, t, **rec_kw)
 
     def _pack_result(self, raw: Any) -> dict[str, Any]:
         """Map execute() output to the public plot-title dict.
@@ -804,16 +850,27 @@ def _call_execute_with_recovery(
     c: np.ndarray,
     v: np.ndarray,
     t: np.ndarray,
+    **kwargs: Any,
 ) -> Any:
     """Call ``execute_script_compiled`` with Numba cache + legacy arity recovery.
 
-    Current IR is ``(open, high, low, close, volume, time)``. Disk modules from
-    older engines may still be 5-arg (no ``time_arr``). On that TypeError, retry
-    without *t* so stale disk IR still runs instead of hard-failing the host.
+    Current IR is ``(open, high, low, close, volume, time)`` plus optional
+    object-mode ``rt_first`` / ``rt_ticks`` / ``data_feed`` / ``feed_symbol``
+    / ``data_provider`` kwargs. Disk modules from older engines may still be
+    6-arg (no realtime kwargs) or 5-arg (no ``time_arr``).
+    On that TypeError, retry without kwargs then without *t* so stale disk IR
+    still runs instead of hard-failing the host.
     """
     try:
+        if kwargs:
+            return _call_with_numba_cache_recovery(execute, o, h, l, c, v, t, **kwargs)
         return _call_with_numba_cache_recovery(execute, o, h, l, c, v, t)
     except TypeError as exc:
+        if kwargs:
+            try:
+                return _call_execute_with_recovery(execute, o, h, l, c, v, t)
+            except TypeError:
+                raise exc from None
         if not _is_legacy_execute_arity_error(exc):
             raise
         _log.debug(
@@ -1011,7 +1068,10 @@ def _normalize_result(raw: Any) -> dict[str, Any]:
             # Match interpret empty-title packaging: plot_N, not "plot".
             n = sum(1 for existing in out if not str(existing).startswith("__"))
             key = f"plot_{n}"
-        if key in ("__drawings", "__events"):
+        if key in ("__drawings", "__events", "__alerts"):
+            # Event containers stay Python lists. Coercing them to a float
+            # array (an *empty* list becomes an empty float64 array) loses the
+            # payload and makes truthiness checks raise.
             out[key] = list(v) if v is not None else []
             continue
         if key.startswith("__") and not isinstance(v, (list, tuple, np.ndarray)):
@@ -1556,7 +1616,7 @@ def _compile_via_disk_index(
     return None
 
 
-def compile_script(source: str, *, use_cache: bool = True) -> CompiledScript:
+def compile_script(source: str, *, use_cache: bool = True, force_object_mode: bool = False) -> CompiledScript:
     """Transpile Pine source and load the compiled entry point.
 
     Uses Numba when the script is pure-numeric; object-mode (UDT/map/drawing)
@@ -1580,6 +1640,9 @@ def compile_script(source: str, *, use_cache: bool = True) -> CompiledScript:
     raw_source = source
     raw_key = _sha256_text(raw_source)
     _t_compile0 = time.perf_counter()
+    if force_object_mode:
+        # Do not poison the numeric cache with a forced object-mode emit.
+        use_cache = False
 
     if use_cache:
         hit = _memory_cache_get(raw_key)
@@ -1627,7 +1690,7 @@ def compile_script(source: str, *, use_cache: bool = True) -> CompiledScript:
             _stats.latency("compile_script.total", time.perf_counter() - _t_compile0)
             return shared_disk
 
-    code, titles, kinds, object_mode, attrs = _transpile_once(source, force_object_mode=False)
+    code, titles, kinds, object_mode, attrs = _transpile_once(source, force_object_mode=force_object_mode)
     ir_key = _sha256_text(code)
     _dbg(
         "compile_script: transpiled san_key=%s ir_key=%s object_mode=%s plots=%d chars=%d",

@@ -139,14 +139,14 @@ class BuiltinEvaluator(
                 decl = _raw_fn(args, kwargs)
                 try:
                     _self._script_declaration = decl  # type: ignore[attr-defined]
-                except Exception:  # noqa: BLE001 — setattr on frozen/partial mocks
+                except Exception:  # setattr on frozen/partial mocks
                     pass
                 # Wire max_lines/labels/boxes/polylines_count → DrawingRegistry GC.
                 try:
                     from .drawing import DrawingRegistry
 
                     DrawingRegistry.configure_from_declaration(decl)
-                except Exception:  # noqa: BLE001 — drawings optional in partial hosts
+                except Exception:  # drawings optional in partial hosts
                     pass
                 if _is_strategy and hasattr(_self, "_apply_strategy_declaration"):
                     # Fail closed on programming errors (TypeError/AttributeError/
@@ -156,7 +156,7 @@ class BuiltinEvaluator(
                         _self._apply_strategy_declaration(decl)
                     except (TypeError, AttributeError, ValueError):
                         raise
-                    except Exception:  # noqa: BLE001 — optional host plumbing only
+                    except Exception:  # optional host plumbing only
                         pass
                 return decl
 

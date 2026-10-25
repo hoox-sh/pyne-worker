@@ -52,11 +52,11 @@ Supporting modules (not re-exported here)
 from __future__ import annotations
 
 from .compiler import CompilerVisitor
+from .engine import CompiledScript
 from .engine import CompileEmitError
 from .engine import CompileError
 from .engine import CompileLoadError
 from .engine import CompileNumbaRequiredError
-from .engine import CompiledScript
 from .engine import clear_compile_cache
 from .engine import clear_disk_compile_cache
 from .engine import clear_numba_function_caches
@@ -70,6 +70,7 @@ from .engine import prewarm_numba_builtins
 from .engine import prewarm_scripts
 from .engine import run_script
 from .engine import transpile
+
 
 __all__ = [
     "CompileEmitError",

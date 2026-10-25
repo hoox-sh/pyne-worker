@@ -56,8 +56,29 @@ Hot-path notes
 from __future__ import annotations
 
 import math
+import os
+
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import Any
+
+from pynescript.ast.evaluator.builtins.timeframe import calendar_day_bucket
+from pynescript.strategy_risk_core import StrategyBracketCore
+from pynescript.strategy_risk_core import StrategyRiskCore
+
+
+def _contracts_risk_mode() -> bool:
+    """True when ``PYNE_STRATEGY_RISK_CONTRACTS`` opts into absolute contracts.
+
+    Mirrors the interpret host: default keeps the pinned %-of-equity
+    ``max_position_size`` semantics; opt-in matches reference Pine.
+    """
+    return os.environ.get("PYNE_STRATEGY_RISK_CONTRACTS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _is_na(value: Any) -> bool:
@@ -96,7 +117,7 @@ def _opt_float(value: Any) -> float | None:
 def _norm_dir(direction: Any) -> str | None:
     """Normalize to ``long``/``short``; ``None`` if unrecognised (reject, do not fill)."""
     # Compile path almost always passes "long" / "short" already.
-    if direction == "long" or direction == "short":
+    if direction in {"long", "short"}:
         return direction  # type: ignore[return-value]
     if direction is None:
         return None
@@ -222,7 +243,7 @@ class ClosedTradeRecord:
     max_runup: float = 0.0
 
 
-class CompileStrategyBroker:
+class CompileStrategyBroker(StrategyRiskCore, StrategyBracketCore):
     """Per-run strategy state for compiled object-mode scripts.
 
     Public methods mirror Pine ``strategy.entry`` / ``close`` / ``order`` /
@@ -355,6 +376,9 @@ class CompileStrategyBroker:
         # strategy.risk.* subset (not full TV risk engine; interpret-aligned halt cascade)
         self.allow_entry_in: str = "all"  # all | long | short
         self.max_position_size_percent: float | None = None
+        # Opt-in absolute contracts cap (PYNE_STRATEGY_RISK_CONTRACTS=1);
+        # mutually exclusive with the percent cap above.
+        self.max_position_size_contracts: float | None = None
         self.max_drawdown_risk: float | None = None  # absolute equity drawdown cap
         self.max_drawdown_risk_percent: float | None = None  # % of peak equity
         self.max_cons_loss_days: int | None = None
@@ -371,6 +395,42 @@ class CompileStrategyBroker:
         self._day_pnl: float = 0.0
         self._fills_day: int | None = None  # day bucket for fill counting
         self._day_filled_orders: int = 0
+        self._calendar_day: int | None = None  # current tz calendar day
+
+    def snapshot(self) -> dict[str, Any]:
+        """Copy broker books for unconfirmed realtime tick rollback.
+
+        Pending orders and open/closed trade records are copied; event dicts
+        are copied by value. :meth:`restore` writes back onto this same
+        instance so generated ``__strategy`` aliases stay valid.
+        """
+        snap: dict[str, Any] = {}
+        for k, v in self.__dict__.items():
+            if k == "pending_orders":
+                snap[k] = {oid: replace(o) for oid, o in v.items()}
+            elif k in {"open_legs", "closed_trade_records"}:
+                snap[k] = [replace(x) for x in v]
+            elif k == "events":
+                snap[k] = [dict(e) for e in v]
+            else:
+                snap[k] = v
+        return snap
+
+    def restore(self, snap: dict[str, Any] | None) -> None:
+        """Replace in-place broker state from :meth:`snapshot` (same object)."""
+        if not snap:
+            return
+        for k, v in snap.items():
+            cur = getattr(self, k, None)
+            if k == "pending_orders" and isinstance(cur, dict):
+                cur.clear()
+                cur.update({oid: replace(o) for oid, o in v.items()})
+            elif k in {"open_legs", "closed_trade_records"} and isinstance(cur, list):
+                cur[:] = [replace(x) for x in v]
+            elif k == "events" and isinstance(cur, list):
+                cur[:] = [dict(e) for e in v]
+            else:
+                setattr(self, k, v)
 
     def begin_bar(
         self,
@@ -510,6 +570,52 @@ class CompileStrategyBroker:
             candidate = float(low) + offset
             if order.stop_price is None or candidate < float(order.stop_price):
                 order.stop_price = candidate
+
+    def ratchet_trails(self, high: float, low: float) -> None:
+        """Ratchet pending trail stops from forming-bar high/low (no fills).
+
+        Re-applied after unconfirmed realtime ``restore`` so the trail follows
+        the forming bar's extremes while fills still roll back.
+        """
+        if not self.pending_orders:
+            return
+        h = float(high)
+        l = float(low)
+        for order in self.pending_orders.values():
+            if order is not None and order.is_trail:
+                self._update_trail_stop(order, h, l)
+
+    def update_open_trade_extremes(self, high: float, low: float) -> None:
+        """Update open-trade MAE/MFE from forming-bar high/low (no fills).
+
+        Re-applied after unconfirmed realtime ``restore`` so per-leg
+        ``max_drawdown`` / ``max_runup`` follow the forming bar's extremes
+        while fills still roll back. Still OHLC-path (no tick path).
+        """
+        if not self.open_legs:
+            return
+        try:
+            hi = float(high)
+            lo = float(low)
+        except (TypeError, ValueError):
+            return
+        if hi != hi or lo != lo:
+            return
+        for leg in self.open_legs:
+            ep = float(leg.entry_price)
+            sz = float(leg.size)
+            if sz <= 0 or ep != ep:
+                continue
+            if leg.direction == "long":
+                fav = (hi - ep) * sz
+                adv = (ep - lo) * sz
+            else:
+                fav = (ep - lo) * sz
+                adv = (hi - ep) * sz
+            if fav > leg.max_runup:
+                leg.max_runup = float(fav)
+            if adv > leg.max_drawdown:
+                leg.max_drawdown = float(adv)
 
     def _trigger_price(
         self,
@@ -690,26 +796,39 @@ class CompileStrategyBroker:
             max_runup=float(max_runup),
         )
 
-    @staticmethod
-    def _day_bucket(ts: int) -> int:
-        """Calendar-day bucket from bar/exit time (ms, s, or raw)."""
+    def _chart_timezone(self) -> object:
+        """Pine ``syminfo.timezone`` installed by the compile host (UTC default)."""
+        try:
+            from pynescript.compiler.numba_builtins import chart_timezone
+
+            return chart_timezone()
+        except Exception:
+            return None
+
+    def _day_bucket(self, ts: int, tz: object | None = None) -> int:
+        """Timezone-aware calendar-day id (``timeframe.change("D")`` ordinal).
+
+        Small integers (``<= 10_000_000``) stay raw day ids. *tz* defaults to
+        ``chart_timezone()`` (host ``syminfo.timezone``; UTC when unset).
+        """
+        zone = tz if tz is not None else self._chart_timezone()
+        day = calendar_day_bucket(ts, zone)
+        if day is not None:
+            return day
         t = int(ts)
-        if t > 10_000_000_000:  # ms epoch
+        if t > 10_000_000_000:
             return t // 86_400_000
-        if t > 10_000_000:  # seconds epoch
+        if t > 10_000_000:
             return t // 86_400
         return t
 
     def _roll_fill_day(self) -> None:
         """Reset intraday fill counter when the bar-time day bucket changes."""
-        day = self._day_bucket(self._bar_time)
-        if self._fills_day is None or day != self._fills_day:
-            self._fills_day = day
-            self._day_filled_orders = 0
+        self._ensure_calendar_day(self._bar_time)
 
     def _note_filled_order(self) -> None:
         """Count one filled order toward max_intraday_filled_orders."""
-        self._roll_fill_day()
+        self._ensure_calendar_day(self._bar_time)
         self._day_filled_orders += 1
         self._note_position_size()
 
@@ -720,8 +839,7 @@ class CompileStrategyBroker:
         (same as interpret ``StrategyState.note_position_size``).
         """
         size = abs(float(self.position_size))
-        if size > self.max_contracts_held_all:
-            self.max_contracts_held_all = size
+        self.max_contracts_held_all = max(self.max_contracts_held_all, size)
         if self.position_size > 0 and size > self.max_contracts_held_long:
             self.max_contracts_held_long = size
         elif self.position_size < 0 and size > self.max_contracts_held_short:
@@ -771,7 +889,7 @@ class CompileStrategyBroker:
             leg (``open_entry_count == 1``) with VWAP avg (F2).
             Pending same-id replacement is the ``pending_orders[id]`` upsert.
         """
-        d = direction if direction == "long" or direction == "short" else _norm_dir(direction)
+        d = direction if direction in {"long", "short"} else _norm_dir(direction)
         if d is None:
             return False
         q = abs(float(qty))
@@ -916,11 +1034,11 @@ class CompileStrategyBroker:
         q, p = abs(qty), abs(price)
         ct = self.commission_type
         # Avoid .lower() when already a plain token
-        if ct == "percent" or ct == "strategy.commission.percent":
+        if ct in {"percent", "strategy.commission.percent"}:
             return q * p * (val / 100.0)
-        if ct == "cash_per_order" or ct == "strategy.commission.cash_per_order":
+        if ct in {"cash_per_order", "strategy.commission.cash_per_order"}:
             return val
-        if ct == "cash_per_contract" or ct == "strategy.commission.cash_per_contract":
+        if ct in {"cash_per_contract", "strategy.commission.cash_per_contract"}:
             return val * q
         ct_l = ct.lower()
         if ct_l in {"percent", "strategy.commission.percent"}:
@@ -974,7 +1092,6 @@ class CompileStrategyBroker:
             return None
         hi = float(self._high)
         lo = float(self._low)
-        op = float(self._open)
         # Prefer OHLC path (same as interpret pending fills)
         if is_long:
             # Close long: sell limit (TP) when high >= lim; sell stop when low <= stop
@@ -984,9 +1101,9 @@ class CompileStrategyBroker:
                 # Both touched: prefer stop (worse for long) — conservative
                 return float(stop_p)  # type: ignore[arg-type]
             if hit_lim:
-                return float(limit_p) if op > limit_p else float(limit_p)  # type: ignore[arg-type]
+                return float(limit_p)  # type: ignore[arg-type]
             if hit_stop:
-                return float(stop_p) if op < stop_p else float(stop_p)  # type: ignore[arg-type]
+                return float(stop_p)  # type: ignore[arg-type]
             return None
         if is_short:
             hit_lim = limit_p is not None and lo <= limit_p
@@ -1051,7 +1168,11 @@ class CompileStrategyBroker:
             self.allow_entry_in = "all"
 
     def risk_max_position_size(self, percent: Any = None, **_kwargs: Any) -> None:
-        """``strategy.risk.max_position_size(percent)`` — cap entry notional vs equity."""
+        """``strategy.risk.max_position_size(value)`` — cap entry notional vs equity.
+
+        With ``PYNE_STRATEGY_RISK_CONTRACTS=1`` the value is an absolute
+        contracts cap (reference Pine semantics) instead.
+        """
         raw = percent if percent is not None else _kwargs.get("percent", _kwargs.get("value"))
         if raw is None or _is_na(raw):
             return
@@ -1060,6 +1181,10 @@ class CompileStrategyBroker:
         except (TypeError, ValueError):
             return
         if not math.isfinite(p) or p <= 0:
+            return
+        if _contracts_risk_mode():
+            self.max_position_size_contracts = p
+            self.max_position_size_percent = None
             return
         self.max_position_size_percent = p
 
@@ -1150,19 +1275,13 @@ class CompileStrategyBroker:
     def note_closed_trade_day(self, exit_time: int, profit: float) -> None:
         """Track consecutive calendar-day losses for risk.max_cons_loss_days.
 
-        Day bucket = floor(exit_time / 86_400_000) when time looks like ms,
-        else floor(exit_time / 86_400) for seconds, else bar-time as-is.
+        Day buckets are midnight-to-midnight in ``syminfo.timezone`` (UTC
+        default). Small integers are treated as already-bucketed day ids.
         Mirrors interpret ``StrategyState.note_closed_trade_day``.
         """
-        day = self._day_bucket(int(exit_time))
-        if self._last_trade_day is None or day != self._last_trade_day:
-            if self._last_trade_day is not None:
-                if self._day_pnl < 0:
-                    self.consecutive_loss_days += 1
-                elif self._day_pnl > 0:
-                    self.consecutive_loss_days = 0
-            self._last_trade_day = day
-            self._day_pnl = 0.0
+        self._ensure_calendar_day(int(exit_time))
+        if self._last_trade_day is None:
+            self._last_trade_day = self._day_bucket(int(exit_time))
         self._day_pnl += float(profit)
         if self.max_cons_loss_days is not None and self.consecutive_loss_days >= int(self.max_cons_loss_days):
             self.entries_blocked = True
@@ -1183,8 +1302,10 @@ class CompileStrategyBroker:
         Checks: allow_entry_in, entries_blocked, max_drawdown (abs/%),
         max_cons_loss_days, max_intraday_loss, max_intraday_filled_orders.
         Sets ``entries_blocked`` when a permanent halt limit is hit (further
-        entries comment ``risk_blocked``). Filled-order cap is day-scoped.
+        entries comment ``risk_blocked``). Intraday loss and filled-order cap
+        are day-scoped (resume on the next ``syminfo.timezone`` calendar day).
         """
+        self._ensure_calendar_day(self._bar_time)
         allow = (self.allow_entry_in or "all").lower().replace("strategy.", "")
         if allow in {"long"} and direction != "long":
             return False
@@ -1221,15 +1342,17 @@ class CompileStrategyBroker:
         ):
             self.entries_blocked = True
             return False
-        # Day-scoped fill cap (resets when bar-time day bucket rolls)
+        # Day-scoped fill cap (resets when tz calendar day rolls)
         if self.max_intraday_filled_orders is not None:
-            self._roll_fill_day()
             if self._day_filled_orders >= int(self.max_intraday_filled_orders):
                 return False
         return True
 
     def _cap_qty_by_max_position(self, qty: float, fill_price: float) -> float:
-        """Apply ``max_position_size_percent`` of equity at *fill_price*."""
+        """Apply the position-size cap (percent of equity, or contracts opt-in)."""
+        contracts = self.max_position_size_contracts
+        if contracts is not None and contracts > 0:
+            return min(float(qty), float(contracts))
         pct = self.max_position_size_percent
         if pct is None or pct <= 0 or fill_price <= 0 or fill_price != fill_price:
             return qty
@@ -1323,6 +1446,7 @@ class CompileStrategyBroker:
                 limit_price=_opt_float(limit),
                 stop_price=_opt_float(stop),
                 comment=comment,
+                max_fill_per_bar=float(_kwargs.get("max_fill_per_bar") or 0.0),
                 is_entry=True,
             )
             self._emit(
@@ -1352,7 +1476,7 @@ class CompileStrategyBroker:
     ) -> tuple[float | None, float | None]:
         """Parse trail_* kwargs → (activation_price, offset_price units).
 
-        Distances are in **ticks** (× :attr:`mintick`) per Pine. Prefer
+        Distances are in **ticks** (x :attr:`mintick`) per Pine. Prefer
         ``trail_points`` when it is a positive tick distance (TV: points wins
         over offset when both are set). ``na`` / ``≤0`` is ignored — not
         coerced to 0 — so a valid ``trail_offset`` can still apply.
@@ -1410,29 +1534,6 @@ class CompileStrategyBroker:
             return avg + offset if is_profit else avg - offset
         return avg - offset if is_profit else avg + offset
 
-    def _merge_exit_bracket_prices(
-        self,
-        *,
-        limit_p: float | None,
-        stop_p: float | None,
-        profit_ticks: float | None,
-        loss_ticks: float | None,
-        is_long: bool,
-        from_entry: str | None,
-    ) -> tuple[float | None, float | None]:
-        """``limit``/``stop`` stay absolute; ``profit``/``loss`` fill missing legs.
-
-        Tick offsets are ``ticks * mintick`` from the exit's entry average.
-        When both a tick param and its absolute twin are set, the absolute
-        price wins. First-touch of the resulting limit+stop pair is unchanged.
-        """
-        entry_avg = self._exit_entry_avg(from_entry)
-        if limit_p is None:
-            limit_p = self._tick_offset_price(profit_ticks, entry_avg, is_long=is_long, is_profit=True)
-        if stop_p is None:
-            stop_p = self._tick_offset_price(loss_ticks, entry_avg, is_long=is_long, is_profit=False)
-        return limit_p, stop_p
-
     def close(
         self,
         id: str | None = None,
@@ -1463,7 +1564,7 @@ class CompileStrategyBroker:
         capped to the open target (whole lot or ``from_entry`` size); wins over
         absolute ``qty``.
 
-        Trail (``trail_offset`` / ``trail_points`` ticks × mintick, optional
+        Trail (``trail_offset`` / ``trail_points`` ticks x mintick, optional
         ``trail_price`` activation) places a pending stop that ratchets with
         bar high/low in :meth:`process_pending_orders` (interpret-aligned
         minimal trail).
@@ -2097,10 +2198,8 @@ class CompileStrategyBroker:
         eq = self.equity
         if eq != eq:  # NaN
             return
-        if eq > self._equity_peak:
-            self._equity_peak = eq
-        if eq < self._equity_trough:
-            self._equity_trough = eq
+        self._equity_peak = max(self._equity_peak, eq)
+        self._equity_trough = min(self._equity_trough, eq)
         dd = self._equity_peak - eq
         if dd > self._max_drawdown:
             self._max_drawdown = dd
@@ -2113,34 +2212,8 @@ class CompileStrategyBroker:
                 self._max_runup_percent = 100.0 * ru / abs(self._equity_trough)
 
     def _update_leg_extremes(self) -> None:
-        """Approximate per-open-leg MAE/MFE from bar high/low (currency units).
-
-        Long: favorable at high, adverse at low; short: inverted. Values are
-        max adverse excursion (``max_drawdown``) and max favorable
-        (``max_runup``) observed while the leg is open. Commission is ignored
-        for extremes (cheap OHLC path; not tick-accurate).
-        """
-        if not self.open_legs:
-            return
-        hi = float(self._high)
-        lo = float(self._low)
-        if hi != hi or lo != lo:
-            return
-        for leg in self.open_legs:
-            ep = float(leg.entry_price)
-            sz = float(leg.size)
-            if sz <= 0 or ep != ep:
-                continue
-            if leg.direction == "long":
-                fav = (hi - ep) * sz
-                adv = (ep - lo) * sz
-            else:
-                fav = (ep - lo) * sz
-                adv = (hi - ep) * sz
-            if fav > leg.max_runup:
-                leg.max_runup = float(fav)
-            if adv > leg.max_drawdown:
-                leg.max_drawdown = float(adv)
+        """Approximate per-open-leg MAE/MFE from bar high/low (currency units)."""
+        self.update_open_trade_extremes(self._high, self._low)
 
     @property
     def max_drawdown(self) -> float:

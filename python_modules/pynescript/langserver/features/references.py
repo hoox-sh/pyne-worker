@@ -61,7 +61,7 @@ def handle_references(
     character = position.character
 
     # Get the word at cursor
-    word, word_start, word_end = get_word_at_position(source, line, character)
+    word, _word_start, _word_end = get_word_at_position(source, line, character)
     if not word:
         return []
 
@@ -159,11 +159,7 @@ class ReferencesFinder(NodeVisitor):
         attr = getattr(node, "attr", None)
         if isinstance(value, ast.Name) and isinstance(attr, str):
             dotted = f"{value.id}.{attr}"
-            if (
-                dotted == self.target_name
-                or attr == self.target_name
-                or value.id == self.target_name
-            ):
+            if self.target_name in {dotted, attr, value.id}:
                 self._add_location(dotted, getattr(node, "lineno", None) or 1)
         if value is not None:
             self.visit(value)

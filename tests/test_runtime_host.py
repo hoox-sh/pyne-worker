@@ -209,3 +209,36 @@ plot(x.FOO)
         assert "error" not in r, r.get("error")
         vals = (r.get("series") or {}).get("plot_0") or r.get("plots") or []
         assert vals == [1.5] * 5
+
+
+_RT_SCRIPT = """
+//@version=5
+indicator("rt")
+var int v = 0
+varip int vip = 0
+v := v + 1
+vip := vip + 1
+plot(v, "v")
+plot(vip, "vip")
+"""
+
+
+class TestRealtime:
+    def test_historical_default_accumulates_varip(self) -> None:
+        n = 12
+        r = Runtime(symbol="TEST").run(_RT_SCRIPT, _bars(n), mode="interpret")
+        assert "error" not in r, r.get("error")
+        assert r["series"]["v"][-1] == n
+        assert r["series"]["vip"][-1] == n
+
+    def test_realtime_last_bar_reinit_varip(self) -> None:
+        n = 12
+        r = Runtime(symbol="TEST").run(
+            _RT_SCRIPT,
+            _bars(n),
+            mode="interpret",
+            realtime_last_bar=True,
+        )
+        assert "error" not in r, r.get("error")
+        assert r["series"]["v"][-1] == n
+        assert r["series"]["vip"][-1] == 1
