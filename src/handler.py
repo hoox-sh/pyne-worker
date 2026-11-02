@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from cors import attach_cors
+from cors import cors_headers_for
 from middleware import LogHelper
 from middleware import RateLimiter
 from middleware import extract_bearer_token
@@ -37,8 +39,11 @@ from middleware import validate_api_key
 from pynescript_backend import Runtime
 from scripts_registry import normalize_libraries
 from security import safe_error_message
+from security import sanitize_error_for_response
 from security import sanitize_symbol
 from security import sanitize_timeframe
+from security import to_pine_period
+from security import validate_webhook_url
 from tenant_verify import TENANT_SCOPE
 from tenant_verify import UPGRADE_URL
 from tenant_verify import VerifyResult
@@ -52,7 +57,7 @@ from window import apply_window
 # Limits
 # ---------------------------------------------------------------------------
 
-_WORKER_VERSION = "0.8.0"
+_WORKER_VERSION = "0.9.0"
 _MAX_SCRIPT_LENGTH = 100_000  # characters
 _MAX_BARS = 100_000
 _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -168,6 +173,37 @@ def _parse_optional_int(
     return value, None
 
 
+def _run_error_body(result: dict[str, Any]) -> dict[str, Any]:
+    """Client-facing ``/run`` failure envelope (Pro API 0.6.30 parity).
+
+    Keeps the worker ``error`` string for existing clients and adds
+    ``status`` / ``message`` plus optional Runtime diagnostics.
+    """
+    msg = sanitize_error_for_response(str(result.get("error") or "Script execution failed"))
+    body: dict[str, Any] = {
+        "status": "error",
+        "error": msg,
+        "message": msg,
+    }
+    if result.get("error_kind"):
+        body["error_kind"] = result["error_kind"]
+    if result.get("error_type"):
+        body["error_type"] = sanitize_error_for_response(str(result["error_type"]))
+    if result.get("error_bar") is not None:
+        body["error_bar"] = result["error_bar"]
+    if result.get("error_bar_time") is not None:
+        body["error_bar_time"] = result["error_bar_time"]
+    if result.get("timed_out"):
+        body["timed_out"] = True
+    if "logs" in result:
+        body["logs"] = result["logs"]
+    if "profile" in result:
+        body["profile"] = result["profile"]
+    if isinstance(result.get("meta"), dict):
+        body["meta"] = result["meta"]
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
@@ -236,6 +272,48 @@ async def _record_tenant_usage(
 
 
 async def handle_request(
+    method: str,
+    path: str,
+    body: str | None = None,
+    r2_bucket: Any = None,
+    api_key: str | None = None,
+    expected_api_key: str | None = None,
+    request_id: str | None = None,
+    authorization: str | None = None,
+    console_url: str | None = None,
+    usage_auth: str | None = None,
+    origin: str | None = None,
+    allowed_origin: str | None = None,
+) -> tuple[dict[str, Any], int, dict[str, str]]:
+    """Route a request and attach AXIS CORS headers.
+
+    ``OPTIONS`` is answered here (204, no auth) so browser preflight never
+    hits the API-key gate. Every other response — including 401 — carries
+    ``Access-Control-Allow-Origin`` when *origin* is allowlisted, so AXIS
+    can read errors instead of an opaque CORS failure.
+    """
+    method_u = (method or "GET").upper()
+    if method_u == "OPTIONS":
+        return {}, 204, cors_headers_for(origin, path, extra_allowed=allowed_origin)
+
+    payload, status, headers = await _dispatch_request(
+        method_u,
+        path,
+        body=body,
+        r2_bucket=r2_bucket,
+        api_key=api_key,
+        expected_api_key=expected_api_key,
+        request_id=request_id,
+        authorization=authorization,
+        console_url=console_url,
+        usage_auth=usage_auth,
+    )
+    return payload, status, attach_cors(
+        headers, origin, path, extra_allowed=allowed_origin
+    )
+
+
+async def _dispatch_request(
     method: str,
     path: str,
     body: str | None = None,
@@ -536,6 +614,8 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
                 "cron": True,
                 "alerts": True,
                 "alert_webhooks": True,
+                "alert_last_bar": True,
+                "alert_batch": True,
                 "libraries": True,
                 "inputs": True,
                 "profiler": True,
@@ -543,9 +623,27 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
                 "timeout_seconds": True,
                 "windowing": True,
                 "realtime": True,
+                "chart_timeframe": True,
+                "cors": True,
                 "live_feed": True,
                 "feed_sources": ["bybit", "binance"],
-                "timeframes": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
+                "timeframes": [
+                    "1m",
+                    "3m",
+                    "5m",
+                    "15m",
+                    "30m",
+                    "1h",
+                    "2h",
+                    "4h",
+                    "6h",
+                    "8h",
+                    "12h",
+                    "1d",
+                    "3d",
+                    "1w",
+                    "1M",
+                ],
             },
         }
     )
@@ -580,6 +678,9 @@ async def handle_run(
       - ``realtime_last_bar`` — last bar is forming (``barstate.isrealtime``)
       - ``realtime_ticks`` — re-visits per bar in the realtime window (≥ 1)
       - ``realtime_bars`` / ``realtime_from_bar`` — realtime window extent
+      - ``webhook_url`` — optional L2 alert destination (HTTPS public host)
+      - ``forward_alerts`` / ``alert_last_bar`` / ``alert_batch`` — webhook
+        delivery flags (parsed in ``entry.py``; last-bar is the default)
     """
     data, err = _parse_body(body)
     if err is not None:
@@ -738,6 +839,18 @@ async def handle_run(
             400,
         )
 
+    webhook_raw = data.get("webhook_url")
+    if webhook_raw is not None and webhook_raw != "":
+        if not isinstance(webhook_raw, str) or validate_webhook_url(webhook_raw) is None:
+            return _json_response(
+                {
+                    "error": "webhook_url is invalid or blocked (https public host required)",
+                    "status": "error",
+                    "code": "WEBHOOK_URL_BLOCKED",
+                },
+                400,
+            )
+
     profiler = bool(data.get("profiler"))
     timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
     if "timeout_seconds" in data and data.get("timeout_seconds") is not None:
@@ -773,8 +886,8 @@ async def handle_run(
     if rt_err is not None:
         return rt_err
 
-    # Execute with timeout via Runtime
-    runtime = Runtime(symbol=symbol)
+    # Chart ``timeframe.*`` uses Pine period form (``"1"`` / ``"60"`` / ``"D"``).
+    runtime = Runtime(symbol=symbol, timeframe=to_pine_period(timeframe))
     result = runtime.run(
         script,
         ohlcv,
@@ -790,19 +903,18 @@ async def handle_run(
     )
 
     if "error" in result:
-        status = 504 if "timed out" in result.get("error", "").lower() else 500
-        err_body: dict[str, Any] = {"error": result["error"]}
-        if result.get("error_kind"):
-            err_body["error_kind"] = result["error_kind"]
-        if result.get("error_type"):
-            err_body["error_type"] = result["error_type"]
-        if result.get("error_bar") is not None:
-            err_body["error_bar"] = result["error_bar"]
-        return _json_response(err_body, status)
+        status = 504 if "timed out" in str(result.get("error", "")).lower() else 500
+        return _json_response(_run_error_body(result), status)
 
     if result.get("timed_out"):
         return _json_response(
-            {"error": "Script execution timed out", "error_kind": "runtime"},
+            _run_error_body(
+                {
+                    "error": "Script execution timed out",
+                    "error_kind": "runtime",
+                    "timed_out": True,
+                }
+            ),
             504,
         )
 

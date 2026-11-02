@@ -3,7 +3,7 @@
 > Production **Python Cloudflare® Worker** for the **[PYNE](https://hoox.sh/pyne)** stack —
 > evaluate TradingView® Pine Script™ on the edge with the same bar-loop contract as the Pro API.
 
-**Version:** 0.8.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.6.22)
+**Version:** 0.9.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.6.30)
 
 **Website:** [hoox.sh/pyne](https://hoox.sh/pyne) · **Docs:** [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) · **Repo:** [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker)
 
@@ -110,6 +110,11 @@ Strong real-world Pine coverage via the open PYNE engine — **not** a claim of 
 - **Libraries** — `POST /run` `libraries: [{namespace, name, version, source}]` for `import ns/Name/ver` (AXIS git-publish emulator; pynescript 0.3.7+)
 - **Response windowing** — `from_bar` / `to_bar` trim the envelope to a visible bar range (engine still evaluates every bar; Pro API parity, pynescript 0.6.9+)
 - **Realtime last bar** — `realtime_last_bar` / `realtime_ticks` / `realtime_bars` / `realtime_from_bar` on `POST /run` (pynescript 0.6.14+ `barstate.isrealtime` + `varip` multi-tick)
+- **Chart timeframe** — request `timeframe` (`1m`/`1h`/`1d`/…) is mapped to Pine `timeframe.period` and passed to `Runtime`, so `timeframe.in_seconds()` / `timeframe.isminutes` match the bars
+- **Strategy next-bar fills** — engine 0.6.29+: market orders placed on bar N fill at the open of bar N+1 (same event flow as the Pro API)
+- **Error sanitization** — `/run` failures drop traceback frames and source paths (Pro API 0.6.30 parity); body includes `status`/`message` plus the existing `error` string
+- **L2 webhook flags on `/run`** — `webhook_url` (blocked URLs → 400), `forward_alerts`, `alert_last_bar` (default true), `alert_batch` (default true)
+- **CORS for AXIS** — `OPTIONS` preflight (no auth) + `Access-Control-Allow-Origin` on `/health` and `/run`. Echoes `https://axis.hoox.sh`, `*.hoox.sh`, `*.pynescript.online`, `*.axis.pages.dev` / `*.pynescript-axis.pages.dev`, and localhost. `X-API-Key` is an allowed request header. Extra hosts via `ALLOWED_ORIGIN`.
 - **Drawings / plot_meta / logs** — same evaluate-contract envelope as the Pro API
 - **$0 tier OK** for light use; Paid Workers recommended for heavy 1m cron
 

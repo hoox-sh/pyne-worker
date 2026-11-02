@@ -1,6 +1,6 @@
 # pyne-worker — Agent Instructions
 
-Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package (engine ≥ 0.6.22: libraries, timeout, drawings, windowing, realtime last-bar).
+Python Cloudflare Worker that evaluates Pine Script strategies on the edge using the `pynescript` package (engine ≥ 0.6.30: libraries, timeout, drawings, windowing, realtime last-bar, chart `timeframe.*`, next-bar strategy fills).
 
 ## Stack
 
@@ -58,13 +58,14 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 |---|---|
 | `src/entry.py` | Worker entry (`fetch` + `scheduled` cron) |
 | `src/handler.py` | HTTP routes: `/run`, `/scripts`, `/cron/*`, `/ingest` |
+| `src/cors.py` | AXIS CORS (`pickOrigin` hosts + `X-API-Key` preflight) |
 | `src/window.py` | `/run` response windowing (`from_bar`/`to_bar`, Pro API parity) |
 | `src/scheduler.py` | Bar-close job runner |
 | `src/scripts_registry.py` | Deployed scripts + cron config in R2 |
 | `src/alert_engine.py` | Last-bar alert filter + summary helpers |
 | `src/alert_forwarder.py` | L2 HTTP webhook delivery for alerts |
 | `wrangler.jsonc` | Worker config + cron `* * * * *` |
-| `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars; `libraries` / `timeout_seconds` / `realtime_*`) |
+| `src/pynescript_backend/` | Thin wrap over `pynescript.runtime` (strict bars; `libraries` / `timeout_seconds` / `realtime_*` / `timeframe=`) |
 | `scripts/live_test.py` | Live E2E + latency suite vs deployed worker (`npm run test:live`) |
 | `package.json` | npm shortcuts (`dev`, `deploy`, `test`, `test:live`, `vendor`, `bench`) |
 | `pyproject.toml` | Package config (editable dep on `pynescript`) |
@@ -73,7 +74,9 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 
 - Runtime exports `alerts` on `/run` (pynescript `AlertsMixin`).
 - `POST /run` accepts `libraries: [{namespace, name, version, source}]` (pynescript 0.3.7+) so `import ns/Name/ver` resolves; also stored on deployed scripts for cron.
-- Cron keeps last closed-bar firings only; POSTs to job `webhook_url` or env `ALERT_WEBHOOK_URL`.
+- `POST /run` maps request `timeframe` (`1m`/`1h`/`1d`/…) to Pine `timeframe.period` and passes it to `Runtime` so chart `timeframe.*` matches the bars.
+- `/run` failures return a sanitized `{error, message, status, error_kind}` envelope (tracebacks/paths stripped, pynescript 0.6.30).
+- Cron keeps last closed-bar firings only; POSTs to job `webhook_url` or env `ALERT_WEBHOOK_URL`. `/run` webhooks default to last-bar too (`alert_last_bar: true`); blocked `webhook_url` is HTTP 400.
 - Webhook URLs must be **HTTPS public hosts** (`security.validate_webhook_url`) — private IPs / localhost rejected (including IPv4-mapped/6to4/decimal disguises); re-checked at POST time with redirects disabled (pynescript 0.6.6+ hardening).
 - Product docs: [hoox.sh/pyne/docs/runtime/alerts](https://hoox.sh/pyne/docs/runtime/alerts)
   (source: [hoox-sh/pyne](https://github.com/hoox-sh/pyne) → `docs/pyne/runtime/alerts.mdx`).
@@ -83,5 +86,6 @@ install. After pulling new `pynescript` APIs (e.g. `util/time_parts.py`), always
 | Module | Role |
 |---|---|
 | `src/security.py` | Symbol/timeframe sanitization (R2 path safety), webhook SSRF checks |
+| `src/cors.py` | AXIS CORS (`pickOrigin` product hosts + localhost; `X-API-Key` preflight) |
 | `src/middleware.py` | `validate_api_key` (constant-time), rate limiter |
 | Auth | `API_KEY` secret + `X-API-Key` — **not** mesh `INTERNAL_KEY_BINDING` |

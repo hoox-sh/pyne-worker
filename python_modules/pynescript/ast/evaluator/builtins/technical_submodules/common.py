@@ -93,19 +93,19 @@ class CommonIndicators(TechnicalHelpers):
 
     # -- Extremes functions -------------------------------------------------
 
-    def _builtin_ta_highestbars(self, args: list[Any]) -> int:
+    def _builtin_ta_highestbars(self, args: list[Any]) -> int | None:
         """Offset to the highest value over length bars."""
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
-        if self._use_incremental_ta():
+        if self._use_incremental_ta() and (not isinstance(series, list) or len(series) < period):
             return self._highestbars_inc_update(series, period)
         if self._bar_mode() and len(series) < period:
             return self._highestbars_inc_update(series, period)
         return self._highestbars(series, period)
 
-    def _builtin_ta_lowestbars(self, args: list[Any]) -> int:
+    def _builtin_ta_lowestbars(self, args: list[Any]) -> int | None:
         """Offset to the lowest value over length bars."""
         series, period = self._expect_series(args, length=BINARY, last_sample_ok=True)
-        if self._use_incremental_ta():
+        if self._use_incremental_ta() and (not isinstance(series, list) or len(series) < period):
             return self._lowestbars_inc_update(series, period)
         if self._bar_mode() and len(series) < period:
             return self._lowestbars_inc_update(series, period)
@@ -415,7 +415,7 @@ class CommonIndicators(TechnicalHelpers):
         return self._vwap(sequence)
 
     def _builtin_ta_barssince(self, args: list[Any]) -> int | None:
-        """Bars since condition was last true."""
+        """Bars since condition was last true (``na`` if it was never true)."""
         self._require_len(args, 1, "ta.barssince() takes exactly one argument")
         condition = args[0]
         if self._use_incremental_ta():
@@ -426,12 +426,12 @@ class CommonIndicators(TechnicalHelpers):
                 is_true = condition[i] is True or (condition[i] is not None and condition[i] is not False)
                 if is_true:
                     return len(condition) - 1 - i
-            return len(condition) - 1
-        # If condition is boolean without bar-mode state, return 0 if true, 1 if false
+            return None
+        # Scalar without bar-mode state: true → 0, false/na → na (never true).
         is_true = condition is True or (condition is not None and condition is not False)
         if is_true:
             return 0
-        return 1
+        return None
 
     # -- Phase 7 Missing Indicators -----------------------------------------
 
@@ -891,7 +891,7 @@ class CommonIndicators(TechnicalHelpers):
         return (count_below / len(valid_values)) * 100
 
     def _variance(self, series: list[float], period: int) -> float | None:
-        """Sample variance (strict window; mirror BasicIndicators)."""
+        """Population variance (strict window; mirror BasicIndicators)."""
         if period <= 1 or len(series) < period:
             return None
         window = series[-period:]
@@ -906,7 +906,7 @@ class CommonIndicators(TechnicalHelpers):
             if fv != fv:  # NaN
                 return None
             vals.append(fv)
-        return statistics.variance(vals)
+        return statistics.pvariance(vals)
 
     def _vwap(self, hlc3_volume: list[float]) -> float:
         if not hlc3_volume:

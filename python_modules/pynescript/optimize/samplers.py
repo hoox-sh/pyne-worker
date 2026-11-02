@@ -162,17 +162,41 @@ class GridSampler(BaseSampler):
         return dict(pts[rng.randrange(len(pts))])
 
 
+def _guide_score(trial: TrialResult) -> float | None:
+    """Score TPE splits on. Out-of-sample when the trial has one.
+
+    Holdout and walk-forward already store ``oos_score``. Splitting on
+    ``is_score`` walks the next suggestions into the training peak.
+    """
+    if trial.error is not None:
+        return None
+    raw = trial.oos_score if trial.oos_score is not None else trial.is_score
+    if raw is None:
+        return None
+    score = float(raw)
+    if math.isnan(score):
+        return None
+    return score
+
+
+def _rank_key(trial: TrialResult) -> float:
+    score = _guide_score(trial)
+    # ``0.0`` is a real score. Only a missing guide falls through.
+    return float("-inf") if score is None else score
+
+
 def _finished(history: Sequence[TrialResult]) -> list[TrialResult]:
-    return [t for t in history if t.error is None and t.is_score is not None]
+    return [t for t in history if _guide_score(t) is not None]
 
 
 class TPESampler(BaseSampler):
     """Tree-structured Parzen Estimator (Bergstra et al.).
 
     After ``n_startup`` random trials, split completed scores at quantile
-    ``gamma`` into good/bad. Continuous axes use a 1-D Gaussian KDE;
-    categorical/bool use smoothed counts. Candidates are drawn from the
-    good density and ranked by ``l(x) / g(x)``.
+    ``gamma`` into good/bad. The split uses ``oos_score`` when the trial
+    has one, otherwise ``is_score``. Continuous axes use a 1-D Gaussian
+    KDE; categorical/bool use smoothed counts. Candidates are drawn from
+    the good density and ranked by ``l(x) / g(x)``.
     """
 
     name = "tpe"
@@ -198,7 +222,7 @@ class TPESampler(BaseSampler):
         done = _finished(history)
         if len(done) < max(2, self.n_startup):
             return self._random.suggest(space, history, rng)
-        ranked = sorted(done, key=lambda t: float(t.is_score), reverse=True)
+        ranked = sorted(done, key=_rank_key, reverse=True)
         n_good = max(1, math.ceil(self.gamma * len(ranked)))
         good = ranked[:n_good]
         bad = ranked[n_good:] or ranked[-1:]

@@ -5,7 +5,9 @@
 
 Covers:
 - R2 path segment sanitization (symbol / timeframe) — path traversal defense
+- Exchange interval → Pine ``timeframe.period`` mapping for Runtime
 - Webhook URL validation — SSRF defense for alert delivery
+- Client-facing engine error sanitization (Pro API 0.6.30 parity)
 """
 
 from __future__ import annotations
@@ -53,6 +55,36 @@ _BLOCKED_HOSTS = frozenset(
 
 _MAX_WEBHOOK_URL_LEN = 2048
 
+# Exchange / Binance-style interval → Pine ``timeframe.period``. Passing the
+# raw worker string ``"1m"`` through Runtime would upper-case to ``"1M"``
+# (monthly). Chart ``timeframe.*`` needs the Pine form.
+_EXCHANGE_TO_PINE_PERIOD: dict[str, str] = {
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "2h": "120",
+    "4h": "240",
+    "6h": "360",
+    "8h": "480",
+    "12h": "720",
+    "1d": "D",
+    "3d": "3D",
+    "1w": "W",
+    "1M": "M",
+}
+
+_INTERNAL_PATH_RE = re.compile(r'(?:File ")?[\\/](?:[\w.-]+[\\/])*[\w.-]+\.py(?:", line \d+)?')
+_MAX_ERROR_MSG_LEN = 500
+_TRACE_PREFIXES = (
+    "Traceback ",
+    "File ",
+    "During handling of",
+    "The above exception",
+)
+
 
 def sanitize_symbol(symbol: str | None) -> str | None:
     """Normalize and validate a trading symbol for R2 keys / feed URLs.
@@ -80,6 +112,39 @@ def sanitize_timeframe(timeframe: str | None) -> str | None:
     if tf not in _VALID_TIMEFRAMES:
         return None
     return tf
+
+
+def to_pine_period(timeframe: str | None) -> str | None:
+    """Map an exchange interval (``1m``, ``4h``, ``1d``) to Pine ``timeframe.period``.
+
+    Runtime constructor ``timeframe=`` expects ``"15"``, ``"60"``, ``"D"``,
+    ``"W"``, ``"M"``, ``"30S"``. ``None`` keeps the engine's daily default.
+
+    Already-Pine forms (numeric minutes, ``D``/``W``/``M``, ``30S``) pass
+    through. Unknown strings return ``None`` so a garbage interval cannot
+    become monthly via ``"1m".upper() == "1M"``.
+    """
+    if not timeframe or not isinstance(timeframe, str):
+        return None
+    tf = timeframe.strip()
+    if not tf:
+        return None
+    mapped = _EXCHANGE_TO_PINE_PERIOD.get(tf)
+    if mapped is not None:
+        return mapped
+    if tf.isdigit():
+        return tf
+    u = tf.upper()
+    aliases = {"1D": "D", "1W": "W", "1M": "M"}
+    if u in aliases:
+        return aliases[u]
+    if u in {"D", "W", "M", "3D"}:
+        return u
+    if len(tf) >= 2 and tf[:-1].isdigit() and tf[-1] in "SsHhDdWw":
+        return tf
+    if len(tf) >= 3 and tf[:-2].isdigit() and tf[-2:].upper() == "MO":
+        return tf
+    return None
 
 
 def _parse_literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -211,3 +276,28 @@ def safe_error_message(exc: BaseException, *, prefix: str = "error") -> str:
     if detail == et:
         return f"{prefix}: {et}"
     return f"{prefix}: {et}: {detail}"
+
+
+def sanitize_error_for_response(msg: str) -> str:
+    """One-line client error: drop traceback frames and source paths.
+
+    Mirrors Flask Pro API ``_sanitize_error_for_response`` (pynescript 0.6.30)
+    so ``/run`` failures never leak isolate paths. Also redacts secret-looking
+    ``key=value`` fragments.
+    """
+    last = ""
+    for line in str(msg).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(_TRACE_PREFIXES) or _INTERNAL_PATH_RE.search(s):
+            continue
+        last = s
+    last = re.sub(
+        r"(?i)(api[_-]?key|authorization|bearer|secret|password)\s*[:=]\s*\S+",
+        r"\1=[redacted]",
+        last,
+    )
+    if len(last) > _MAX_ERROR_MSG_LEN:
+        last = last[:_MAX_ERROR_MSG_LEN] + "..."
+    return last or "An error occurred"

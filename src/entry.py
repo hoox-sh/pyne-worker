@@ -43,6 +43,7 @@ from urllib.parse import urlparse
 from workers import Response
 from workers import WorkerEntrypoint
 
+from cors import attach_cors
 from handler import handle_request
 from middleware import LogHelper
 from trade_forwarder import forward_events
@@ -98,6 +99,9 @@ class Default(WorkerEntrypoint):
     - ``USAGE_SERVICE_KEY`` (secret, optional) — Service Bearer for
     -   ``POST /api/v1/usage``. Falls back to the per-request tenant key
     -   hash (still hash-on-wire) when unset.
+    - ``ALLOWED_ORIGIN`` (var, optional) — extra CORS origins, comma-separated.
+    -   Product hosts and localhost are always echoed; ``GET /health`` reflects
+    -   any http(s) Origin (AXIS Settings probe).
     """
 
     TRADE_SERVICE: object  # service binding, set by the runtime
@@ -110,6 +114,7 @@ class Default(WorkerEntrypoint):
     DEFAULT_EXCHANGE: str | None = None  # optional default exchange
     CONSOLE_URL: str | None = None  # tenant verify + usage base URL (None → passthrough)
     USAGE_SERVICE_KEY: str | None = None  # optional service Bearer for POST /api/v1/usage
+    ALLOWED_ORIGIN: str | None = None  # extra CORS allowlist (comma-separated)
 
     async def fetch(self, request):
         start = time.time()
@@ -120,6 +125,8 @@ class Default(WorkerEntrypoint):
         # Read optional auth headers (legacy X-API-Key + tenant Bearer passthrough)
         api_key = request.headers.get("X-API-Key", None)
         authorization = request.headers.get("Authorization", None)
+        origin = request.headers.get("Origin", None)
+        allowed_origin = getattr(self.env, "ALLOWED_ORIGIN", None)
 
         # Read body for POST (hard cap before full pipeline — fail closed on size)
         body = None
@@ -127,13 +134,19 @@ class Default(WorkerEntrypoint):
             raw = await request.text()
             # 5 MB hard limit (matches handler._MAX_PAYLOAD_BYTES)
             if len(raw) > 5 * 1024 * 1024:
-                return Response(
-                    json.dumps({"error": "Request body too large"}),
-                    status=413,
-                    headers={
+                cap_headers = attach_cors(
+                    {
                         "Content-Type": "application/json",
                         "X-Request-ID": request_id,
                     },
+                    origin,
+                    path,
+                    extra_allowed=allowed_origin,
+                )
+                return Response(
+                    json.dumps({"error": "Request body too large"}),
+                    status=413,
+                    headers=cap_headers,
                 )
             if raw.strip():
                 body = raw
@@ -149,6 +162,8 @@ class Default(WorkerEntrypoint):
             authorization=authorization,
             console_url=getattr(self.env, "CONSOLE_URL", None),
             usage_auth=getattr(self.env, "USAGE_SERVICE_KEY", None),
+            origin=origin,
+            allowed_origin=allowed_origin,
         )
 
         # -- Forward strategy events to trade-worker ----------------------
@@ -156,6 +171,8 @@ class Default(WorkerEntrypoint):
         # Allow client to opt out of forwarding with "forward_events": false
         _forward_flag: bool = True
         _forward_alerts: bool = True
+        _alert_last_bar: bool = True
+        _alert_batch: bool = True
         _req_webhook: str | None = None
         _req_exchange: str | None = None
         if body:
@@ -164,6 +181,8 @@ class Default(WorkerEntrypoint):
                 if isinstance(_parsed, dict):
                     _forward_flag = _parsed.get("forward_events", True)
                     _forward_alerts = bool(_parsed.get("forward_alerts", True))
+                    _alert_last_bar = bool(_parsed.get("alert_last_bar", True))
+                    _alert_batch = bool(_parsed.get("alert_batch", True))
                     wh = _parsed.get("webhook_url")
                     if isinstance(wh, str) and wh.strip():
                         from security import validate_webhook_url
@@ -194,9 +213,26 @@ class Default(WorkerEntrypoint):
         # -- Alert webhooks (L2): /run, /cron/run payloads with alerts -----
         if _forward_alerts:
             try:
+                from alert_engine import filter_alerts_for_bar
                 from alert_forwarder import forward_alert_groups
 
                 alerts_payload = payload.get("alerts") or []
+                if _alert_last_bar and alerts_payload:
+                    last_time = None
+                    times = payload.get("times")
+                    if isinstance(times, list) and times:
+                        try:
+                            last_time = int(times[-1])
+                        except (TypeError, ValueError, IndexError):
+                            last_time = None
+                    last_index = None
+                    if last_time is None:
+                        n = payload.get("count") or payload.get("bars")
+                        if isinstance(n, int) and n > 0:
+                            last_index = n - 1
+                    alerts_payload = filter_alerts_for_bar(
+                        alerts_payload, last_time, bar_index=last_index
+                    )
                 default_wh = _req_webhook or getattr(self.env, "ALERT_WEBHOOK_URL", None)
                 if alerts_payload and (default_wh or any(
                     isinstance(a, dict) and a.get("webhook_url") for a in alerts_payload
@@ -204,6 +240,7 @@ class Default(WorkerEntrypoint):
                     alert_fwd = await forward_alert_groups(
                         alerts_payload,
                         default_url=str(default_wh).strip() if default_wh else None,
+                        batch=_alert_batch,
                     )
                     if alert_fwd.get("destinations"):
                         payload["alert_forward"] = alert_fwd
@@ -238,13 +275,16 @@ class Default(WorkerEntrypoint):
         print(json.dumps(log))
 
         # -- Build response -----------------------------------------------
-        headers = {"Content-Type": "application/json"}
+        headers: dict[str, str] = {}
+        if status != 204:
+            headers["Content-Type"] = "application/json"
         headers.update(extra_headers)
         if request_id:
             headers["X-Request-ID"] = request_id
 
+        body_out = "" if status == 204 else json.dumps(payload)
         return Response(
-            json.dumps(payload),
+            body_out,
             status=status,
             headers=headers,
         )

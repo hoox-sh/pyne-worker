@@ -159,11 +159,39 @@ class BasicIndicators(TechnicalHelpers):
         # Align volume length
         if len(volume) < len(source):
             volume = volume + [0.0] * (len(source) - len(volume))
-        # Cumulative VWAP over available history
+        # Default anchor is the daily session (reference Pine): reset the
+        # cumulative window when the bar's UTC day changes. Explicit anchor
+        # args (>= 2) are handled by the caller. HTF / direct list inputs
+        # have no bar clock and stay cumulative.
+        times: list[Any] | None = None
+        if self._bar_mode() and len(args) < 2:
+            series_map = getattr(self, "current_series", None) or {}
+            tsrc = series_map.get("time")
+            if tsrc is None:
+                ctx = getattr(self, "context", None)
+                tsrc = ctx.get("time") if isinstance(ctx, dict) else None
+            if tsrc is not None:
+                if isinstance(tsrc, list):
+                    times = tsrc
+                else:
+                    hist = getattr(tsrc, "history", None)
+                    if hist:
+                        times = list(reversed(hist))
         cum_pv = 0.0
         cum_v = 0.0
         last = None
+        last_day: float | None = None
         for i, raw_price in enumerate(source):
+            if times is not None and i < len(times) and times[i] is not None:
+                try:
+                    day = float(times[i]) // 86_400_000.0
+                except (TypeError, ValueError):
+                    day = None
+                if day is not None:
+                    if last_day is not None and day != last_day:
+                        cum_pv = 0.0
+                        cum_v = 0.0
+                    last_day = day
             if raw_price is None:
                 continue
             v = volume[i] if i < len(volume) and volume[i] is not None else 0.0
@@ -256,7 +284,7 @@ class BasicIndicators(TechnicalHelpers):
             return self._lowest_inc_update(series, period)
         return self._lowest(series, period)
 
-    def _builtin_ta_highestbars(self, args: list[Any]) -> int:
+    def _builtin_ta_highestbars(self, args: list[Any]) -> int | None:
         """Offset to highest value."""
         if self._use_incremental_ta():
             if len(args) == 1 and self._is_period_like(args[0]):
@@ -275,7 +303,7 @@ class BasicIndicators(TechnicalHelpers):
             return self._highestbars_inc_update(series, period)
         return self._highestbars(series, period)
 
-    def _builtin_ta_lowestbars(self, args: list[Any]) -> int:
+    def _builtin_ta_lowestbars(self, args: list[Any]) -> int | None:
         """Offset to lowest value."""
         if self._use_incremental_ta():
             if len(args) == 1 and self._is_period_like(args[0]):
@@ -337,18 +365,21 @@ class BasicIndicators(TechnicalHelpers):
         from context). Also accepts the legacy 3-arg form for unit tests.
         """
         if len(args) <= UNARY:
-            # Optional boolean handle_na is ignored for computation; na bars
-            # already yield None via _tr internals.
+            raw_handle = args[0] if len(args) == UNARY else False
+            if hasattr(raw_handle, "current") and hasattr(raw_handle, "history"):
+                raw_handle = raw_handle.current
+            handle_na = bool(raw_handle)
             if self._use_incremental_ta():
                 return self._tr_inc_update(
                     self._context_source("high"),
                     self._context_source("low"),
                     self._context_source("close"),
+                    handle_na,
                 )
             highs = self._context_series("high")
             lows = self._context_series("low")
             closes = self._context_series("close")
-            return self._finalize_series(self._tr(highs, lows, closes))
+            return self._finalize_series(self._tr(highs, lows, closes, handle_na))
         msg = "ta.tr expects high, low, and close (or 0-1 handle_na args)"
         self._require_len(args, TERNARY, msg)
         if self._use_incremental_ta():
@@ -1010,7 +1041,7 @@ class BasicIndicators(TechnicalHelpers):
         return self._variance(series, period)
 
     def _builtin_ta_barssince(self, args: list[Any]) -> int | None:
-        """Bars since condition was last true."""
+        """Bars since condition was last true (``na`` if it was never true)."""
         self._require_len(args, 1, "ta.barssince() takes exactly one argument")
         condition = args[0]
         if self._use_incremental_ta():
@@ -1021,12 +1052,12 @@ class BasicIndicators(TechnicalHelpers):
                 is_true = condition[i] is True or (condition[i] is not None and condition[i] is not False)
                 if is_true:
                     return len(condition) - 1 - i
-            return len(condition) - 1
-        # If condition is boolean without bar-mode state, return 0 if true, 1 if false
+            return None
+        # Scalar without bar-mode state: true → 0, false/na → na (never true).
         is_true = condition is True or (condition is not None and condition is not False)
         if is_true:
             return 0
-        return 1
+        return None
 
     @staticmethod
     def _pivot_scalar(value: Any) -> float | None:
@@ -1307,21 +1338,33 @@ class BasicIndicators(TechnicalHelpers):
             return valid_values[0] if valid_values else None
 
     def _percentrank(self, series: list[float], period: int) -> float | None:
-        """Percentile rank of current value in period."""
-        if len(series) < period:
+        """Percentile rank of the current value among the previous ``period`` bars.
+
+        Reference Pine starts at bar ``period`` and excludes the current bar
+        from the ranking window (verified against the TV golden export).
+        """
+        if period <= 0 or len(series) <= period:
             return None
-        window = series[-period:]
-        valid_values = sorted([v for v in window if v is not None])
-        if not valid_values or len(valid_values) < 2:
-            return 50.0
+        window = series[-period - 1 : -1]
         current = series[-1]
         if current is None:
             return None
-        count_below = sum(1 for v in valid_values if v < current)
-        return (count_below / len(valid_values)) * 100
+        vals: list[float] = []
+        for v in window:
+            if v is None:
+                return None
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                return None
+            if fv != fv:
+                return None
+            vals.append(fv)
+        count_below = sum(1 for v in vals if v <= float(current))
+        return (count_below / period) * 100.0
 
     def _variance(self, series: list[float], period: int) -> float | None:
-        """Sample variance over a period (strict window, match compile/reference Pine)."""
+        """Population variance over a period (strict window, reference Pine)."""
         if period <= 1 or len(series) < period:
             return None
         window = series[-period:]
@@ -1336,4 +1379,4 @@ class BasicIndicators(TechnicalHelpers):
             if fv != fv:  # NaN
                 return None
             vals.append(fv)
-        return statistics.variance(vals)
+        return statistics.pvariance(vals)

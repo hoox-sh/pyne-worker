@@ -50,6 +50,11 @@
   //     (optional; falls back to the per-request tenant key hash)
   // Optional vars:
   //   DEFAULT_EXCHANGE — default trade exchange id (default: binance)
+  //   ALLOWED_ORIGIN — extra CORS origins, comma-separated. Product hosts
+  //     (*.hoox.sh, *.pynescript.online, *.axis.pages.dev) and localhost
+  //     are always echoed; GET /health reflects any http(s) Origin.
+  //   PYNE_STRATEGY_RISK_CONTRACTS=1 — `strategy.risk.max_position_size` as
+  //     absolute contracts (reference Pine). Default is %-of-equity.
   "services": [
     {
       "binding": "TRADE_SERVICE",

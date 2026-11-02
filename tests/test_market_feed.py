@@ -8,6 +8,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from market_feed import _BINANCE_INTERVAL
+from market_feed import _BYBIT_INTERVAL
+from market_feed import _TF_MS
 from market_feed import only_closed_bars
 from market_feed import refresh_pair_to_r2
 from market_feed import refresh_pairs_for_jobs
@@ -76,6 +79,18 @@ class TestOnlyClosedBars:
         # after second candle fully closed
         closed2 = only_closed_bars(bars, "1m", now_ms=t0 + 120_000)
         assert len(closed2) == 2
+
+
+class TestTimeframeMaps:
+    def test_sanitizer_intervals_have_ms(self) -> None:
+        for tf in ("1m", "8h", "3d", "1w", "1M"):
+            assert tf in _TF_MS, tf
+
+    def test_8h_and_3d_fall_back_to_binance(self) -> None:
+        assert "8h" not in _BYBIT_INTERVAL
+        assert _BINANCE_INTERVAL["8h"] == "8h"
+        assert _BINANCE_INTERVAL["3d"] == "3d"
+        assert _BYBIT_INTERVAL["1M"] == "M"
 
 
 class TestMarketRefresh:

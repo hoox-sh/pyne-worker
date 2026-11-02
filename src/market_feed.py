@@ -34,12 +34,15 @@ _TF_MS: dict[str, int] = {
     "2h": 7_200_000,
     "4h": 14_400_000,
     "6h": 21_600_000,
+    "8h": 28_800_000,
     "12h": 43_200_000,
     "1d": 86_400_000,
+    "3d": 259_200_000,
     "1w": 604_800_000,
+    "1M": 2_592_000_000,  # 30d; used only to drop a still-forming candle
 }
 
-# Pine TF → Bybit interval string
+# Pine TF → Bybit interval string (v5 kline: 1,3,5,15,30,60,120,240,360,720,D,W,M)
 _BYBIT_INTERVAL: dict[str, str] = {
     "1m": "1",
     "3m": "3",
@@ -53,6 +56,7 @@ _BYBIT_INTERVAL: dict[str, str] = {
     "12h": "720",
     "1d": "D",
     "1w": "W",
+    "1M": "M",
 }
 
 # Pine TF → Binance interval (fallback; often blocked on CF)
@@ -66,9 +70,12 @@ _BINANCE_INTERVAL: dict[str, str] = {
     "2h": "2h",
     "4h": "4h",
     "6h": "6h",
+    "8h": "8h",
     "12h": "12h",
     "1d": "1d",
+    "3d": "3d",
     "1w": "1w",
+    "1M": "1M",
 }
 
 HttpGetJson = Callable[[str], Awaitable[Any]]

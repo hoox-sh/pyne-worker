@@ -156,19 +156,19 @@ if bar_index == 2
     # -- No runtime error -------------------------------------------------
     assert "error" not in result, f"Unexpected error: {result['error']}"
 
-    # -- Events are present and well-typed --------------------------------
+    # -- Events are present and well-typed (0.6.29 next-bar-fill flow) ----
     events: list[dict] = result["events"]
     assert len(events) >= 3, f"Expected at least 3 events, got {len(events)}"
+    kinds = [e["kind"] for e in events]
+    assert "order" in kinds, f"Unexpected kinds: {kinds}"
+    assert "entry" in kinds, f"Unexpected kinds: {kinds}"
+    assert "close" in kinds, f"Unexpected kinds: {kinds}"
 
-    kinds = [e["kind"] for e in events[:3]]
-    assert kinds == ["entry", "exit", "close"], f"Unexpected kinds: {kinds}"
-
-    # -- bar_index is threaded from context -------------------------------
-    assert events[0]["bar_index"] == 0
-    assert events[1]["bar_index"] == 1
-    assert events[2]["bar_index"] == 2
+    # Market entry placed on bar 0 fills at the open of bar 1.
+    entry = next(e for e in events if e["kind"] == "entry")
+    assert entry["bar_index"] == 1
 
     # -- script_id and run_id are present ---------------------------------
-    for ev in events[:3]:
+    for ev in events:
         assert ev.get("script_id"), f"Missing script_id in {ev['kind']}"
         assert ev.get("run_id"), f"Missing run_id in {ev['kind']}"

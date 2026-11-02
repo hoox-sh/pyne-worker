@@ -14,8 +14,10 @@ from data_provider import _ohlcv_key
 from data_provider import ingest_ohlcv_to_r2
 from handler import handle_request
 from middleware import validate_api_key
+from security import sanitize_error_for_response
 from security import sanitize_symbol
 from security import sanitize_timeframe
+from security import to_pine_period
 from security import validate_webhook_url
 
 
@@ -45,6 +47,26 @@ class TestSanitizeTimeframe:
         assert sanitize_timeframe("../1m") is None
         assert sanitize_timeframe("1min") is None
         assert sanitize_timeframe("") is None
+
+
+class TestToPinePeriod:
+    def test_minutes_do_not_become_monthly(self) -> None:
+        assert to_pine_period("1m") == "1"
+        assert to_pine_period("1M") == "M"
+
+    def test_hours_and_days(self) -> None:
+        assert to_pine_period("1h") == "60"
+        assert to_pine_period("1d") == "D"
+
+
+class TestSanitizeErrorForResponse:
+    def test_keeps_last_non_trace_line(self) -> None:
+        assert (
+            sanitize_error_for_response(
+                "Traceback (most recent call last):\nFile \"/tmp/x.py\", line 1\nboom"
+            )
+            == "boom"
+        )
 
 
 class TestOhlcvKey:

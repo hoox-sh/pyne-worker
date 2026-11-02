@@ -39,7 +39,10 @@ import lsprotocol.types as lsp
 
 from pynescript.ast import helper as ast_helper
 from pynescript.ast import node as ast
+from pynescript.langserver.analysis import SymbolIndex
+from pynescript.langserver.analysis import ensure_symbol_index
 from pynescript.langserver.config import semantic_token_types
+from pynescript.langserver.protocol.utils import codepoint_column_to_utf16
 
 
 # Indices into semantic_token_types()
@@ -86,6 +89,8 @@ def handle_semantic_tokens(
     _params: lsp.SemanticTokensParams,
     source: str | None,
     tree: Any | None = ...,
+    *,
+    analysis: SymbolIndex | None = None,
 ) -> lsp.SemanticTokens | None:
     """Return full-document semantic tokens for *source*.
 
@@ -95,18 +100,21 @@ def handle_semantic_tokens(
         tree: Pre-parsed AST from the workspace cache. Pass ``None`` when the
             workspace already failed to parse (skips a redundant re-parse).
             Omit (default ``...``) to parse from *source*.
+        analysis: Pre-built symbol index for *tree* (user references/params).
 
     Returns:
         :class:`~lsprotocol.types.SemanticTokens` with encoded ``data``
         (empty list if source missing or parse fails).
     """
-    return lsp.SemanticTokens(data=_encode(_collect_tokens(source, tree)))
+    return lsp.SemanticTokens(data=_encode(_to_utf16(_collect_tokens(source, tree, analysis), source)))
 
 
 def handle_semantic_tokens_range(
     params: lsp.SemanticTokensRangeParams,
     source: str | None,
     tree: Any | None = ...,
+    *,
+    analysis: SymbolIndex | None = None,
 ) -> lsp.SemanticTokens | None:
     """Return semantic tokens whose start falls inside *params.range*.
 
@@ -119,19 +127,21 @@ def handle_semantic_tokens_range(
         tree: Pre-parsed AST from the workspace cache. Pass ``None`` when the
             workspace already failed to parse (skips a redundant re-parse).
             Omit (default ``...``) to parse from *source*.
+        analysis: Pre-built symbol index for *tree*.
 
     Returns:
         :class:`~lsprotocol.types.SemanticTokens` with encoded ``data``
         (empty list if source missing, parse fails, or no tokens in range).
     """
-    raw = _collect_tokens(source, tree)
+    raw = _collect_tokens(source, tree, analysis)
     clipped = [t for t in raw if _start_in_range(t[0], t[1], params.range)]
-    return lsp.SemanticTokens(data=_encode(clipped))
+    return lsp.SemanticTokens(data=_encode(_to_utf16(clipped, source)))
 
 
 def _collect_tokens(
     source: str | None,
     tree: Any | None,
+    analysis: SymbolIndex | None = None,
 ) -> list[tuple[int, int, int, int, int]]:
     if tree is ...:
         if not source:
@@ -144,9 +154,80 @@ def _collect_tokens(
         return []
 
     raw: list[tuple[int, int, int, int, int]] = []
-    _collect(tree, raw)
-    raw.sort(key=lambda t: (t[0], t[1]))
-    return raw
+    index = ensure_symbol_index(source, tree, analysis)
+    if index is not None:
+        _collect_from_index(index, raw)
+        # Builtin namespace/member tokens are not user symbols; keep the AST
+        # attribute pass for those.
+        _collect_builtin_attrs(tree, raw)
+    else:
+        _collect(tree, raw)
+    raw.sort(key=lambda t: (t[0], t[1], -t[4]))
+    return _dedupe(raw)
+
+
+def _dedupe(
+    tokens: list[tuple[int, int, int, int, int]],
+) -> list[tuple[int, int, int, int, int]]:
+    """Drop duplicate ranges; keep the declaration-richest token."""
+    seen: dict[tuple[int, int, int], tuple[int, int, int, int, int]] = {}
+    for token in tokens:
+        key = (token[0], token[1], token[2])
+        existing = seen.get(key)
+        if existing is None or token[4] > existing[4]:
+            seen[key] = token
+    return sorted(seen.values(), key=lambda t: (t[0], t[1]))
+
+
+def _collect_from_index(index: SymbolIndex, out: list[tuple[int, int, int, int, int]]) -> None:
+    """Emit declaration/reference tokens from the static symbol index."""
+    for occurrence in index.occurrences:
+        symbol = occurrence.symbol
+        if symbol is None:
+            continue
+        token_type = _TOKEN_TYPE_BY_KIND.get(symbol.kind)
+        if token_type is None:
+            continue
+        mods = 0
+        is_declaration = occurrence.write and occurrence.node is symbol.name_node
+        if is_declaration:
+            mods |= _MOD_DECLARATION
+            if symbol.kind in {"function", "method", "type", "enum"}:
+                mods |= _MOD_DEFINITION
+        out.append(
+            (
+                occurrence.line,
+                occurrence.column,
+                max(1, occurrence.end_column - occurrence.column),
+                _TT[token_type],
+                mods,
+            )
+        )
+
+
+_TOKEN_TYPE_BY_KIND: dict[str, str] = {
+    "variable": "variable",
+    "function": "function",
+    "method": "method",
+    "type": "class",
+    "enum": "type",
+    "enum_member": "property",
+    "field": "property",
+    "param": "parameter",
+    "import": "namespace",
+}
+
+
+def _collect_builtin_attrs(tree: Any, out: list[tuple[int, int, int, int, int]]) -> None:
+    """Emit namespace/method tokens for builtin ``ta.sma``-style attributes."""
+    for node in ast_helper.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        value = getattr(node, "value", None)
+        attr = getattr(node, "attr", None)
+        if isinstance(value, ast.Name) and value.id in _BUILTIN_NS and isinstance(attr, str):
+            _emit_name(value, value.id, _TT["namespace"], _MOD_DEFAULT_LIBRARY | _MOD_READONLY, out)
+            _emit_attr(node, attr, _TT["method"], _MOD_DEFAULT_LIBRARY, out)
 
 
 def _start_in_range(line: int, col: int, rng: lsp.Range) -> bool:
@@ -238,6 +319,28 @@ def _emit_attr(
     else:
         col = max(0, int(getattr(node, "col_offset", 0) or 0))
     out.append((line, col, len(attr), token_type, mods))
+
+
+def _to_utf16(
+    tokens: list[tuple[int, int, int, int, int]],
+    source: str | None,
+) -> list[tuple[int, int, int, int, int]]:
+    """Convert token columns/lengths from code points to UTF-16 units."""
+    if not source or not tokens:
+        return tokens
+    lines = source.split("\n")
+    converted: list[tuple[int, int, int, int, int]] = []
+    for line, column, length, token_type, modifiers in tokens:
+        if not (0 <= line < len(lines)):
+            converted.append((line, column, length, token_type, modifiers))
+            continue
+        text = lines[line]
+        if text.endswith("\r"):
+            text = text[:-1]
+        start = codepoint_column_to_utf16(text, column)
+        end = codepoint_column_to_utf16(text, column + length)
+        converted.append((line, start, max(0, end - start), token_type, modifiers))
+    return converted
 
 
 def _encode(tokens: list[tuple[int, int, int, int, int]]) -> list[int]:

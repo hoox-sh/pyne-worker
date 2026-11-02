@@ -14,6 +14,7 @@ and edge share one circuit breaker. ``libraries`` is forwarded to the package
 host (AXIS ``import ns/Name/ver``). ``realtime_*`` kwargs match
 :meth:`pynescript.runtime.host.Runtime.run` (0.6.14+): last-bar
 ``barstate.isrealtime``, multi-tick ``varip``, and a realtime window.
+``Runtime(timeframe=)`` drives chart ``timeframe.*`` (Pine period form).
 """
 
 from __future__ import annotations

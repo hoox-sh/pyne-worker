@@ -34,7 +34,11 @@ from typing import Any
 from lsprotocol import types as lsp
 
 from pynescript.ast import node as ast
+from pynescript.langserver.analysis import Symbol
+from pynescript.langserver.analysis import SymbolIndex
+from pynescript.langserver.analysis import ensure_symbol_index
 from pynescript.langserver.protocol.utils import get_identifier_segment_at_position
+from pynescript.langserver.protocol.utils import in_comment_or_string
 from pynescript.langserver.providers.builtin_metadata import get_builtin
 from pynescript.langserver.providers.completion_items import PINE_KEYWORDS
 from pynescript.langserver.providers.completion_items import collect_user_enums
@@ -69,6 +73,24 @@ _QUALIFIER_DOCS: dict[str, str] = {
     "varip": "Declaration mode. Like `var`, but also updates on every intra-bar tick.",
 }
 
+# Built-in variables are not callables, so they are absent from the function
+# metadata catalog. Keep a small authoritative table for hover.
+_BUILTIN_VAR_DOCS: dict[str, tuple[str, str]] = {
+    "open": ("series float", "Open price of the current bar."),
+    "high": ("series float", "High price of the current bar."),
+    "low": ("series float", "Low price of the current bar."),
+    "close": ("series float", "Close price of the current bar."),
+    "volume": ("series float", "Volume of the current bar."),
+    "hl2": ("series float", "Midpoint of the current bar's high and low."),
+    "hlc3": ("series float", "Average of the current bar's high, low, and close."),
+    "ohlc4": ("series float", "Average of the current bar's open, high, low, and close."),
+    "time": ("series int", "UNIX timestamp (milliseconds) of the current bar's open."),
+    "time_close": ("series int", "UNIX timestamp (milliseconds) of the current bar's close."),
+    "bar_index": ("series int", "Zero-based index of the current bar."),
+    "last_bar_index": ("series int", "Index of the last bar in the dataset."),
+    "na": ("na", "Pine's missing-value literal."),
+}
+
 # Module names shown when the cursor is on the left of ``module.member``.
 _NAMESPACE_DOCS: dict[str, str] = {
     "ta": "Namespace. Technical-analysis functions (`ta.sma`, `ta.ema`, `ta.rsi`, …).",
@@ -99,12 +121,52 @@ _NAMESPACE_DOCS: dict[str, str] = {
 
 _SNIPPET_PLACEHOLDER = re.compile(r"\$\{(\d+):([^}]+)\}|\$\{(\d+)\}|\$(\d+)")
 
+# Known Pine library annotation tags. Any other ``//`` line inside an
+# annotation block is Markdown continuation content.
+_KNOWN_ANNOTATION_TAGS = frozenset(
+    {
+        "version",
+        "description",
+        "function",
+        "returns",
+        "type",
+        "variable",
+        "param",
+        "field",
+        "enum",
+        "strategy_alert_message",
+    }
+)
+
+# Tags whose content is the node's description (function / type / variable).
+_DESCRIPTION_TAGS = frozenset({"function", "type", "variable", "description", "enum"})
+
+def _split_annotation_tag(body: str) -> tuple[str, str] | None:
+    """Parse ``@tag rest`` from a stripped comment line.
+
+    Character scan instead of ``@\\s*([A-Za-z_]+)(?:\\s+(.*))?$`` so hover
+    does not run a user-controlled regex (CodeQL ``py/polynomial-redos``).
+    """
+    if not body.startswith("@"):
+        return None
+    i = 1
+    n = len(body)
+    while i < n and body[i] in " \t":
+        i += 1
+    start = i
+    while i < n and (("A" <= body[i] <= "Z") or ("a" <= body[i] <= "z") or body[i] == "_"):
+        i += 1
+    if i == start:
+        return None
+    return body[start:i], body[i:].lstrip(" \t")
+
 
 def handle_hover(
     params: lsp.HoverParams,
     source: str | None,
     tree: Any | None = ...,
     cache: dict[str, Any] | None = None,
+    analysis: SymbolIndex | None = None,
 ) -> lsp.Hover | None:
     """Return markdown hover for a symbol at the cursor, or ``None``.
 
@@ -117,6 +179,7 @@ def handle_hover(
         cache: Optional per-document-version memo (the workspace
             ``feature_cache``). Caches the user-declaration walk — without it
             every hover re-walks the whole AST.
+        analysis: Pre-built symbol index for *tree*.
 
     Returns:
         :class:`~lsprotocol.types.Hover` with docs, or ``None`` if the
@@ -131,10 +194,32 @@ def handle_hover(
     if position.line >= len(lines):
         return None
 
+    if in_comment_or_string(source, position.line, position.character):
+        return None
+
     line_text = lines[position.line]
     segment, seg_start, seg_end, word = get_identifier_segment_at_position(source, position.line, position.character)
     if not word:
         return None
+
+    # Scope-aware symbols and members win over namespace/type/builtin cards so
+    # a local variable named ``color`` or a UDT field is not described as a
+    # builtin namespace.
+    index = ensure_symbol_index(source, tree, analysis)
+    if index is not None:
+        member = index.member_at(position.line, position.character)
+        if member is not None:
+            if member.symbol is not None:
+                return _build_symbol_hover(member.symbol, source, position.line, seg_start, seg_end)
+            if member.kind == "constructor":
+                return _build_constructor_hover(member, position.line, seg_start, seg_end)
+            if member.builtin_name:
+                builtin = _hover_builtin(member.builtin_name, line_text, seg_start, position.line, seg_end)
+                if builtin is not None:
+                    return builtin
+        symbol = index.symbol_at(position.line, position.character)
+        if symbol is not None:
+            return _build_symbol_hover(symbol, source, position.line, seg_start, seg_end)
 
     ns_hover = _hover_namespace(segment, word, line_text, position.line, seg_start, seg_end)
     if ns_hover is not None:
@@ -144,21 +229,109 @@ def handle_hover(
     if type_hover is not None:
         return type_hover
 
-    builtin_hover = _hover_builtin(word, line_text, seg_start, position.line, seg_end)
-    if builtin_hover is not None:
-        return builtin_hover
-
+    # The library declaration is a builtin-shaped call; prefer a script-level
+    # //@description card when one exists.
     resolved = _resolve_tree(source, tree)
+    if word == "library":
+        library_hover = _hover_library(word, resolved, source, position.line, seg_start, seg_end)
+        if library_hover is not None:
+            return library_hover
+
+    # User enums get a richer member-aware card than the generic decl card.
     enums = collect_user_enums(resolved, source)
     enum_hover = _hover_user_enum(word, enums, position.line, seg_start, seg_end)
     if enum_hover is not None:
         return enum_hover
 
-    decl_hover = _hover_user_decl(segment, resolved, source, position.line, seg_start, seg_end, cache=cache)
-    if decl_hover is not None:
-        return decl_hover
+    decl_info = _lookup_user_decl(segment, resolved, source, cache)
+
+    builtin_hover = _hover_builtin(word, line_text, seg_start, position.line, seg_end)
+    if builtin_hover is not None:
+        # User-defined functions/methods/types shadow builtin metadata so
+        # library ``//@function`` docs render for colliding names (e.g. ``bb``).
+        if decl_info is not None and decl_info.get("kind") in {"function", "method", "type"}:
+            return _build_user_decl_hover(decl_info, position.line, seg_start, seg_end)
+        return builtin_hover
+
+    if decl_info is not None:
+        return _build_user_decl_hover(decl_info, position.line, seg_start, seg_end)
+
+    builtin_var = _BUILTIN_VAR_DOCS.get(segment)
+    if builtin_var is not None and not _followed_by_paren(line_text, seg_end):
+        type_label, brief = builtin_var
+        return _markdown_hover(f"{segment}: {type_label}", brief, position.line, seg_start, seg_end)
 
     return _hover_keyword(segment, position.line, seg_start, seg_end)
+
+
+def _build_symbol_hover(
+    symbol: Symbol,
+    source: str,
+    line: int,
+    start: int,
+    end: int,
+) -> lsp.Hover:
+    """Build a hover card for a symbol from the static analysis index."""
+    if symbol.kind in {"enum", "enum_member"}:
+        enum_name = symbol.container if symbol.kind == "enum_member" else symbol.name
+        members = []
+        # The symbol does not carry the enum body; walk the enum declaration.
+        node = symbol.node
+        if symbol.kind == "enum_member" and isinstance(symbol.scope.node, ast.EnumDef):
+            node = symbol.scope.node
+        if isinstance(node, ast.EnumDef):
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign) and isinstance(stmt.target, ast.Name):
+                    members.append({"name": stmt.target.id, "value": None})
+        enum_info = {
+            "name": enum_name,
+            "members": members,
+            "export": symbol.export,
+        }
+        member = symbol.name if symbol.kind == "enum_member" else None
+        return _build_enum_hover(enum_info, member=member, line=line, start=start, end=end)
+
+    if symbol.kind in {"param", "import"}:
+        annotations = list(symbol.annotations)
+    else:
+        comment_block = _extract_comment_block(source.split("\n"), getattr(symbol.node, "lineno", None))
+        # The AST keeps only ``//@tag`` lines (not Markdown continuation
+        # lines), so prefer the full source comment block when present.
+        annotations = comment_block or list(symbol.annotations)
+    signature = symbol.signature or symbol.name
+    info: dict[str, Any] = {
+        "kind": symbol.kind,
+        "signature": signature,
+        "annotations": annotations,
+    }
+    hover = _build_user_decl_hover(info, line, start, end)
+    extra: list[str] = []
+    if symbol.type_label and symbol.type_label not in signature:
+        extra.append(f"**Type:** `{symbol.type_label}`")
+    if symbol.container:
+        extra.append(f"**Member of** `{symbol.container}`")
+    if extra:
+        content = hover.contents
+        if isinstance(content, lsp.MarkupContent):
+            content.value = content.value.rstrip() + "\n\n" + "\n\n".join(extra) + "\n"
+    return hover
+
+
+def _build_constructor_hover(
+    member: Any,
+    line: int,
+    start: int,
+    end: int,
+) -> lsp.Hover:
+    """Hover for ``Type.new(...)`` constructors."""
+    node = getattr(member, "node", None)
+    type_name = ""
+    value = getattr(node, "value", None)
+    if isinstance(value, ast.Name):
+        type_name = value.id or ""
+    signature = f"{type_name}.new(...)" if type_name else "new(...)"
+    brief = f"Create a new `{type_name}` value." if type_name else "Create a new user-defined value."
+    return _markdown_hover(signature, brief, line, start, end)
 
 
 def _followed_by_paren(line_text: str, end: int) -> bool:
@@ -190,6 +363,11 @@ def _hover_namespace(
     brief = _NAMESPACE_DOCS.get(segment)
     if brief is None:
         return None
+    # ``syminfo.ticker`` has a member segment named ``ticker``; that is a
+    # property, not the ticker namespace. Only the head segment can be a
+    # namespace.
+    if word != segment and not word.startswith(segment + "."):
+        return None
     dotted = word.startswith(segment + ".") or (end < len(line_text) and line_text[end] == ".")
     if not dotted:
         # Bare `ta` / `math` still document the module. Types that share a
@@ -217,16 +395,13 @@ def _hover_type_or_qualifier(
     return None
 
 
-def _hover_user_decl(
+def _lookup_user_decl(
     name: str,
     tree: Any | None,
     source: str,
-    line: int,
-    start: int,
-    end: int,
     cache: dict[str, Any] | None = None,
-) -> lsp.Hover | None:
-    """Hover for a user function, assignment, type, or enum from the AST."""
+) -> dict[str, Any] | None:
+    """Return the collected declaration info for *name*, or ``None``."""
     if not name or tree is None:
         return None
     try:
@@ -238,25 +413,220 @@ def _hover_user_decl(
                 cache["user_decls"] = decls
     except Exception:
         return None
-    info = decls.get(name)
-    if info is None:
+    result = decls.get(name)
+    return result if isinstance(result, dict) else None
+
+
+def _strip_comment_prefix(line: str) -> str | None:
+    """Return the text after ``//`` (one leading space removed), or ``None``.
+
+    Trailing whitespace is preserved: Pine Markdown uses two trailing spaces to
+    force a line break.
+    """
+    text = line.lstrip()
+    if not text.startswith("//"):
         return None
+    body = text[2:]
+    if body.startswith(" "):
+        body = body[1:]
+    return body
+
+
+def _extract_comment_block(lines: list[str], lineno: int | None) -> list[str]:
+    """Return the contiguous ``//`` comment block immediately above *lineno*.
+
+    Args:
+        lines: Document text split by ``\\n``.
+        lineno: 1-based declaration line, or ``None``.
+
+    Returns:
+        Raw comment lines (top-to-bottom), or ``[]`` when the line above the
+        declaration is not a ``//`` comment.
+    """
+    if not lines or not lineno:
+        return []
+    idx = lineno - 2
+    if idx < 0 or not lines[idx].lstrip().startswith("//"):
+        return []
+    start = idx
+    while start > 0 and lines[start - 1].lstrip().startswith("//"):
+        start -= 1
+    return lines[start : idx + 1]
+
+
+def _extract_comment_block_at(lines: list[str], idx: int) -> list[str]:
+    """Return the contiguous ``//`` comment block containing line *idx*."""
+    if not lines or idx < 0 or idx >= len(lines) or not lines[idx].lstrip().startswith("//"):
+        return []
+    start = idx
+    while start > 0 and lines[start - 1].lstrip().startswith("//"):
+        start -= 1
+    end = idx
+    while end + 1 < len(lines) and lines[end + 1].lstrip().startswith("//"):
+        end += 1
+    return lines[start : end + 1]
+
+
+def _parse_annotation_entries(block: list[str] | None) -> list[tuple[str, str | None, str]]:
+    """Parse a ``//`` comment block into ``(tag, name, content)`` entries.
+
+    A known tag line starts a new entry (``@function``, ``@param name …``,
+    ``@returns``, …); every following plain ``//`` line is Markdown
+    continuation content for that tag. Markdown (headings, lists, code fences,
+    blockquotes, tables, links, inline formatting, and two-space line breaks)
+    is preserved verbatim so the hover renders it.
+
+    Args:
+        block: Raw comment lines (each starting with ``//``), or ``None``.
+
+    Returns:
+        Ordered ``(tag, name, content)`` entries. ``name`` is set for
+        ``param`` / ``field``. Empty when the block has no known tag.
+    """
+    entries: list[list[Any]] = []
+    current: list[Any] | None = None
+    for raw in block or []:
+        body = _strip_comment_prefix(raw)
+        if body is None:
+            continue
+        parsed = _split_annotation_tag(body.lstrip())
+        tag = parsed[0].lower() if parsed else ""
+        if parsed and tag in _KNOWN_ANNOTATION_TAGS:
+            if current is not None:
+                entries.append(current)
+            rest = parsed[1] or ""
+            if tag in {"param", "field"}:
+                parts = rest.split(None, 1)
+                name = parts[0] if parts else ""
+                desc = parts[1] if len(parts) > 1 else ""
+                current = [tag, name, [desc] if desc else []]
+            else:
+                current = [tag, None, [rest] if rest else []]
+        elif current is not None:
+            current[2].append(body)
+    if current is not None:
+        entries.append(current)
+    return [(entry[0], entry[1], "\n".join(entry[2]).rstrip("\n")) for entry in entries]
+
+
+def _annotation_sections(
+    entries: list[tuple[str, str | None, str]],
+) -> tuple[str | None, list[tuple[str, str]], str | None, list[tuple[str, str]]]:
+    """Split annotation entries into description, params, returns, and fields."""
+    description: str | None = None
+    returns: str | None = None
+    params: list[tuple[str, str]] = []
+    fields: list[tuple[str, str]] = []
+    for tag, field_name, content in entries:
+        if tag in _DESCRIPTION_TAGS:
+            if content:
+                description = content
+        elif tag == "param" and field_name:
+            params.append((field_name, content))
+        elif tag == "field" and field_name:
+            fields.append((field_name, content))
+        elif tag == "returns" and content:
+            returns = content
+    return description, params, returns, fields
+
+
+def _format_named_list(title: str, items: list[tuple[str, str]]) -> str:
+    """Render a Markdown bullet list of ``name``/``description`` pairs."""
+    lines = [f"**{title}:**"]
+    for item_name, item_desc in items:
+        if item_desc:
+            lines.append(f"- `{item_name}`: {item_desc}")
+        else:
+            lines.append(f"- `{item_name}`")
+    return "\n".join(lines)
+
+
+def _build_user_decl_hover(info: dict[str, Any], line: int, start: int, end: int) -> lsp.Hover:
+    """Build a Markdown hover card from a declaration's annotations.
+
+    The card mirrors TradingView's library hover: a fenced signature, then the
+    ``//@function`` / ``//@type`` / ``//@variable`` description rendered as
+    Markdown, followed by ``//@field``, ``//@param``, and ``//@returns``
+    sections. Without annotations it falls back to a one-line note.
+    """
     kind = info.get("kind", "declaration")
-    signature = info.get("signature") or name
-    return _markdown_hover(signature, f"User-defined {kind}.", line, start, end)
+    signature = info.get("signature") or info.get("name") or kind
+    entries = _parse_annotation_entries(info.get("annotations"))
+    description, params, returns, fields = _annotation_sections(entries)
+
+    parts = [f"```pinescript\n{signature}\n```"]
+    if description:
+        parts.append(description)
+    if fields:
+        parts.append(_format_named_list("Fields", fields))
+    if params:
+        parts.append(_format_named_list("Parameters", params))
+    if returns:
+        parts.append(f"**Returns:** {returns}")
+    if len(parts) == 1:
+        parts.append(f"User-defined {kind}.")
+
+    return lsp.Hover(
+        contents=lsp.MarkupContent(kind=lsp.MarkupKind.Markdown, value="\n\n".join(parts) + "\n"),
+        range=lsp.Range(
+            start=lsp.Position(line=line, character=start),
+            end=lsp.Position(line=line, character=end),
+        ),
+    )
 
 
-def _collect_user_decls(tree: Any, source: str) -> dict[str, dict[str, str]]:
-    """Map identifier → first declaration (kind + source signature)."""
-    found: dict[str, dict[str, str]] = {}
+def _hover_library(
+    word: str,
+    tree: Any | None,
+    source: str | None,
+    line: int,
+    start: int,
+    end: int,
+) -> lsp.Hover | None:
+    """Hover the ``library`` declaration using the script-level ``//@description``."""
+    if word != "library" or tree is None or not source:
+        return None
+    raw = getattr(tree, "annotations", None) or []
+    if not any("description" in item for item in raw):
+        return None
+    lines = source.split("\n")
+    for idx, text in enumerate(lines):
+        if not re.match(r"^\s*//\s*@\s*description\b", text):
+            continue
+        entries = _parse_annotation_entries(_extract_comment_block_at(lines, idx))
+        description = next(
+            (content for tag, _name, content in entries if tag == "description" and content),
+            None,
+        )
+        if description:
+            content = f"```pinescript\nlibrary\n```\n\n{description}\n"
+            return lsp.Hover(
+                contents=lsp.MarkupContent(kind=lsp.MarkupKind.Markdown, value=content),
+                range=lsp.Range(
+                    start=lsp.Position(line=line, character=start),
+                    end=lsp.Position(line=line, character=end),
+                ),
+            )
+    return None
+
+
+def _collect_user_decls(tree: Any, source: str) -> dict[str, dict[str, Any]]:
+    """Map identifier → first declaration (kind, source signature, annotations)."""
+    found: dict[str, dict[str, Any]] = {}
     # Split once — a per-declaration split is O(decls x doc-size).
     lines = source.split("\n") if source else []
 
     def add(name: str | None, kind: str, node: Any, fallback: str) -> None:
         if not name or name in found:
             return
-        snippet = _snippet_from_lines(lines, getattr(node, "lineno", None))
-        found[name] = {"kind": kind, "signature": snippet or fallback}
+        lineno = getattr(node, "lineno", None)
+        snippet = _snippet_from_lines(lines, lineno)
+        found[name] = {
+            "kind": kind,
+            "signature": snippet or fallback,
+            # Full contiguous comment block (tag + Markdown continuation lines).
+            "annotations": _extract_comment_block(lines, lineno),
+        }
 
     def walk(node: Any) -> None:
         if node is None:
@@ -324,16 +694,17 @@ def _snippet_from_lines(lines: list[str], lineno: int | None) -> str:
 
 def _hover_builtin(word: str, line_text: str, start: int, line: int, end: int) -> lsp.Hover | None:
     """Resolve a builtin from the full word, leaf, or preceding ``module.``."""
+    called = _followed_by_paren(line_text, end)
     builtin_info = get_builtin(word)
     if builtin_info:
-        return _build_builtin_hover(builtin_info, line, start, end)
+        return _build_builtin_hover(builtin_info, line, start, end, called=called)
 
     if "." in word:
         leaf = word.rsplit(".", 1)[-1]
         for candidate in (word, leaf):
             builtin_info = get_builtin(candidate)
             if builtin_info:
-                return _build_builtin_hover(builtin_info, line, start, end)
+                return _build_builtin_hover(builtin_info, line, start, end, called=called)
 
     text_before = line_text[:start]
     words_before = text_before.rstrip().split()
@@ -343,7 +714,7 @@ def _hover_builtin(word: str, line_text: str, start: int, line: int, end: int) -
             module = last_word.rstrip(".")
             builtin_info = get_builtin(f"{module}.{word}")
             if builtin_info:
-                return _build_builtin_hover(builtin_info, line, start, end)
+                return _build_builtin_hover(builtin_info, line, start, end, called=called)
     return None
 
 
@@ -486,14 +857,24 @@ def _format_params(info: dict) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def _build_builtin_hover(info: dict, line: int, start: int, end: int) -> lsp.Hover:
-    """Build a Hover for a builtin function.
+def _build_builtin_hover(
+    info: dict,
+    line: int,
+    start: int,
+    end: int,
+    *,
+    called: bool = True,
+) -> lsp.Hover:
+    """Build a Hover for a builtin function or property.
 
     Args:
         info: Metadata dict from builtin_metadata.
         line: The line number (0-indexed).
         start: Start character position.
         end: End character position.
+        called: Whether the identifier is followed by ``(``. Bare uses of
+            overloaded entries (``syminfo.ticker``) get a property card rather
+            than a function signature.
 
     Returns:
         LSP Hover with documentation.
@@ -502,6 +883,12 @@ def _build_builtin_hover(info: dict, line: int, start: int, end: int) -> lsp.Hov
     brief = info.get("brief", "")
     documentation = info.get("documentation", "")
     signature = _signature_from_info(info)
+    if called and "(" not in signature:
+        signature = f"{label}(...)"
+    if not called and "." in label and signature.startswith(label + "("):
+        signature = label
+        if not brief:
+            brief = "Built-in property."
 
     content = f"""```pinescript
 {signature}
@@ -511,7 +898,7 @@ def _build_builtin_hover(info: dict, line: int, start: int, end: int) -> lsp.Hov
 
 """
 
-    params_block = _format_params(info)
+    params_block = "" if not called else _format_params(info)
     if params_block:
         content += params_block
 

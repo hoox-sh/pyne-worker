@@ -63,15 +63,14 @@ SCRIPT_NAME_REPLACE = {
     '"': "",
 }
 
-# PYNE volt pack (same hex as scripts/showcase.py / __main__.py)
-_PYNE_ACCENT = "#B7EF09"
-_PYNE_ACCENT_DIM = "#76A000"
-_PYNE_FG = "#EFEFE8"
-_PYNE_MUTED = "#CBCCBD"
-_PYNE_BORDER = "#58594C"
-_PYNE_FAIL = "#E7000B"
-_PYNE_OK = "#B7EF09"
-_PYNE_WARN = "#EBA941"
+# PYNE volt pack — shared landing snapshot (see rich_theme.py)
+from pynescript.util.rich_theme import ACCENT as _PYNE_ACCENT
+from pynescript.util.rich_theme import ACCENT_DIM as _PYNE_ACCENT_DIM
+from pynescript.util.rich_theme import BORDER as _PYNE_BORDER
+from pynescript.util.rich_theme import OK as _PYNE_OK
+from pynescript.util.rich_theme import console as _theme_console
+from pynescript.util.rich_theme import has_rich as _has_rich
+from pynescript.util.rich_theme import use_rich as _use_rich
 
 _THREAD_LOCAL = threading.local()
 _THREAD_SESSIONS: set[requests.Session] = set()
@@ -93,49 +92,8 @@ class DownloadResult:
     error: str | None = None
 
 
-def _has_rich() -> bool:
-    try:
-        import rich  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
-def _use_rich(*, force: bool = False, plain: bool = False) -> bool:
-    if plain:
-        return False
-    if not _has_rich():
-        return False
-    if force:
-        return True
-    if os.environ.get("NO_COLOR"):
-        return False
-    return bool(sys.stdout.isatty())
-
-
 def _console(*, force: bool = False, plain: bool = False) -> Any | None:
-    if not _use_rich(force=force, plain=plain):
-        return None
-    from rich.console import Console
-    from rich.theme import Theme
-
-    return Console(
-        force_terminal=True if force else None,
-        color_system="truecolor" if force else "auto",
-        theme=Theme(
-            {
-                "pyne.accent": f"bold {_PYNE_ACCENT}",
-                "pyne.accent_dim": _PYNE_ACCENT_DIM,
-                "pyne.fg": _PYNE_FG,
-                "pyne.muted": _PYNE_MUTED,
-                "pyne.ok": f"bold {_PYNE_OK}",
-                "pyne.fail": f"bold {_PYNE_FAIL}",
-                "pyne.warn": f"bold {_PYNE_WARN}",
-                "pyne.border": _PYNE_BORDER,
-            }
-        ),
-    )
+    return _theme_console(force=force, plain=plain)
 
 
 def _register_thread_session(session: requests.Session) -> requests.Session:

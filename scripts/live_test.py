@@ -11,7 +11,8 @@ wall-clock latency; ``/run`` cases also record the engine-reported
 
 Coverage: health/feature flags, auth, interpret / strategy events / alerts /
 drawings / inputs / libraries, response windowing (+ validation), auto &
-compile modes, parse + timeout error contracts, payload cap, R2 ingest →
+compile modes, parse + timeout error contracts, chart timeframe, realtime
+last-bar, blocked webhook, AXIS CORS preflight, payload cap, R2 ingest →
 read-back, Bybit feed refresh, scripts registry lifecycle, cron jobs listing,
 and an opt-in cron run.
 
@@ -53,7 +54,7 @@ from typing import Callable
 
 DEFAULT_URL = "https://pyne-worker.cryptolinx.workers.dev"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-USER_AGENT = "pyne-worker-live-test/0.8.0"
+USER_AGENT = "pyne-worker-live-test/0.9.0"
 
 # Fixed fixture clock — 2026-01-01T00:00:00Z. Deterministic (identical bars on
 # every run → R2 ingest dedupes by time) and inside the reader's ~10-year scan.
@@ -343,7 +344,16 @@ def case_health(s: Suite) -> Outcome:
     features = body.get("features") or {}
     missing = [
         k
-        for k in ("scripts", "cron", "alerts", "libraries", "windowing", "realtime")
+        for k in (
+            "scripts",
+            "cron",
+            "alerts",
+            "libraries",
+            "windowing",
+            "realtime",
+            "chart_timeframe",
+            "cors",
+        )
         if k not in features
     ]
     if missing:
@@ -355,6 +365,58 @@ def case_health(s: Suite) -> Outcome:
         version=body.get("version"),
         engine=body.get("engine"),
     )
+
+
+def case_cors_preflight(s: Suite) -> Outcome:
+    """AXIS browser preflight: OPTIONS /run must 204 with ACAO + X-API-Key."""
+    origin = "https://axis.hoox.sh"
+    headers = {
+        "Origin": origin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-api-key,authorization",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+    started = time.perf_counter()
+    try:
+        req = urllib.request.Request(s.client.base + "/run", headers=headers, method="OPTIONS")
+        with urllib.request.urlopen(req, timeout=s.client.timeout) as resp:
+            status = resp.status
+            acao = resp.headers.get("Access-Control-Allow-Origin")
+            allow_h = resp.headers.get("Access-Control-Allow-Headers") or ""
+            allow_m = resp.headers.get("Access-Control-Allow-Methods") or ""
+    except urllib.error.HTTPError as exc:
+        return Outcome.failed(f"preflight HTTP {exc.code}: {exc.read()[:120]!r}")
+    except Exception as exc:  # noqa: BLE001
+        return Outcome.failed(f"{type(exc).__name__}: {exc}")
+    ms = (time.perf_counter() - started) * 1000
+    s.all_latencies.append(ms)
+    s.requests += 1
+    if s._cur is not None:
+        s._cur.latencies.append(ms)
+        s._cur.http = status
+    if status != 204:
+        return Outcome.failed(f"expected 204, got {status}")
+    if acao != origin:
+        return Outcome.failed(f"ACAO={acao!r} (expected {origin})")
+    if "x-api-key" not in allow_h.lower():
+        return Outcome.failed(f"Allow-Headers missing X-API-Key: {allow_h!r}")
+    if "POST" not in allow_m.upper():
+        return Outcome.failed(f"Allow-Methods missing POST: {allow_m!r}")
+
+    health_req = urllib.request.Request(
+        s.client.base + "/health",
+        headers={"Origin": origin, "User-Agent": USER_AGENT, "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(health_req, timeout=s.client.timeout) as resp:
+            health_acao = resp.headers.get("Access-Control-Allow-Origin")
+    except Exception as exc:  # noqa: BLE001
+        return Outcome.failed(f"GET /health CORS: {type(exc).__name__}: {exc}")
+    if health_acao != origin:
+        return Outcome.failed(f"GET /health ACAO={health_acao!r}")
+    return Outcome.passed(f"OPTIONS /run + GET /health echo {origin}")
 
 
 def case_404(s: Suite) -> Outcome:
@@ -571,9 +633,79 @@ def case_run_parse_error(s: Suite) -> Outcome:
     r = s.request("POST", "/run", {"script": broken, "ohlcv": make_bars(20)})
     if r.status != 500:
         return Outcome.failed(f"expected 500, got {r.status}: {_error_of(r)}")
-    if (r.body or {}).get("error_kind") != "parse":
-        return Outcome.failed(f"error_kind={(r.body or {}).get('error_kind')!r}")
-    return Outcome.passed("parse error → error_kind=parse")
+    body = r.body or {}
+    if body.get("error_kind") != "parse":
+        return Outcome.failed(f"error_kind={body.get('error_kind')!r}")
+    if body.get("status") != "error" or not body.get("message"):
+        return Outcome.failed(f"missing sanitized envelope: {json.dumps(body)[:160]}")
+    if "Traceback" in str(body.get("error")) or "/home/" in str(body.get("error")):
+        return Outcome.failed("error body leaked traceback or path")
+    return Outcome.passed("parse error → error_kind=parse · sanitized envelope")
+
+
+def case_run_timeframe(s: Suite) -> Outcome:
+    script = (
+        "//@version=6\nindicator('live-tf')\n"
+        "plot(timeframe.in_seconds(), 'sec')\n"
+        "plot(timeframe.isminutes ? 1 : 0, 'minutes')\n"
+    )
+    r = s.request(
+        "POST",
+        "/run",
+        {"script": script, "ohlcv": make_bars(20), "timeframe": "15m", "mode": "interpret"},
+    )
+    s.engine(_engine_ms(r))
+    if r.status != 200:
+        return Outcome.failed(f"{r.status}: {_error_of(r)}")
+    series = (r.body or {}).get("series") or {}
+    sec = series.get("sec") or []
+    minutes = series.get("minutes") or []
+    if not sec or sec[-1] != 900:
+        return Outcome.failed(f"timeframe.in_seconds last={sec[-1:]!r} (expected 900 for 15m)")
+    if not minutes or minutes[-1] != 1:
+        return Outcome.failed(f"timeframe.isminutes last={minutes[-1:]!r}")
+    return Outcome.passed("15m → timeframe.in_seconds=900")
+
+
+def case_run_realtime(s: Suite) -> Outcome:
+    script = (
+        "//@version=5\nindicator('live-rt')\n"
+        "var int v = 0\n"
+        "varip int vip = 0\n"
+        "v := v + 1\n"
+        "vip := vip + 1\n"
+        "plot(v, 'v')\n"
+        "plot(vip, 'vip')\n"
+    )
+    r = s.request(
+        "POST",
+        "/run",
+        {"script": script, "ohlcv": make_bars(12), "realtime_last_bar": True, "mode": "interpret"},
+    )
+    s.engine(_engine_ms(r))
+    if r.status != 200:
+        return Outcome.failed(f"{r.status}: {_error_of(r)}")
+    series = (r.body or {}).get("series") or {}
+    if (series.get("v") or [None])[-1] != 12 or (series.get("vip") or [None])[-1] != 1:
+        return Outcome.failed(f"varip not re-inited: v={series.get('v')} vip={series.get('vip')}")
+    return Outcome.passed("realtime_last_bar re-inits varip (vip=1, v=12)")
+
+
+def case_run_webhook_blocked(s: Suite) -> Outcome:
+    r = s.request(
+        "POST",
+        "/run",
+        {
+            "script": SIMPLE,
+            "ohlcv": make_bars(5),
+            "webhook_url": "http://127.0.0.1/hook",
+        },
+    )
+    if r.status != 400:
+        return Outcome.failed(f"expected 400, got {r.status}: {_error_of(r)}")
+    if (r.body or {}).get("code") != "WEBHOOK_URL_BLOCKED":
+        return Outcome.failed(f"code={(r.body or {}).get('code')!r}")
+    return Outcome.passed("private webhook_url → 400 WEBHOOK_URL_BLOCKED")
 
 
 def case_run_timeout(s: Suite) -> Outcome:
@@ -944,6 +1076,7 @@ def main() -> int:
 
     # Order matters: health first (report header + cold-start sample).
     suite.add("health", case_health, repeat=None)
+    suite.add("cors.preflight", case_cors_preflight, repeat=1)
     suite.add("routing.404", case_404, repeat=1)
     # Auth cases need no configured key — they verify the *absence* of a valid key.
     suite.add("auth.missing_key", case_auth_missing, repeat=1, skip_reason="--skip-auth-checks" if args.skip_auth_checks else None)
@@ -960,6 +1093,9 @@ def main() -> int:
     suite.add("run.mode_auto", case_run_mode_auto, repeat=1, skip_reason=needs_auth)
     suite.add("run.mode_compile", case_run_mode_compile, repeat=1, skip_reason=needs_auth)
     suite.add("run.parse_error", case_run_parse_error, repeat=1, skip_reason=needs_auth)
+    suite.add("run.timeframe", case_run_timeframe, repeat=1, skip_reason=needs_auth)
+    suite.add("run.realtime", case_run_realtime, repeat=1, skip_reason=needs_auth)
+    suite.add("run.webhook_blocked", case_run_webhook_blocked, repeat=1, skip_reason=needs_auth)
     suite.add("run.timeout", case_run_timeout, repeat=1, skip_reason=needs_auth)
     suite.add("run.r2_missing_data", case_run_r2_nodata, repeat=1, skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None))
     suite.add("r2.ingest", case_r2_ingest, repeat=1, skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None))

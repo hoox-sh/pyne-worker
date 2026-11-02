@@ -26,8 +26,10 @@ from scripts_registry import get_script
 from scripts_registry import load_cron_jobs
 from scripts_registry import put_cron_state
 from scripts_registry import sanitize_exchange
+from security import sanitize_error_for_response
 from security import sanitize_symbol
 from security import sanitize_timeframe
+from security import to_pine_period
 from security import validate_webhook_url
 
 HttpGetJson = Callable[[str], Awaitable[Any]]
@@ -186,7 +188,7 @@ async def run_scheduled_jobs(
 
         libraries = rec.get("libraries") if isinstance(rec.get("libraries"), list) else None
         inputs = rec.get("inputs") if isinstance(rec.get("inputs"), dict) else None
-        runtime = Runtime(symbol=symbol)
+        runtime = Runtime(symbol=symbol, timeframe=to_pine_period(timeframe))
         result = runtime.run(
             script,
             ohlcv,
@@ -197,14 +199,15 @@ async def run_scheduled_jobs(
         )
 
         if "error" in result:
-            results.append(
-                {
-                    "script_id": script_id,
-                    "status": "error",
-                    "reason": result["error"],
-                    "mode": result.get("mode") or mode,
-                }
-            )
+            err_row: dict[str, Any] = {
+                "script_id": script_id,
+                "status": "error",
+                "reason": sanitize_error_for_response(str(result["error"])),
+                "mode": result.get("mode") or mode,
+            }
+            if result.get("error_kind"):
+                err_row["error_kind"] = result["error_kind"]
+            results.append(err_row)
             continue
 
         events = result.get("events") or []

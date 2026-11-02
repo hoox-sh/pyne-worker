@@ -78,7 +78,7 @@ async def default_http_post_json(url: str, body: dict[str, Any]) -> int:
         headers = Headers.new(
             [
                 ["Content-Type", "application/json"],
-                ["User-Agent", "pyne-worker-alerts/0.5"],
+                ["User-Agent", "pyne-worker-alerts/0.9"],
                 ["X-Source", "pyne-worker"],
             ]
         )
@@ -104,7 +104,7 @@ async def default_http_post_json(url: str, body: dict[str, Any]) -> int:
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "User-Agent": "pyne-worker-alerts/0.5",
+            "User-Agent": "pyne-worker-alerts/0.9",
             "X-Source": "pyne-worker",
         },
     )
