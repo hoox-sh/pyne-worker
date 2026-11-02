@@ -3,7 +3,7 @@
 > Production **Python Cloudflare® Worker** for the **[PYNE](https://hoox.sh/pyne)** stack —
 > evaluate TradingView® Pine Script™ on the edge with the same bar-loop contract as the Pro API.
 
-**Version:** 0.9.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.6.30)
+**Version:** 0.10.0 · **Runtime:** Cloudflare Workers (Python) · **Engine:** [`hoox-pyne`](https://pypi.org/project/hoox-pyne/) (`pynescript` ≥ 0.6.30)
 
 **Website:** [hoox.sh/pyne](https://hoox.sh/pyne) · **Docs:** [hoox.sh/pyne/docs](https://hoox.sh/pyne/docs) · **Repo:** [hoox-sh/pyne-worker](https://github.com/hoox-sh/pyne-worker)
 

@@ -57,7 +57,7 @@ from window import apply_window
 # Limits
 # ---------------------------------------------------------------------------
 
-_WORKER_VERSION = "0.9.0"
+_WORKER_VERSION = "0.10.0"
 _MAX_SCRIPT_LENGTH = 100_000  # characters
 _MAX_BARS = 100_000
 _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -208,7 +208,7 @@ def _run_error_body(result: dict[str, Any]) -> dict[str, Any]:
 # Path helpers
 # ---------------------------------------------------------------------------
 
-_KNOWN_ROOTS = frozenset({"/health", "/run", "/ingest", "/scripts", "/cron", "/schedules", "/feed"})
+_KNOWN_ROOTS = frozenset({"/health", "/run", "/ingest", "/scripts", "/cron", "/schedules", "/feed", "/ast"})
 
 
 def _match_route(path: str) -> tuple[str, str | None]:
@@ -220,6 +220,7 @@ def _match_route(path: str) -> tuple[str, str | None]:
       /cron/jobs        → ("/cron/jobs", None)
       /cron/run         → ("/cron/run", None)
       /feed/refresh     → ("/feed/refresh", None)
+      /ast/parse        → ("/ast/:op", "parse")
     """
     if path in ("/cron/jobs", "/cron/run", "/feed/refresh"):
         return path, None
@@ -231,6 +232,10 @@ def _match_route(path: str) -> tuple[str, str | None]:
         sid = path[len("/scripts/") :].strip("/")
         if sid and "/" not in sid:
             return "/scripts/:id", sid
+    if path.startswith("/ast/"):
+        op = path[len("/ast/") :].strip("/")
+        if op and "/" not in op:
+            return "/ast/:op", op
     return path, None
 
 
@@ -375,9 +380,10 @@ async def _dispatch_request(
         "/cron/jobs",
         "/cron/run",
         "/feed/refresh",
+        "/ast/:op",
     }
     if route not in known and route != "/health":
-        return _json_response({"error": "Not found"}, 404)
+        return _json_response({"error": "Not found", "code": "UNKNOWN_ROUTE"}, 404)
 
     # -- Auth: tenant Bearer (live verify when console set), else legacy X-API-Key
     bearer = extract_bearer_token(authorization)
@@ -487,6 +493,12 @@ async def _dispatch_request(
         )
 
     # -- Route ------------------------------------------------------------
+    if route == "/ast/:op" and method == "POST":
+        resp_body, resp_status, resp_headers = await handle_ast(param or "", body)
+        resp_headers.update(rate_headers)
+        resp_headers.update(verify_headers)
+        return resp_body, resp_status, resp_headers
+
     if route == "/run" and method == "POST":
         resp_body, resp_status, resp_headers = await handle_run(body, r2_bucket=r2_bucket)
         resp_headers.update(rate_headers)
@@ -626,6 +638,16 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
                 "chart_timeframe": True,
                 "cors": True,
                 "live_feed": True,
+                "ast": True,
+                "ast_ops": [
+                    "parse",
+                    "dump",
+                    "unparse",
+                    "format",
+                    "lint",
+                    "diagnostics",
+                    "compile",
+                ],
                 "feed_sources": ["bybit", "binance"],
                 "timeframes": [
                     "1m",
@@ -647,6 +669,44 @@ def _handle_health(r2_bucket: Any | None) -> tuple[dict[str, Any], int, dict[str
             },
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /ast/:op
+# ---------------------------------------------------------------------------
+
+
+async def handle_ast(
+    op: str,
+    body: str | None,
+) -> tuple[dict[str, Any], int, dict[str, str]]:
+    """Language ops for pyne-agent-worker (parse / lint / dump / …)."""
+    from ast_routes import dispatch_ast
+    from ast_routes import is_ast_op
+
+    if not is_ast_op(op):
+        return _json_response(
+            {
+                "ok": False,
+                "error": f"unknown ast op: {op}",
+                "code": "UNKNOWN_ROUTE",
+                "kind": "io",
+            },
+            404,
+        )
+
+    data, err = _parse_body(body)
+    if err is not None:
+        return err
+    if data is None:
+        return _json_response(
+            {"ok": False, "error": "Failed to parse request body", "kind": "io"},
+            400,
+        )
+
+    result = dispatch_ast(op, data)
+    # Protocol success even when ok=false (parse/lint failures are payload).
+    return _json_response(result, 200)
 
 
 # ---------------------------------------------------------------------------

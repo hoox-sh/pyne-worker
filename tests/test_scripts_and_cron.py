@@ -332,7 +332,7 @@ class TestHealthFeatures:
     async def test_health_lists_features(self) -> None:
         payload, status, _ = await handle_request("GET", "/health")
         assert status == 200
-        assert payload["version"] == "0.9.0"
+        assert payload["version"] == "0.10.0"
         assert "modes" in payload.get("features", {})
         assert payload["features"].get("libraries") is True
         assert payload["features"].get("windowing") is True

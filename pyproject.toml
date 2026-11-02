@@ -1,6 +1,6 @@
 [project]
 name = "pyne-worker"
-version = "0.9.0"
+version = "0.10.0"
 description = "PYNE edge evaluate on Cloudflare Workers — Python host for pynescript (alerts, libraries, cron, R2, realtime, chart timeframe)"
 license = { text = "AGPL-3.0-or-later" }
 readme = "README.md"

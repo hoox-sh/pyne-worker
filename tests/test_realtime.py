@@ -118,7 +118,7 @@ class TestRunRealtime:
         payload, status, _ = await handle_request("GET", "/health")
         assert status == 200
         assert payload["features"].get("realtime") is True
-        assert payload["version"] == "0.9.0"
+        assert payload["version"] == "0.10.0"
         assert str(payload.get("engine", "")).startswith("0.6.30")
         assert payload["features"].get("chart_timeframe") is True
         assert payload["features"].get("cors") is True
