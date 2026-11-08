@@ -17,7 +17,7 @@ MODE="${1:-all}"
 case "$MODE" in
   pre-commit | pre-push | all) ;;
   *)
-    echo "Usage: $0 [pre-commit|pre-push|all]" >&2
+    echo "Usage: $0 [pre-commit|pre-push|all] [base head]" >&2
     exit 2
     ;;
 esac
@@ -31,36 +31,70 @@ OKF_CMD='okn --no-telemetry validate --spec 0.2 okf'
 # /oo:commands
 # No type checker detected; add a `typecheck` script or edit TYPECHECK_CMD.
 
-# Scope format and lint to what this commit actually adds. The generated hook
-# runs this same script, so a whole-tree check gates a commit on debt that
-# predates it. A staged-set check still fails on badly formatted work that is
-# being committed. Outside a hook, or with nothing staged, the full-tree command
-# above is used unchanged.
+# Scope format and lint to the change being checked. The generated hook runs
+# this same script, so a whole-tree check gates a push on debt that predates
+# it. A scoped check still fails on badly formatted work that is being
+# committed or pushed. Outside a hook the full-tree command above is used.
 #
-# The staged set is only appended to a direct tool invocation: a file list after
+# pre-commit: the staged set.
+# pre-push:   the pushed range. .githooks/pre-push resolves the refs git sends
+#             on stdin and passes them here as $2 and $3; run by hand with no
+#             range, this falls back to @{u}..HEAD.
+#
+# The file list is only appended to a direct tool invocation: a file list after
 # a script wrapper (npm run lint) is silently ignored, which would pass without
-# checking anything. An empty STAGED_CMD keeps the full-tree command.
+# checking anything. An empty *_SCOPED keeps the full-tree command.
 FORMAT_EXT='py'
 LINT_EXT='py'
-FORMAT_STAGED='ruff format --check'
-LINT_STAGED='ruff check'
-STAGED=''
+FORMAT_SCOPED='ruff format --check'
+LINT_SCOPED='ruff check'
+
+RANGE_BASE="${2:-}"
+RANGE_HEAD="${3:-}"
+CHANGED=''
+CHANGED_LABEL=''
+RANGE_ERROR=''
 if [ "$MODE" = "pre-commit" ]; then
-  STAGED="$(git diff --cached --name-only --diff-filter=ACMR)"
+  CHANGED="$(git diff --cached --name-only --diff-filter=ACMR)"
+  CHANGED_LABEL='staged'
+elif [ "$MODE" = "pre-push" ]; then
+  if [ -n "$RANGE_BASE" ] && [ -n "$RANGE_HEAD" ]; then
+    CHANGED_LABEL="$RANGE_BASE..$RANGE_HEAD"
+    if git rev-parse --verify --quiet "$RANGE_BASE^{commit}" >/dev/null 2>&1 &&
+      git rev-parse --verify --quiet "$RANGE_HEAD^{commit}" >/dev/null 2>&1; then
+      CHANGED="$(git diff --name-only --diff-filter=ACMR "$RANGE_BASE..$RANGE_HEAD")"
+    else
+      RANGE_ERROR="cannot resolve pushed range $CHANGED_LABEL"
+    fi
+  else
+    CHANGED_LABEL='@{u}..HEAD'
+    if git rev-parse --verify --quiet '@{u}^{commit}' >/dev/null 2>&1; then
+      CHANGED="$(git diff --name-only --diff-filter=ACMR '@{u}..HEAD')"
+    else
+      RANGE_ERROR='no upstream branch; pass the pushed range explicitly'
+    fi
+  fi
 fi
-scope_to_staged() {
-  local base="$1" staged_cmd="$2" ext="$3" files
-  [ -n "$staged_cmd" ] || { printf '%s' "$base"; return; }
-  [ -n "$STAGED" ] || { printf '%s' "$base"; return; }
-  files="$(printf '%s\n' "$STAGED" | grep -Ei "\.($ext)\$" || true)"
+
+scope_to_changed() {
+  local base="$1" scoped_cmd="$2" ext="$3" files file out
+  case "$MODE" in pre-commit | pre-push) ;; *) printf '%s' "$base"; return ;; esac
+  [ -n "$scoped_cmd" ] || { printf '%s' "$base"; return; }
+  [ -z "$RANGE_ERROR" ] || { printf '%s' "$base"; return; }
+  files="$(printf '%s\n' "$CHANGED" | grep -Ei "\.($ext)\$" || true)"
   if [ -z "$files" ]; then
-    printf 'echo "no staged files match .%s; nothing to check"' "$ext"
+    printf 'echo "no files in %s match .%s; nothing to check"' "$CHANGED_LABEL" "$ext"
     return
   fi
-  printf '%s %s' "$staged_cmd" "$(printf '%s' "$files" | tr '\n' ' ')"
+  out="$scoped_cmd"
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    out="$out $(printf '%q' "$file")"
+  done <<<"$files"
+  printf '%s' "$out"
 }
-FORMAT_CMD="$(scope_to_staged "$FORMAT_CMD" "$FORMAT_STAGED" "$FORMAT_EXT")"
-LINT_CMD="$(scope_to_staged "$LINT_CMD" "$LINT_STAGED" "$LINT_EXT")"
+FORMAT_CMD="$(scope_to_changed "$FORMAT_CMD" "$FORMAT_SCOPED" "$FORMAT_EXT")"
+LINT_CMD="$(scope_to_changed "$LINT_CMD" "$LINT_SCOPED" "$LINT_EXT")"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
   BOLD=$'\033[1m'
@@ -173,12 +207,60 @@ PROJECT='pyne-worker'
 printf '\n%s %s\n' "${CYAN}${BOLD}OpenOrchestrate${RESET}" "${DIM}· ${MODE} · ${PROJECT}${RESET}"
 printf '%s\n\n' "${DIM}${RULE}${RESET}"
 
+# An unresolvable range must fail, not fall through to a scoped check with no
+# file list: that would pass without checking anything.
+if [ -n "$RANGE_ERROR" ]; then
+  printf '%s %-10s %s\n' "${RED}${FAIL}${RESET}" "Range" "${BOLD}${RANGE_ERROR}${RESET}"
+  printf '\n%s\n' "${DIM}${RULE}${RESET}"
+  exit 1
+fi
+
 run_step format "Format" "$FORMAT_CMD"
 run_step lint "Lint" "$LINT_CMD"
 run_step typecheck "Typecheck" "$TYPECHECK_CMD"
 run_step okf "OKF" "$OKF_CMD"
 
 if [ "$MODE" = "all" ] || [ "$MODE" = "pre-push" ]; then
+  # Two suites cannot run on a machine without a synced sibling pynescript
+  # checkout. Name every exclusion out loud: a skipped suite must never look
+  # like a passing one, and the tests that can run still run.
+  #
+  # tests/test_parity.py asserts its fixtures exist at import time, so pytest
+  # aborts collection before any test runs. ../../pynescript is the same path
+  # the test asserts on.
+  PARITY_ROOT="$(cd "$ROOT/../.." 2>/dev/null && pwd)"
+  PARITY_FIXTURES="$PARITY_ROOT/pynescript/tests/fixtures/parity"
+  TEST_ARGS=()
+  if [ ! -d "$PARITY_FIXTURES" ]; then
+    printf '%s %-10s %s\n' "${YELLOW}${SKIP}${RESET}" "Parity" "${DIM}skipped: fixtures unavailable (${PARITY_FIXTURES})${RESET}"
+    SKIPPED=$((SKIPPED + 1))
+    TEST_ARGS+=(--ignore=tests/test_parity.py)
+  fi
+
+  # test_sibling_checkout_is_synced compares the vendored snapshot with whatever
+  # pynescript checkout this machine has. A newer sibling fails a push that
+  # changed no Python, so deselect that one test and print the drift.
+  SIBLING=''
+  for cand in "$ROOT/../pynescript/src/pynescript" "$ROOT/../../pynescript/src/pynescript"; do
+    if [ -f "$cand/__about__.py" ]; then
+      SIBLING="$cand"
+      break
+    fi
+  done
+  VENDORED="$ROOT/python_modules/pynescript/__about__.py"
+  if [ -n "$SIBLING" ] && [ -f "$VENDORED" ]; then
+    vend="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$VENDORED" | head -n 1)"
+    live="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$SIBLING/__about__.py" | head -n 1)"
+    if [ -n "$vend" ] && [ -n "$live" ] && [ "$vend" != "$live" ]; then
+      printf '%s %-10s %s\n' "${YELLOW}${SKIP}${RESET}" "Vendor" "${DIM}skipped: sibling checkout out of sync (vendored ${vend} != sibling ${live})${RESET}"
+      SKIPPED=$((SKIPPED + 1))
+      TEST_ARGS+=(--deselect=tests/test_vendor_sync.py::TestVendoredSnapshot::test_sibling_checkout_is_synced)
+    fi
+  fi
+
+  if [ "${#TEST_ARGS[@]}" -gt 0 ]; then
+    TEST_CMD="$TEST_CMD -- ${TEST_ARGS[*]}"
+  fi
   run_step test "Tests" "$TEST_CMD"
 fi
 
