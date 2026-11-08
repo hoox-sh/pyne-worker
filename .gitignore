@@ -26,3 +26,8 @@ live_report*.json
 python_modules/**/__pycache__/
 python_modules/**/*.pyc
 .dev.vars
+
+# OpenOrchestrate runtime state
+.openorchestrate/state.db
+.openorchestrate/state.db-*
+.openorchestrate/logs/

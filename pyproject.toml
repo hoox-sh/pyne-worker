@@ -26,6 +26,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
+[tool.ruff]
+# Vendored third-party wheels (antlr4, certifi, idna, pynescript) are not ours to
+# reformat or lint; they ship with their own style.
+exclude = ["python_modules"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [
