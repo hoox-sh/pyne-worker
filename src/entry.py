@@ -102,6 +102,9 @@ class Default(WorkerEntrypoint):
     - ``ALLOWED_ORIGIN`` (var, optional) — extra CORS origins, comma-separated.
     -   Product hosts and localhost are always echoed; ``GET /health`` reflects
     -   any http(s) Origin (AXIS Settings probe).
+    - ``ALLOW_GUEST_RUN`` (var, optional) — when ``1`` / ``true`` / ``product``,
+    -   allowlisted browser Origins may ``POST /run`` and ``POST /ast/*``
+    -   without ``X-API-Key``. Management routes still require the key.
     """
 
     TRADE_SERVICE: object  # service binding, set by the runtime
@@ -115,6 +118,7 @@ class Default(WorkerEntrypoint):
     CONSOLE_URL: str | None = None  # tenant verify + usage base URL (None → passthrough)
     USAGE_SERVICE_KEY: str | None = None  # optional service Bearer for POST /api/v1/usage
     ALLOWED_ORIGIN: str | None = None  # extra CORS allowlist (comma-separated)
+    ALLOW_GUEST_RUN: str | None = None  # "1" = guest POST /run from product Origins
 
     async def fetch(self, request):
         start = time.time()
@@ -127,6 +131,7 @@ class Default(WorkerEntrypoint):
         authorization = request.headers.get("Authorization", None)
         origin = request.headers.get("Origin", None)
         allowed_origin = getattr(self.env, "ALLOWED_ORIGIN", None)
+        allow_guest_run = getattr(self.env, "ALLOW_GUEST_RUN", None)
 
         # Read body for POST (hard cap before full pipeline — fail closed on size)
         body = None
@@ -164,6 +169,7 @@ class Default(WorkerEntrypoint):
             usage_auth=getattr(self.env, "USAGE_SERVICE_KEY", None),
             origin=origin,
             allowed_origin=allowed_origin,
+            allow_guest_run=allow_guest_run,
         )
 
         # -- Forward strategy events to trade-worker ----------------------

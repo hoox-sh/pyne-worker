@@ -115,6 +115,7 @@ Strong real-world Pine coverage via the open PYNE engine — **not** a claim of 
 - **Error sanitization** — `/run` failures drop traceback frames and source paths (Pro API 0.6.30 parity); body includes `status`/`message` plus the existing `error` string
 - **L2 webhook flags on `/run`** — `webhook_url` (blocked URLs → 400), `forward_alerts`, `alert_last_bar` (default true), `alert_batch` (default true)
 - **CORS for AXIS** — `OPTIONS` preflight (no auth) + `Access-Control-Allow-Origin` on `/health` and `/run`. Echoes `https://axis.hoox.sh`, `*.hoox.sh`, `*.pynescript.online`, `*.axis.pages.dev` / `*.pynescript-axis.pages.dev`, and localhost. `X-API-Key` is an allowed request header. Extra hosts via `ALLOWED_ORIGIN`.
+- **Guest `/run`** — when var `ALLOW_GUEST_RUN=1`, those same Origins may `POST /run` and `POST /ast/*` without `X-API-Key` (AXIS Edge Worker on product + Pages previews). Management routes still require the key.
 - **Drawings / plot_meta / logs** — same evaluate-contract envelope as the Pro API
 - **$0 tier OK** for light use; Paid Workers recommended for heavy 1m cron
 
