@@ -28,7 +28,12 @@
     // `/run` + `/ingest` usage is flushed to POST {CONSOLE_URL}/api/v1/usage.
     // Unset/empty (self-host) keeps the legacy passthrough: tenant keys are
     // accepted without remote verify and no usage is reported.
-    "CONSOLE_URL": "https://console.hoox.sh"
+    "CONSOLE_URL": "https://console.hoox.sh",
+    // Guest POST /run + /ast/* (no X-API-Key) from product Origins:
+    // *.hoox.sh, *.pynescript.online, *.axis.pages.dev,
+    // *.pynescript-axis.pages.dev, and localhost. Management routes
+    // still require API_KEY. Set to "0" to disable.
+    "ALLOW_GUEST_RUN": "1"
     // Metering auth (optional — set via `wrangler secret put USAGE_SERVICE_KEY`):
     // Bearer for POST {CONSOLE_URL}/api/v1/usage. When unset, usage flush
     // falls back to the per-request tenant key hash (still hash-on-wire).
@@ -51,8 +56,12 @@
   // Optional vars:
   //   DEFAULT_EXCHANGE — default trade exchange id (default: binance)
   //   ALLOWED_ORIGIN — extra CORS origins, comma-separated. Product hosts
-  //     (*.hoox.sh, *.pynescript.online, *.axis.pages.dev) and localhost
-  //     are always echoed; GET /health reflects any http(s) Origin.
+  //     (*.hoox.sh, *.pynescript.online, *.axis.pages.dev,
+  //     *.pynescript-axis.pages.dev) and localhost are always echoed;
+  //     GET /health reflects any http(s) Origin.
+  //   ALLOW_GUEST_RUN — "1" / "true" / "product" lets those Origins POST
+  //     /run and /ast/* without X-API-Key. Management routes still need
+  //     the key. Default unset/off in code; this deploy sets "1".
   //   PYNE_STRATEGY_RISK_CONTRACTS=1 — `strategy.risk.max_position_size` as
   //     absolute contracts (reference Pine). Default is %-of-equity.
   "services": [

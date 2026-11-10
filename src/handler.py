@@ -30,6 +30,7 @@ from typing import Any
 
 from cors import attach_cors
 from cors import cors_headers_for
+from cors import origin_allowed
 from middleware import LogHelper
 from middleware import RateLimiter
 from middleware import extract_bearer_token
@@ -64,6 +65,18 @@ _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _MAX_TIMEOUT_SECONDS = 30.0
 _REQUIRED_BAR_FIELDS = {"open", "high", "low", "close", "time"}
+
+# Browser AXIS (product hosts + Pages previews + localhost) may POST /run
+# and /ast/* without X-API-Key when ALLOW_GUEST_RUN is enabled. Management
+# routes (/scripts, /ingest, /cron, /feed) still require the key.
+_GUEST_ROUTES = frozenset({"/run", "/ast/:op"})
+
+
+def _guest_run_enabled(flag: str | None) -> bool:
+    if not flag or not isinstance(flag, str):
+        return False
+    return flag.strip().lower() in {"1", "true", "yes", "on", "product"}
+
 
 # ---------------------------------------------------------------------------
 # Singleton middleware instances
@@ -289,6 +302,7 @@ async def handle_request(
     usage_auth: str | None = None,
     origin: str | None = None,
     allowed_origin: str | None = None,
+    allow_guest_run: str | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, str]]:
     """Route a request and attach AXIS CORS headers.
 
@@ -312,6 +326,9 @@ async def handle_request(
         authorization=authorization,
         console_url=console_url,
         usage_auth=usage_auth,
+        origin=origin,
+        allowed_origin=allowed_origin,
+        allow_guest_run=allow_guest_run,
     )
     return payload, status, attach_cors(
         headers, origin, path, extra_allowed=allowed_origin
@@ -329,6 +346,9 @@ async def _dispatch_request(
     authorization: str | None = None,
     console_url: str | None = None,
     usage_auth: str | None = None,
+    origin: str | None = None,
+    allowed_origin: str | None = None,
+    allow_guest_run: str | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, str]]:
     """Route and process a request through the middleware pipeline.
 
@@ -470,7 +490,14 @@ async def _dispatch_request(
         rate_key = f"tenant:{tenant_hash16}"
     else:
         if not validate_api_key(api_key, expected_api_key):
-            return _json_response({"error": "Unauthorized"}, 401)
+            guest_ok = (
+                _guest_run_enabled(allow_guest_run)
+                and route in _GUEST_ROUTES
+                and method == "POST"
+                and origin_allowed(origin, allowed_origin)
+            )
+            if not guest_ok:
+                return _json_response({"error": "Unauthorized"}, 401)
         # -- Rate limit -------------------------------------------------------
         # Bucket by hash prefix — raw secrets never sit in isolate memory
         # as map keys (mirrors the tenant path's tenant:{hash16} bucket).
