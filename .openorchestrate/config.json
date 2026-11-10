@@ -3,7 +3,7 @@
   "project": {
     "id": "pyne-worker",
     "name": "pyne-worker",
-    "description": "PYNE edge evaluate host \u2014 Python Cloudflare Worker. Full language toolchain lives in hoox-sh/pyne.",
+    "description": "PYNE edge evaluate host — Python Cloudflare Worker. Full language toolchain lives in hoox-sh/pyne.",
     "kind": "project",
     "languages": [
       "Python",
