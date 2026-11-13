@@ -35,12 +35,12 @@ def _make_bars(n: int = 50) -> list[dict]:
         o = round(price, 2)
         c = round(price + (1 if i % 3 else -0.5), 2)
         h = round(max(o, c) + 0.8, 2)
-        l = round(min(o, c) - 0.8, 2)
+        low = round(min(o, c) - 0.8, 2)
         bars.append(
             {
                 "open": o,
                 "high": h,
-                "low": max(l, 0.01),
+                "low": max(low, 0.01),
                 "close": c,
                 "time": 1_000_000 + i * 86_400_000,
                 "volume": 1000.0 + i,

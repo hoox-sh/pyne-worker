@@ -22,12 +22,12 @@ def _bars(n: int = 20) -> list[dict]:
         o = price
         c = price + (1.0 if i % 2 == 0 else -0.5)
         h = max(o, c) + 0.5
-        l = min(o, c) - 0.5
+        low = min(o, c) - 0.5
         out.append(
             {
                 "open": o,
                 "high": h,
-                "low": l,
+                "low": low,
                 "close": c,
                 "time": 1_700_000_000 + i * 86_400,
                 "volume": 1000.0,

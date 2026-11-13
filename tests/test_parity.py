@@ -64,7 +64,7 @@ _PYNESCRIPT_ROOT_STR = str(_PYNESCRIPT_ROOT)
 if _PYNESCRIPT_ROOT.exists() and _PYNESCRIPT_ROOT_STR not in sys.path:
     sys.path.insert(0, _PYNESCRIPT_ROOT_STR)
 
-from tests.fixtures.parity.ohlcv import OHLCV  # type: ignore[import-untyped]
+from tests.fixtures.parity.ohlcv import OHLCV  # type: ignore[import-untyped]  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
