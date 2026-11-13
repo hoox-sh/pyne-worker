@@ -30,6 +30,8 @@ packages = ["src"]
 # Vendored third-party wheels (antlr4, certifi, idna, pynescript) are not ours to
 # reformat or lint; they ship with their own style.
 exclude = ["python_modules"]
+# Explicitly-passed vendored files (pre-commit passes staged paths) must stay excluded too.
+force-exclude = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
