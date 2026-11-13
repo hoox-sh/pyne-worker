@@ -162,7 +162,9 @@ class TestVerifyTenant:
         monkeypatch.setattr(tv, "_fetch_json_get", fake)
         assert (await tv.verify_tenant(_CONSOLE, _TENANT_KEY)).outcome == "degraded"
 
-    async def test_console_429_maps_to_limited_with_body_retry_after(self, monkeypatch) -> None:
+    async def test_console_429_maps_to_limited_with_body_retry_after(
+        self, monkeypatch
+    ) -> None:
         fake, _ = _fake_get(429, {"ok": False, "retry_after": 45})
         monkeypatch.setattr(tv, "_fetch_json_get", fake)
         result = await tv.verify_tenant(_CONSOLE, _TENANT_KEY)
@@ -302,10 +304,15 @@ class TestVerifyWiring:
             console_url=_CONSOLE,
         )
         assert status == 429
-        assert payload == {"ok": False, "error": {"code": "usage.quota_exceeded", "retry_after": 45}}
+        assert payload == {
+            "ok": False,
+            "error": {"code": "usage.quota_exceeded", "retry_after": 45},
+        }
         assert headers.get("Retry-After") == "45"
 
-    async def test_console_429_without_retry_after_omits_header(self, monkeypatch) -> None:
+    async def test_console_429_without_retry_after_omits_header(
+        self, monkeypatch
+    ) -> None:
         fake, _ = _fake_get(429, {"ok": False})
         monkeypatch.setattr(tv, "_fetch_json_get", fake)
         payload, status, headers = await handle_request(
@@ -504,7 +511,13 @@ class TestUsageFlush:
                     "symbol": "BTCUSDT",
                     "timeframe": "1d",
                     "bars": [
-                        {"open": 100, "high": 105, "low": 95, "close": 102, "time": 1000},
+                        {
+                            "open": 100,
+                            "high": 105,
+                            "low": 95,
+                            "close": 102,
+                            "time": 1000,
+                        },
                     ],
                 }
             ),

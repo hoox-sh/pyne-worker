@@ -79,7 +79,11 @@ def _optional_price(event: dict[str, Any]) -> float | None:
 
 
 def _optional_order_type(event: dict[str, Any]) -> str | None:
-    raw = event.get("orderType") if event.get("orderType") is not None else event.get("order_type")
+    raw = (
+        event.get("orderType")
+        if event.get("orderType") is not None
+        else event.get("order_type")
+    )
     if raw is None:
         return None
     s = str(raw).strip()
@@ -119,12 +123,12 @@ def _idempotency_key(
     direction = event.get("direction") or ""
     action = payload.get("action") or ""
     bar_index = event.get("bar_index")
-    bar_time = event.get("time") if event.get("time") is not None else event.get("bar_time")
+    bar_time = (
+        event.get("time") if event.get("time") is not None else event.get("bar_time")
+    )
 
     if script_id or kind or bar_index is not None or bar_time is not None:
-        return (
-            f"pyne:{script_id}:{symbol}:{kind}:{direction}:{bar_index}:{bar_time}:{action}"
-        )
+        return f"pyne:{script_id}:{symbol}:{kind}:{direction}:{bar_index}:{bar_time}:{action}"
 
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
@@ -195,9 +199,13 @@ def _map_event_to_payload(
 
     if kind == "entry":
         if direction == "long":
-            return _decorate_payload({**base, "action": "LONG"}, event, default_leverage=default_leverage)
+            return _decorate_payload(
+                {**base, "action": "LONG"}, event, default_leverage=default_leverage
+            )
         if direction == "short":
-            return _decorate_payload({**base, "action": "SHORT"}, event, default_leverage=default_leverage)
+            return _decorate_payload(
+                {**base, "action": "SHORT"}, event, default_leverage=default_leverage
+            )
         return None
 
     if kind in ("close", "exit"):
@@ -231,9 +239,13 @@ def _map_event_to_payload(
 
     if kind == "order":
         if direction == "long":
-            return _decorate_payload({**base, "action": "LONG"}, event, default_leverage=default_leverage)
+            return _decorate_payload(
+                {**base, "action": "LONG"}, event, default_leverage=default_leverage
+            )
         if direction == "short":
-            return _decorate_payload({**base, "action": "SHORT"}, event, default_leverage=default_leverage)
+            return _decorate_payload(
+                {**base, "action": "SHORT"}, event, default_leverage=default_leverage
+            )
         return None
 
     return None

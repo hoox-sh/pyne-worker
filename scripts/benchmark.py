@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -130,10 +129,19 @@ def run_and_measure(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark pyne-worker Runtime")
-    parser.add_argument("--duration", type=int, default=300, help="Target duration in seconds")
+    parser.add_argument(
+        "--duration", type=int, default=300, help="Target duration in seconds"
+    )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
-    parser.add_argument("--iterations", type=int, default=0, help="Override: fixed iterations (disables duration)")
-    parser.add_argument("--csv", default=str(_PROJECT / "benchmark_results.csv"), help="Output CSV path")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=0,
+        help="Override: fixed iterations (disables duration)",
+    )
+    parser.add_argument(
+        "--csv", default=str(_PROJECT / "benchmark_results.csv"), help="Output CSV path"
+    )
     args = parser.parse_args()
 
     from pynescript_backend import Runtime
@@ -163,7 +171,9 @@ def main() -> None:
         elapsed = time.perf_counter() - t0
         est_per_run = elapsed / 5
         n = max(10, int(args.duration / est_per_run))
-        print(f"  ~{est_per_run * 1000:.1f} ms/run → {n} iterations in {args.duration}s")
+        print(
+            f"  ~{est_per_run * 1000:.1f} ms/run → {n} iterations in {args.duration}s"
+        )
 
     # Run benchmark for each script
     results: list[dict] = []
@@ -179,7 +189,17 @@ def main() -> None:
 
     # Write CSV
     csv_path = Path(args.csv)
-    fieldnames = ["script", "n", "bars", "errors", "total_ms", "avg_ms", "min_ms", "max_ms", "runs_per_minute"]
+    fieldnames = [
+        "script",
+        "n",
+        "bars",
+        "errors",
+        "total_ms",
+        "avg_ms",
+        "min_ms",
+        "max_ms",
+        "runs_per_minute",
+    ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

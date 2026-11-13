@@ -100,9 +100,7 @@ def _run_one(args: tuple[str, str, int]) -> tuple[str, str, str, int]:
         if n_bars not in _BARS_CACHE:
             _BARS_CACHE[n_bars] = _make_bars(n_bars)
         run_mode = "compile" if mode == "compile" else "interpret"
-        result = Runtime(symbol="BTCUSDT").run(
-            src, _BARS_CACHE[n_bars], mode=run_mode
-        )
+        result = Runtime(symbol="BTCUSDT").run(src, _BARS_CACHE[n_bars], mode=run_mode)
         ms = int((time.perf_counter() - t0) * 1000)
         err = result.get("error")
         if err:
@@ -262,7 +260,9 @@ def main() -> None:
 
     t_all = time.perf_counter()
     mode_w = "a" if (args.resume and args.out.exists()) else "w"
-    write_header = mode_w == "w" or not args.out.exists() or args.out.stat().st_size == 0
+    write_header = (
+        mode_w == "w" or not args.out.exists() or args.out.stat().st_size == 0
+    )
     summary_path = args.out.with_name(args.out.stem + "_summary.txt")
     done_new = 0
     total_new = len(files)
@@ -376,7 +376,13 @@ def main() -> None:
                     err_bucket[error[:100]] += 1
 
                 w.writerow(
-                    {"file": rel, "set": set_name, "status": status, "ms": ms, "error": error}
+                    {
+                        "file": rel,
+                        "set": set_name,
+                        "status": status,
+                        "ms": ms,
+                        "error": error,
+                    }
                 )
                 done_new += 1
                 if done_new % 10 == 0:

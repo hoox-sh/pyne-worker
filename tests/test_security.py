@@ -63,7 +63,7 @@ class TestSanitizeErrorForResponse:
     def test_keeps_last_non_trace_line(self) -> None:
         assert (
             sanitize_error_for_response(
-                "Traceback (most recent call last):\nFile \"/tmp/x.py\", line 1\nboom"
+                'Traceback (most recent call last):\nFile "/tmp/x.py", line 1\nboom'
             )
             == "boom"
         )
@@ -108,7 +108,9 @@ class TestWebhookUrl:
         assert validate_webhook_url("https://3232235777/hook") is None
         assert validate_webhook_url("https://[::ffff:127.0.0.1]/hook") is None
         assert validate_webhook_url("https://[::ffff:10.0.0.5]/hook") is None
-        assert validate_webhook_url("https://[2002:7f00:1::]/hook") is None  # 6to4 → 127.0.0.1
+        assert (
+            validate_webhook_url("https://[2002:7f00:1::]/hook") is None
+        )  # 6to4 → 127.0.0.1
 
     def test_public_literal_ip_ok(self) -> None:
         assert validate_webhook_url("https://8.8.8.8/hook") == "https://8.8.8.8/hook"

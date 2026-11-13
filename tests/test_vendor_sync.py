@@ -29,7 +29,10 @@ _SIBLING_CANDIDATES = (
     Path("/home/jango/Git/pynescript/src/pynescript"),
     Path("/mnt/data/home/jango/Git/pynescript/src/pynescript"),
 )
-_SIBLING_PKG = next((p for p in _SIBLING_CANDIDATES if (p / "__about__.py").is_file()), _SIBLING_CANDIDATES[0])
+_SIBLING_PKG = next(
+    (p for p in _SIBLING_CANDIDATES if (p / "__about__.py").is_file()),
+    _SIBLING_CANDIDATES[0],
+)
 
 _VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.M)
 

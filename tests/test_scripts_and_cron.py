@@ -47,7 +47,9 @@ class FakeR2Bucket:
         return await self.get(key)
 
 
-def _bars(n: int = 5, start_time: int = 1_700_000_000_000, step_ms: int = 60_000) -> list[dict[str, Any]]:
+def _bars(
+    n: int = 5, start_time: int = 1_700_000_000_000, step_ms: int = 60_000
+) -> list[dict[str, Any]]:
     out = []
     for i in range(n):
         c = 100.0 + i
@@ -114,7 +116,9 @@ class TestRunMode:
         assert status == 200
         assert body["bars"] == 4
         # auto may be compile or interpret depending on numba
-        assert body.get("mode") in ("compile", "interpret", "auto") or body.get("auto_backend") in (
+        assert body.get("mode") in ("compile", "interpret", "auto") or body.get(
+            "auto_backend"
+        ) in (
             "compile",
             "interpret",
             None,
@@ -349,7 +353,9 @@ class TestNormalizeLibraries:
         out = normalize_libraries(
             [{"namespace": "ns", "name": "Lib", "version": "2", "source": "x = 1"}]
         )
-        assert out == [{"namespace": "ns", "name": "Lib", "version": 2, "source": "x = 1"}]
+        assert out == [
+            {"namespace": "ns", "name": "Lib", "version": 2, "source": "x = 1"}
+        ]
 
     def test_rejects_non_list(self) -> None:
         with pytest.raises(ValueError, match="must be a list"):

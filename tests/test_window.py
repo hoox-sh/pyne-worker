@@ -14,7 +14,6 @@ Two properties matter and are pinned here:
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 from handler import handle_request
@@ -33,7 +32,9 @@ def _envelope(n: int = 10) -> dict:
         "series": {"plot_0": list(range(n)), "plot_1": [v * 2 for v in range(n)]},
         "plots": list(range(n)),
         "times": [1_700_000_000 + i * 86_400 for i in range(n)],
-        "events": [{"kind": "entry", "bar_index": i, "direction": "long"} for i in range(n)],
+        "events": [
+            {"kind": "entry", "bar_index": i, "direction": "long"} for i in range(n)
+        ],
         "drawings": [{"id": f"d{i}", "bar_index": i} for i in range(n)],
         "alerts": [{"message": "m", "bar_index": i} for i in range(n)],
         "meta": {"profile": {"bars": n, "total_ms": 12.5}},

@@ -126,9 +126,7 @@ def dispatch_ast(op: str, data: dict[str, Any]) -> dict[str, Any]:
             if errors:
                 result["ok"] = False
                 result["error"] = errors[0].get("message") or "diagnostics error"
-                result["kind"] = (
-                    "parse" if errors[0].get("code") == "parse" else "lint"
-                )
+                result["kind"] = "parse" if errors[0].get("code") == "parse" else "lint"
                 if errors[0].get("line") is not None:
                     result["line"] = errors[0].get("line")
                 if errors[0].get("column") is not None:

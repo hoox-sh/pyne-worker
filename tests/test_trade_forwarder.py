@@ -72,7 +72,9 @@ class TestNormalizeExchange:
 
 class TestMapEvent:
     def test_long_entry(self) -> None:
-        p = _map_event_to_payload(_ev(kind="entry", direction="long", qty=0.5), "BTCUSDT")
+        p = _map_event_to_payload(
+            _ev(kind="entry", direction="long", qty=0.5), "BTCUSDT"
+        )
         assert isinstance(p, dict)
         assert p["action"] == "LONG"
         assert p["quantity"] == 0.5
@@ -80,7 +82,9 @@ class TestMapEvent:
         assert p["symbol"] == "BTCUSDT"
 
     def test_short_entry(self) -> None:
-        p = _map_event_to_payload(_ev(kind="entry", direction="short", qty=1.2), "ETHUSDT")
+        p = _map_event_to_payload(
+            _ev(kind="entry", direction="short", qty=1.2), "ETHUSDT"
+        )
         assert isinstance(p, dict)
         assert p["action"] == "SHORT"
         assert p["quantity"] == 1.2

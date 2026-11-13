@@ -332,7 +332,9 @@ def main() -> None:
 
         for year, year_bars in by_year.items():
             # Write to local file
-            output_path = os.path.join(args.output_dir, symbol, args.timeframe, f"{year}.jsonl.gz")
+            output_path = os.path.join(
+                args.output_dir, symbol, args.timeframe, f"{year}.jsonl.gz"
+            )
             n = write_jsonl_gz(year_bars, output_path)
             total_bars += n
             print(f"  Wrote {n} bars to {output_path}")
@@ -340,9 +342,14 @@ def main() -> None:
         # Upload via /ingest if configured
         if args.ingest_url:
             if not args.api_key:
-                print("  Skipping upload: --api-key required with --ingest-url", file=sys.stderr)
+                print(
+                    "  Skipping upload: --api-key required with --ingest-url",
+                    file=sys.stderr,
+                )
             else:
-                upload_via_ingest(bars, symbol, args.timeframe, args.ingest_url, args.api_key)
+                upload_via_ingest(
+                    bars, symbol, args.timeframe, args.ingest_url, args.api_key
+                )
 
     print(f"\nDone. Total bars fetched: {total_bars}")
 

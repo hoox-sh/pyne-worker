@@ -208,7 +208,9 @@ async def put_script(bucket: Any, record: dict[str, Any]) -> dict[str, Any]:
             )
         stored["webhook_url"] = safe_wh
     # Optional exchange for trade-forward (alphanumeric + underscore)
-    exch = sanitize_exchange(str(record["exchange"]) if record.get("exchange") is not None else None)
+    exch = sanitize_exchange(
+        str(record["exchange"]) if record.get("exchange") is not None else None
+    )
     if exch is not None:
         stored["exchange"] = exch
 
@@ -328,7 +330,9 @@ async def load_cron_jobs(bucket: Any) -> list[dict[str, Any]]:
     return derived
 
 
-async def put_cron_jobs(bucket: Any, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def put_cron_jobs(
+    bucket: Any, jobs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     cleaned: list[dict[str, Any]] = []
     for j in jobs:
         if not isinstance(j, dict):
@@ -365,7 +369,9 @@ async def put_cron_jobs(bucket: Any, jobs: list[dict[str, Any]]) -> list[dict[st
             if safe_wh is not None:
                 entry["webhook_url"] = safe_wh
             # Invalid webhook silently dropped (fail-closed for SSRF)
-        exch = sanitize_exchange(str(j["exchange"]) if j.get("exchange") is not None else None)
+        exch = sanitize_exchange(
+            str(j["exchange"]) if j.get("exchange") is not None else None
+        )
         if exch is not None:
             entry["exchange"] = exch
         cleaned.append(entry)

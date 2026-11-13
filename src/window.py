@@ -92,7 +92,9 @@ def _slice_bars(value: Any, lo: int, hi: int) -> Any:
     if isinstance(value, list):
         return value[lo : hi + 1]
     if isinstance(value, dict):
-        return {k: (v[lo : hi + 1] if isinstance(v, list) else v) for k, v in value.items()}
+        return {
+            k: (v[lo : hi + 1] if isinstance(v, list) else v) for k, v in value.items()
+        }
     return value
 
 

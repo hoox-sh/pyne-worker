@@ -68,7 +68,9 @@ R2TEST_BARS = 60
 # ---------------------------------------------------------------------------
 
 
-def make_bars(n: int = 200, base_ms: int = BARS_BASE_MS, step_ms: int = 60_000) -> list[dict[str, Any]]:
+def make_bars(
+    n: int = 200, base_ms: int = BARS_BASE_MS, step_ms: int = 60_000
+) -> list[dict[str, Any]]:
     """Deterministic OHLCV: sine wave (~8 strategy crossovers over 200 bars)."""
     bars: list[dict[str, Any]] = []
     prev = 100.0
@@ -107,7 +109,9 @@ DRAWINGS = (
     "    line.new(bar_index - 5, low, bar_index, high)\nplot(close)"
 )
 LIBRARY_SRC = "//@version=6\nlibrary('LiveLib')\nexport const float FOO = 1.5"
-USE_LIBRARY = "//@version=6\nindicator('live-lib')\nimport ns/LiveLib/1 as x\nplot(x.FOO)"
+USE_LIBRARY = (
+    "//@version=6\nindicator('live-lib')\nimport ns/LiveLib/1 as x\nplot(x.FOO)"
+)
 INPUTS_SCRIPT = (
     "//@version=6\nindicator('live-inputs')\n"
     "len = input.int(20, 'Length')\nplot(ta.sma(close, len))"
@@ -155,7 +159,11 @@ class Client:
         auth: bool = True,
         key: str | None = None,
     ) -> HttpResult:
-        data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
+        data = (
+            json.dumps(body, separators=(",", ":")).encode()
+            if body is not None
+            else None
+        )
         headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
         if data is not None:
             headers["Content-Type"] = "application/json"
@@ -168,7 +176,9 @@ class Client:
             attempts += 1
             started = time.perf_counter()
             try:
-                req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+                req = urllib.request.Request(
+                    self.base + path, data=data, headers=headers, method=method
+                )
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw = resp.read()
                     status: int | None = resp.status
@@ -179,7 +189,9 @@ class Client:
                 hdrs = exc.headers
             except Exception as exc:  # noqa: BLE001 — URLError/timeout/etc.
                 ms = (time.perf_counter() - started) * 1000
-                return HttpResult(None, None, ms, f"{type(exc).__name__}: {exc}", attempts)
+                return HttpResult(
+                    None, None, ms, f"{type(exc).__name__}: {exc}", attempts
+                )
 
             ms = (time.perf_counter() - started) * 1000
             parsed: dict[str, Any] | None = None
@@ -252,7 +264,9 @@ def _error_of(r: HttpResult) -> str:
 
 
 class Suite:
-    def __init__(self, client: Client, default_repeat: int, quiet: bool = False) -> None:
+    def __init__(
+        self, client: Client, default_repeat: int, quiet: bool = False
+    ) -> None:
         self.client = client
         self.default_repeat = default_repeat
         self.quiet = quiet
@@ -272,7 +286,12 @@ class Suite:
         skip_reason: str | None = None,
     ) -> None:
         self.cases.append(
-            Case(name=name, fn=fn, repeat=self.default_repeat if repeat is None else repeat, skip_reason=skip_reason)
+            Case(
+                name=name,
+                fn=fn,
+                repeat=self.default_repeat if repeat is None else repeat,
+                skip_reason=skip_reason,
+            )
         )
 
     # -- used by case functions -------------------------------------------
@@ -379,7 +398,9 @@ def case_cors_preflight(s: Suite) -> Outcome:
     }
     started = time.perf_counter()
     try:
-        req = urllib.request.Request(s.client.base + "/run", headers=headers, method="OPTIONS")
+        req = urllib.request.Request(
+            s.client.base + "/run", headers=headers, method="OPTIONS"
+        )
         with urllib.request.urlopen(req, timeout=s.client.timeout) as resp:
             status = resp.status
             acao = resp.headers.get("Access-Control-Allow-Origin")
@@ -406,7 +427,11 @@ def case_cors_preflight(s: Suite) -> Outcome:
 
     health_req = urllib.request.Request(
         s.client.base + "/health",
-        headers={"Origin": origin, "User-Agent": USER_AGENT, "Accept": "application/json"},
+        headers={
+            "Origin": origin,
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
         method="GET",
     )
     try:
@@ -431,12 +456,19 @@ def case_auth_missing(s: Suite) -> Outcome:
     if r.status == 401:
         return Outcome.passed("no key → 401")
     if r.status == 200:
-        return Outcome.failed("200 without a key — API_KEY looks unset on the worker (dev mode)")
+        return Outcome.failed(
+            "200 without a key — API_KEY looks unset on the worker (dev mode)"
+        )
     return Outcome.failed(f"expected 401, got {r.status}: {_error_of(r)}")
 
 
 def case_auth_wrong(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(5)}, key="live-test-wrong-key")
+    r = s.request(
+        "POST",
+        "/run",
+        {"script": SIMPLE, "ohlcv": make_bars(5)},
+        key="live-test-wrong-key",
+    )
     if r.status != 401:
         return Outcome.failed(f"expected 401, got {r.status}: {_error_of(r)}")
     return Outcome.passed("bad key → 401")
@@ -459,13 +491,17 @@ def case_run_interpret(s: Suite) -> Outcome:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
     body = r.body or {}
     if body.get("status") != "success":
-        return Outcome.failed(f"status={body.get('status')!r} error={body.get('error')!r}")
+        return Outcome.failed(
+            f"status={body.get('status')!r} error={body.get('error')!r}"
+        )
     if body.get("bars") != 200:
         return Outcome.failed(f"bars={body.get('bars')!r} (expected 200)")
     series = body.get("series") or {}
     plot0 = series.get("plot_0")
     if not isinstance(plot0, list) or len(plot0) != 200:
-        return Outcome.failed(f"series.plot_0 length={len(plot0) if isinstance(plot0, list) else plot0!r}")
+        return Outcome.failed(
+            f"series.plot_0 length={len(plot0) if isinstance(plot0, list) else plot0!r}"
+        )
     if not body.get("plots"):
         return Outcome.failed("empty plots vector")
     profile = body.get("profile") or {}
@@ -487,7 +523,9 @@ def case_run_strategy(s: Suite) -> Outcome:
     if "kind" not in first or not isinstance(first.get("bar_index"), int):
         return Outcome.failed(f"event shape unexpected: {json.dumps(first)[:120]}")
     kinds = sorted({e.get("kind") for e in events if isinstance(e, dict)})
-    return Outcome.passed(f"events={len(events)} (kinds: {', '.join(str(k) for k in kinds)})")
+    return Outcome.passed(
+        f"events={len(events)} (kinds: {', '.join(str(k) for k in kinds)})"
+    )
 
 
 def case_run_alerts(s: Suite) -> Outcome:
@@ -503,7 +541,9 @@ def case_run_alerts(s: Suite) -> Outcome:
     titled = [c for c in conditions if isinstance(c, dict) and c.get("title") == "X"]
     if not titled:
         return Outcome.failed("alertcondition 'X' not present in alert_conditions")
-    return Outcome.passed(f"alerts={len(alerts)} · alert_conditions={len(conditions)} (title 'X' present)")
+    return Outcome.passed(
+        f"alerts={len(alerts)} · alert_conditions={len(conditions)} (title 'X' present)"
+    )
 
 
 def case_run_drawings(s: Suite) -> Outcome:
@@ -515,11 +555,17 @@ def case_run_drawings(s: Suite) -> Outcome:
     if not drawings:
         return Outcome.failed("no drawings exported")
     types = sorted({d.get("type") for d in drawings if isinstance(d, dict)})
-    return Outcome.passed(f"drawings={len(drawings)} (types: {', '.join(str(t) for t in types)})")
+    return Outcome.passed(
+        f"drawings={len(drawings)} (types: {', '.join(str(t) for t in types)})"
+    )
 
 
 def case_run_window(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(200), "from_bar": -10, "to_bar": -1})
+    r = s.request(
+        "POST",
+        "/run",
+        {"script": SIMPLE, "ohlcv": make_bars(200), "from_bar": -10, "to_bar": -1},
+    )
     s.engine(_engine_ms(r))
     if r.status != 200:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
@@ -533,14 +579,24 @@ def case_run_window(s: Suite) -> Outcome:
         return Outcome.failed(f"series.plot_0 length={len(plot0)} (expected 10)")
     meta_profile = (body.get("meta") or {}).get("profile") or {}
     if not meta_profile.get("windowed") or meta_profile.get("bars") != 10:
-        return Outcome.failed(f"meta.profile not marked windowed: {json.dumps(meta_profile)[:120]}")
+        return Outcome.failed(
+            f"meta.profile not marked windowed: {json.dumps(meta_profile)[:120]}"
+        )
     if (body.get("profile") or {}).get("bars") != 200:
-        return Outcome.failed("top-level profile.bars must stay the full length (only meta.profile is windowed)")
-    return Outcome.passed("200→10 bars · meta.profile.windowed · profile.bars stays 200")
+        return Outcome.failed(
+            "top-level profile.bars must stay the full length (only meta.profile is windowed)"
+        )
+    return Outcome.passed(
+        "200→10 bars · meta.profile.windowed · profile.bars stays 200"
+    )
 
 
 def case_run_window_full(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(50), "from_bar": 0, "to_bar": 49})
+    r = s.request(
+        "POST",
+        "/run",
+        {"script": SIMPLE, "ohlcv": make_bars(50), "from_bar": 0, "to_bar": 49},
+    )
     s.engine(_engine_ms(r))
     if r.status != 200:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
@@ -550,7 +606,9 @@ def case_run_window_full(s: Suite) -> Outcome:
 
 
 def case_run_window_validation(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(10), "from_bar": True})
+    r = s.request(
+        "POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(10), "from_bar": True}
+    )
     if r.status != 400:
         return Outcome.failed(f"expected 400 for boolean from_bar, got {r.status}")
     if "from_bar" not in str((r.body or {}).get("error") or ""):
@@ -566,7 +624,14 @@ def case_run_libraries(s: Suite) -> Outcome:
             "script": USE_LIBRARY,
             "ohlcv": make_bars(20),
             "mode": "interpret",
-            "libraries": [{"namespace": "ns", "name": "LiveLib", "version": 1, "source": LIBRARY_SRC}],
+            "libraries": [
+                {
+                    "namespace": "ns",
+                    "name": "LiveLib",
+                    "version": 1,
+                    "source": LIBRARY_SRC,
+                }
+            ],
         },
     )
     s.engine(_engine_ms(r))
@@ -574,7 +639,9 @@ def case_run_libraries(s: Suite) -> Outcome:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
     plot0 = ((r.body or {}).get("series") or {}).get("plot_0") or []
     if len(plot0) != 20 or plot0[0] != 1.5:
-        return Outcome.failed(f"library export not plotted: first={plot0[:1]!r} len={len(plot0)}")
+        return Outcome.failed(
+            f"library export not plotted: first={plot0[:1]!r} len={len(plot0)}"
+        )
     return Outcome.passed("import ns/LiveLib/1 → FOO=1.5 plotted")
 
 
@@ -582,12 +649,21 @@ def case_run_inputs(s: Suite) -> Outcome:
     override = s.request(
         "POST",
         "/run",
-        {"script": INPUTS_SCRIPT, "ohlcv": make_bars(30), "mode": "interpret", "inputs": {"Length": 5}},
+        {
+            "script": INPUTS_SCRIPT,
+            "ohlcv": make_bars(30),
+            "mode": "interpret",
+            "inputs": {"Length": 5},
+        },
     )
     s.engine(_engine_ms(override))
     if override.status != 200:
         return Outcome.failed(f"override run: {override.status}: {_error_of(override)}")
-    default = s.request("POST", "/run", {"script": INPUTS_SCRIPT, "ohlcv": make_bars(30), "mode": "interpret"})
+    default = s.request(
+        "POST",
+        "/run",
+        {"script": INPUTS_SCRIPT, "ohlcv": make_bars(30), "mode": "interpret"},
+    )
     s.engine(_engine_ms(default))
     if default.status != 200:
         return Outcome.failed(f"default run: {default.status}: {_error_of(default)}")
@@ -604,7 +680,9 @@ def case_run_inputs(s: Suite) -> Outcome:
 
 
 def case_run_mode_auto(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(100), "mode": "auto"})
+    r = s.request(
+        "POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(100), "mode": "auto"}
+    )
     s.engine(_engine_ms(r))
     if r.status != 200:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
@@ -618,14 +696,24 @@ def case_run_mode_auto(s: Suite) -> Outcome:
 
 
 def case_run_mode_compile(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(100), "mode": "compile"})
+    r = s.request(
+        "POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(100), "mode": "compile"}
+    )
     s.engine(_engine_ms(r))
     if r.status == 200:
         return Outcome.passed("compiled natively (numpy toolchain present)")
     body = r.body or {}
-    if r.status == 500 and body.get("error_kind") == "compile" and "unavailable" in str(body.get("error", "")):
-        return Outcome.passed("structured 'compile unavailable' contract (edge runtime ships no numpy)")
-    return Outcome.failed(f"{r.status}: {_error_of(r)} (expected 200 or a structured compile error)")
+    if (
+        r.status == 500
+        and body.get("error_kind") == "compile"
+        and "unavailable" in str(body.get("error", ""))
+    ):
+        return Outcome.passed(
+            "structured 'compile unavailable' contract (edge runtime ships no numpy)"
+        )
+    return Outcome.failed(
+        f"{r.status}: {_error_of(r)} (expected 200 or a structured compile error)"
+    )
 
 
 def case_run_parse_error(s: Suite) -> Outcome:
@@ -652,7 +740,12 @@ def case_run_timeframe(s: Suite) -> Outcome:
     r = s.request(
         "POST",
         "/run",
-        {"script": script, "ohlcv": make_bars(20), "timeframe": "15m", "mode": "interpret"},
+        {
+            "script": script,
+            "ohlcv": make_bars(20),
+            "timeframe": "15m",
+            "mode": "interpret",
+        },
     )
     s.engine(_engine_ms(r))
     if r.status != 200:
@@ -661,7 +754,9 @@ def case_run_timeframe(s: Suite) -> Outcome:
     sec = series.get("sec") or []
     minutes = series.get("minutes") or []
     if not sec or sec[-1] != 900:
-        return Outcome.failed(f"timeframe.in_seconds last={sec[-1:]!r} (expected 900 for 15m)")
+        return Outcome.failed(
+            f"timeframe.in_seconds last={sec[-1:]!r} (expected 900 for 15m)"
+        )
     if not minutes or minutes[-1] != 1:
         return Outcome.failed(f"timeframe.isminutes last={minutes[-1:]!r}")
     return Outcome.passed("15m → timeframe.in_seconds=900")
@@ -680,14 +775,21 @@ def case_run_realtime(s: Suite) -> Outcome:
     r = s.request(
         "POST",
         "/run",
-        {"script": script, "ohlcv": make_bars(12), "realtime_last_bar": True, "mode": "interpret"},
+        {
+            "script": script,
+            "ohlcv": make_bars(12),
+            "realtime_last_bar": True,
+            "mode": "interpret",
+        },
     )
     s.engine(_engine_ms(r))
     if r.status != 200:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
     series = (r.body or {}).get("series") or {}
     if (series.get("v") or [None])[-1] != 12 or (series.get("vip") or [None])[-1] != 1:
-        return Outcome.failed(f"varip not re-inited: v={series.get('v')} vip={series.get('vip')}")
+        return Outcome.failed(
+            f"varip not re-inited: v={series.get('v')} vip={series.get('vip')}"
+        )
     return Outcome.passed("realtime_last_bar re-inits varip (vip=1, v=12)")
 
 
@@ -709,18 +811,27 @@ def case_run_webhook_blocked(s: Suite) -> Outcome:
 
 
 def case_run_timeout(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "ohlcv": make_bars(10_000), "timeout_seconds": 0.001})
+    r = s.request(
+        "POST",
+        "/run",
+        {"script": SIMPLE, "ohlcv": make_bars(10_000), "timeout_seconds": 0.001},
+    )
     s.engine(_engine_ms(r))
     if r.status != 504:
         return Outcome.failed(f"expected 504, got {r.status}")
     body = r.body or {}
-    if body.get("error_kind") != "runtime" or "timed out" not in str(body.get("error", "")).lower():
+    if (
+        body.get("error_kind") != "runtime"
+        or "timed out" not in str(body.get("error", "")).lower()
+    ):
         return Outcome.failed(f"unexpected timeout contract: {json.dumps(body)[:160]}")
     return Outcome.passed("wall-clock budget → 504 timed out · error_kind=runtime")
 
 
 def case_run_r2_nodata(s: Suite) -> Outcome:
-    r = s.request("POST", "/run", {"script": SIMPLE, "symbol": "NODATA42", "timeframe": "1d"})
+    r = s.request(
+        "POST", "/run", {"script": SIMPLE, "symbol": "NODATA42", "timeframe": "1d"}
+    )
     s.engine(_engine_ms(r))
     if r.status == 501:
         return Outcome.failed("R2 not configured on the worker")
@@ -736,14 +847,22 @@ def case_r2_ingest(s: Suite) -> Outcome:
     r = s.request(
         "POST",
         "/ingest",
-        {"symbol": R2TEST_SYMBOL, "timeframe": R2TEST_TIMEFRAME, "bars": make_bars(R2TEST_BARS)},
+        {
+            "symbol": R2TEST_SYMBOL,
+            "timeframe": R2TEST_TIMEFRAME,
+            "bars": make_bars(R2TEST_BARS),
+        },
     )
     if r.status != 200:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
     body = r.body or {}
     if body.get("ingested") != R2TEST_BARS:
-        return Outcome.failed(f"ingested={body.get('ingested')!r} (expected {R2TEST_BARS})")
-    return Outcome.passed(f"{R2TEST_SYMBOL}/{R2TEST_TIMEFRAME} · ingested={body.get('ingested')}")
+        return Outcome.failed(
+            f"ingested={body.get('ingested')!r} (expected {R2TEST_BARS})"
+        )
+    return Outcome.passed(
+        f"{R2TEST_SYMBOL}/{R2TEST_TIMEFRAME} · ingested={body.get('ingested')}"
+    )
 
 
 def case_r2_roundtrip(s: Suite) -> Outcome:
@@ -767,7 +886,9 @@ def case_r2_roundtrip(s: Suite) -> Outcome:
 
 
 def case_feed_refresh(s: Suite) -> Outcome:
-    r = s.request("POST", "/feed/refresh", {"symbol": "BTCUSDT", "timeframe": "1m", "limit": 3})
+    r = s.request(
+        "POST", "/feed/refresh", {"symbol": "BTCUSDT", "timeframe": "1m", "limit": 3}
+    )
     if r.status != 200:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
     feed = (r.body or {}).get("feed") or []
@@ -814,13 +935,15 @@ def case_scripts_lifecycle(s: Suite) -> Outcome:
             return Outcome.failed(failure or "")
 
         r = s.request("GET", "/scripts")
-        listed = (
-            r.status == 200
-            and any(isinstance(item, dict) and item.get("id") == sid for item in (r.body or {}).get("scripts") or [])
+        listed = r.status == 200 and any(
+            isinstance(item, dict) and item.get("id") == sid
+            for item in (r.body or {}).get("scripts") or []
         )
         steps.append(f"list={'found' if listed else 'missing'}")
         if not step("list-http", r.status, 200) or not listed:
-            return Outcome.failed(failure or "deployed script missing from GET /scripts")
+            return Outcome.failed(
+                failure or "deployed script missing from GET /scripts"
+            )
 
         r = s.request("GET", f"/scripts/{sid}")
         if not step("get", r.status, 200):
@@ -832,8 +955,13 @@ def case_scripts_lifecycle(s: Suite) -> Outcome:
         r = s.request("POST", "/run", {"script_id": sid, "ohlcv": make_bars(50)})
         s.engine(_engine_ms(r))
         body = r.body or {}
-        if not step("run-by-id-http", r.status, 200) or body.get("deployed_script_id") != sid:
-            return Outcome.failed(failure or "script_id run did not resolve to the deployed record")
+        if (
+            not step("run-by-id-http", r.status, 200)
+            or body.get("deployed_script_id") != sid
+        ):
+            return Outcome.failed(
+                failure or "script_id run did not resolve to the deployed record"
+            )
 
         r = s.request("DELETE", f"/scripts/{sid}")
         deleted = r.status == 200
@@ -868,11 +996,17 @@ def case_cron_run(s: Suite) -> Outcome:
         return Outcome.failed(f"{r.status}: {_error_of(r)}")
     body = r.body or {}
     results = body.get("results")
-    return Outcome.passed(f"results={len(results) if isinstance(results, list) else '?'} · errors={body.get('errors', 0)}")
+    return Outcome.passed(
+        f"results={len(results) if isinstance(results, list) else '?'} · errors={body.get('errors', 0)}"
+    )
 
 
 def case_limits_payload(s: Suite) -> Outcome:
-    body = {"script": SIMPLE, "ohlcv": make_bars(2), "pad": "x" * (5 * 1024 * 1024 + 64)}
+    body = {
+        "script": SIMPLE,
+        "ohlcv": make_bars(2),
+        "pad": "x" * (5 * 1024 * 1024 + 64),
+    }
     r = s.request("POST", "/run", body)
     if r.status != 413:
         return Outcome.failed(f"expected 413 for >5MB body, got {r.status}")
@@ -911,10 +1045,16 @@ def _emit(rep: CaseReport) -> None:
     lat = _lat(rep)
     engine = ""
     if rep.engine_ms:
-        engine = f" · engine {min(rep.engine_ms):.0f}" + (f"–{max(rep.engine_ms):.0f}" if len(rep.engine_ms) > 1 else "") + "ms"
+        engine = (
+            f" · engine {min(rep.engine_ms):.0f}"
+            + (f"–{max(rep.engine_ms):.0f}" if len(rep.engine_ms) > 1 else "")
+            + "ms"
+        )
     detail = rep.detail or ""
     n = f" · n={len(rep.latencies)}" if len(rep.latencies) > 1 else ""
-    print(f"  {tag}  {rep.name:<24} {http:>4}  {lat:>18}{n}  {detail}{engine}", flush=True)
+    print(
+        f"  {tag}  {rep.name:<24} {http:>4}  {lat:>18}{n}  {detail}{engine}", flush=True
+    )
 
 
 def _pctl(values: list[float], q: float) -> float:
@@ -948,13 +1088,27 @@ def print_summary(s: Suite, reports: list[CaseReport], started: float) -> None:
         )
     engine = [ms for r in reports for ms in r.engine_ms]
     if engine:
-        print(f"  engine time (/run cases): min {min(engine):.1f}ms · max {max(engine):.1f}ms (rest is parse/network/edge)")
+        print(
+            f"  engine time (/run cases): min {min(engine):.1f}ms · max {max(engine):.1f}ms (rest is parse/network/edge)"
+        )
     if s.client.retries:
-        print(_c("33", f"  ↻ {s.client.retries} request(s) retried after 429 — rate limit is 100 req/60s per key"))
+        print(
+            _c(
+                "33",
+                f"  ↻ {s.client.retries} request(s) retried after 429 — rate limit is 100 req/60s per key",
+            )
+        )
     print("─" * 96)
 
 
-def write_json_report(path: Path, url: str, s: Suite, reports: list[CaseReport], started: float, args: argparse.Namespace) -> None:
+def write_json_report(
+    path: Path,
+    url: str,
+    s: Suite,
+    reports: list[CaseReport],
+    started: float,
+    args: argparse.Namespace,
+) -> None:
     payload = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "url": url,
@@ -1040,18 +1194,51 @@ def main() -> int:
         description="Live end-to-end + latency suite for a running pyne-worker",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--url", default=os.environ.get("PYNE_WORKER_URL") or DEFAULT_URL, help="Worker base URL")
-    parser.add_argument("--api-key", default=None, help="X-API-Key (env PYNE_API_KEY / API_KEY / .dev.vars)")
-    parser.add_argument("--repeat", type=int, default=3, help="Latency samples for idempotent cases")
-    parser.add_argument("--timeout", type=float, default=40.0, help="Per-request timeout in seconds")
-    parser.add_argument("--json", dest="json_path", default=None, help="Write a JSON report to this path")
-    parser.add_argument("--no-r2", action="store_true", help="Skip ingest/read-back (no R2 writes)")
-    parser.add_argument("--no-feed", action="store_true", help="Skip Bybit feed refresh")
-    parser.add_argument("--no-scripts", action="store_true", help="Skip scripts registry lifecycle")
-    parser.add_argument("--no-limits", action="store_true", help="Skip the >5MB payload cap case")
-    parser.add_argument("--skip-auth-checks", action="store_true", help="Skip the 401 auth cases")
-    parser.add_argument("--with-cron", action="store_true", help="Include POST /cron/run (may fire webhooks)")
-    parser.add_argument("--quiet", action="store_true", help="Only print failures + summary")
+    parser.add_argument(
+        "--url",
+        default=os.environ.get("PYNE_WORKER_URL") or DEFAULT_URL,
+        help="Worker base URL",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="X-API-Key (env PYNE_API_KEY / API_KEY / .dev.vars)",
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=3, help="Latency samples for idempotent cases"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=40.0, help="Per-request timeout in seconds"
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_path",
+        default=None,
+        help="Write a JSON report to this path",
+    )
+    parser.add_argument(
+        "--no-r2", action="store_true", help="Skip ingest/read-back (no R2 writes)"
+    )
+    parser.add_argument(
+        "--no-feed", action="store_true", help="Skip Bybit feed refresh"
+    )
+    parser.add_argument(
+        "--no-scripts", action="store_true", help="Skip scripts registry lifecycle"
+    )
+    parser.add_argument(
+        "--no-limits", action="store_true", help="Skip the >5MB payload cap case"
+    )
+    parser.add_argument(
+        "--skip-auth-checks", action="store_true", help="Skip the 401 auth cases"
+    )
+    parser.add_argument(
+        "--with-cron",
+        action="store_true",
+        help="Include POST /cron/run (may fire webhooks)",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="Only print failures + summary"
+    )
     args = parser.parse_args()
 
     url = str(args.url)
@@ -1063,9 +1250,16 @@ def main() -> int:
     print()
     print(_c("1", f"  PYNE-WORKER LIVE TEST — {url}"))
     if api_key:
-        print(f"  key: {key_source} · repeat: {args.repeat} · timeout: {args.timeout:.0f}s")
+        print(
+            f"  key: {key_source} · repeat: {args.repeat} · timeout: {args.timeout:.0f}s"
+        )
     else:
-        print(_c("33", "  no API key found — authenticated cases will be skipped (set PYNE_API_KEY or .dev.vars)"))
+        print(
+            _c(
+                "33",
+                "  no API key found — authenticated cases will be skipped (set PYNE_API_KEY or .dev.vars)",
+            )
+        )
     if url.startswith("http://") and "localhost" not in url and "127.0.0.1" not in url:
         print(_c("33", "  warning: plain http to a remote host"))
     print()
@@ -1079,29 +1273,80 @@ def main() -> int:
     suite.add("cors.preflight", case_cors_preflight, repeat=1)
     suite.add("routing.404", case_404, repeat=1)
     # Auth cases need no configured key — they verify the *absence* of a valid key.
-    suite.add("auth.missing_key", case_auth_missing, repeat=1, skip_reason="--skip-auth-checks" if args.skip_auth_checks else None)
-    suite.add("auth.wrong_key", case_auth_wrong, repeat=1, skip_reason="--skip-auth-checks" if args.skip_auth_checks else None)
+    suite.add(
+        "auth.missing_key",
+        case_auth_missing,
+        repeat=1,
+        skip_reason="--skip-auth-checks" if args.skip_auth_checks else None,
+    )
+    suite.add(
+        "auth.wrong_key",
+        case_auth_wrong,
+        repeat=1,
+        skip_reason="--skip-auth-checks" if args.skip_auth_checks else None,
+    )
     suite.add("run.interpret", case_run_interpret, repeat=None, skip_reason=needs_auth)
-    suite.add("run.strategy_events", case_run_strategy, repeat=1, skip_reason=needs_auth)
+    suite.add(
+        "run.strategy_events", case_run_strategy, repeat=1, skip_reason=needs_auth
+    )
     suite.add("run.alerts", case_run_alerts, repeat=1, skip_reason=needs_auth)
     suite.add("run.drawings", case_run_drawings, repeat=1, skip_reason=needs_auth)
     suite.add("run.window", case_run_window, repeat=1, skip_reason=needs_auth)
-    suite.add("run.window_full_noop", case_run_window_full, repeat=1, skip_reason=needs_auth)
-    suite.add("run.window_validation", case_run_window_validation, repeat=1, skip_reason=needs_auth)
+    suite.add(
+        "run.window_full_noop", case_run_window_full, repeat=1, skip_reason=needs_auth
+    )
+    suite.add(
+        "run.window_validation",
+        case_run_window_validation,
+        repeat=1,
+        skip_reason=needs_auth,
+    )
     suite.add("run.libraries", case_run_libraries, repeat=1, skip_reason=needs_auth)
     suite.add("run.inputs", case_run_inputs, repeat=1, skip_reason=needs_auth)
     suite.add("run.mode_auto", case_run_mode_auto, repeat=1, skip_reason=needs_auth)
-    suite.add("run.mode_compile", case_run_mode_compile, repeat=1, skip_reason=needs_auth)
+    suite.add(
+        "run.mode_compile", case_run_mode_compile, repeat=1, skip_reason=needs_auth
+    )
     suite.add("run.parse_error", case_run_parse_error, repeat=1, skip_reason=needs_auth)
     suite.add("run.timeframe", case_run_timeframe, repeat=1, skip_reason=needs_auth)
     suite.add("run.realtime", case_run_realtime, repeat=1, skip_reason=needs_auth)
-    suite.add("run.webhook_blocked", case_run_webhook_blocked, repeat=1, skip_reason=needs_auth)
+    suite.add(
+        "run.webhook_blocked",
+        case_run_webhook_blocked,
+        repeat=1,
+        skip_reason=needs_auth,
+    )
     suite.add("run.timeout", case_run_timeout, repeat=1, skip_reason=needs_auth)
-    suite.add("run.r2_missing_data", case_run_r2_nodata, repeat=1, skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None))
-    suite.add("r2.ingest", case_r2_ingest, repeat=1, skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None))
-    suite.add("r2.roundtrip", case_r2_roundtrip, repeat=1, skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None))
-    suite.add("feed.refresh", case_feed_refresh, repeat=1, skip_reason=needs_auth or ("--no-feed" if args.no_feed else None))
-    suite.add("scripts.lifecycle", case_scripts_lifecycle, repeat=1, skip_reason=needs_auth or ("--no-scripts" if args.no_scripts else None))
+    suite.add(
+        "run.r2_missing_data",
+        case_run_r2_nodata,
+        repeat=1,
+        skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None),
+    )
+    suite.add(
+        "r2.ingest",
+        case_r2_ingest,
+        repeat=1,
+        skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None),
+    )
+    suite.add(
+        "r2.roundtrip",
+        case_r2_roundtrip,
+        repeat=1,
+        skip_reason=needs_auth or ("--no-r2" if args.no_r2 else None),
+    )
+    suite.add(
+        "feed.refresh",
+        case_feed_refresh,
+        repeat=1,
+        skip_reason=needs_auth or ("--no-feed" if args.no_feed else None),
+    )
+    suite.add(
+        "scripts.lifecycle",
+        case_scripts_lifecycle,
+        repeat=1,
+        skip_reason=needs_auth or ("--no-scripts" if args.no_scripts else None),
+    )
     suite.add("cron.jobs_list", case_cron_jobs_list, repeat=1, skip_reason=needs_auth)
     suite.add(
         "cron.run",
@@ -1109,7 +1354,12 @@ def main() -> int:
         repeat=1,
         skip_reason=needs_auth or (None if args.with_cron else "--with-cron not set"),
     )
-    suite.add("limits.payload_413", case_limits_payload, repeat=1, skip_reason=needs_auth or ("--no-limits" if args.no_limits else None))
+    suite.add(
+        "limits.payload_413",
+        case_limits_payload,
+        repeat=1,
+        skip_reason=needs_auth or ("--no-limits" if args.no_limits else None),
+    )
 
     started = time.perf_counter()
     reports = suite.run()

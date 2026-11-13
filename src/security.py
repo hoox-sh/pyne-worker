@@ -76,7 +76,9 @@ _EXCHANGE_TO_PINE_PERIOD: dict[str, str] = {
     "1M": "M",
 }
 
-_INTERNAL_PATH_RE = re.compile(r'(?:File ")?[\\/](?:[\w.-]+[\\/])*[\w.-]+\.py(?:", line \d+)?')
+_INTERNAL_PATH_RE = re.compile(
+    r'(?:File ")?[\\/](?:[\w.-]+[\\/])*[\w.-]+\.py(?:", line \d+)?'
+)
 _MAX_ERROR_MSG_LEN = 500
 _TRACE_PREFIXES = (
     "Traceback ",
@@ -147,7 +149,9 @@ def to_pine_period(timeframe: str | None) -> str | None:
     return None
 
 
-def _parse_literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+def _parse_literal_ip(
+    host: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """Parse a hostname that is itself an IP (dotted, IPv6, or decimal IPv4).
 
     Decimal (``2130706433``) is the spelled-out form of ``127.0.0.1`` that
@@ -242,7 +246,11 @@ def validate_webhook_url(url: str | None, *, allow_http: bool = False) -> str | 
 
     if host in _BLOCKED_HOSTS:
         return None
-    if host.endswith(".local") or host.endswith(".internal") or host.endswith(".localhost"):
+    if (
+        host.endswith(".local")
+        or host.endswith(".internal")
+        or host.endswith(".localhost")
+    ):
         return None
     if host.endswith(".localdomain"):
         return None

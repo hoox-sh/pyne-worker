@@ -115,8 +115,12 @@ class Default(WorkerEntrypoint):
     TRADE_EXECUTE_KEY_BINDING: str | None = None  # optional execute-scoped key
     TRADE_INTERNAL_KEY: str | None = None  # legacy alias
     DEFAULT_EXCHANGE: str | None = None  # optional default exchange
-    CONSOLE_URL: str | None = None  # tenant verify + usage base URL (None → passthrough)
-    USAGE_SERVICE_KEY: str | None = None  # optional service Bearer for POST /api/v1/usage
+    CONSOLE_URL: str | None = (
+        None  # tenant verify + usage base URL (None → passthrough)
+    )
+    USAGE_SERVICE_KEY: str | None = (
+        None  # optional service Bearer for POST /api/v1/usage
+    )
     ALLOWED_ORIGIN: str | None = None  # extra CORS allowlist (comma-separated)
     ALLOW_GUEST_RUN: str | None = None  # "1" = guest POST /run from product Origins
 
@@ -239,10 +243,16 @@ class Default(WorkerEntrypoint):
                     alerts_payload = filter_alerts_for_bar(
                         alerts_payload, last_time, bar_index=last_index
                     )
-                default_wh = _req_webhook or getattr(self.env, "ALERT_WEBHOOK_URL", None)
-                if alerts_payload and (default_wh or any(
-                    isinstance(a, dict) and a.get("webhook_url") for a in alerts_payload
-                )):
+                default_wh = _req_webhook or getattr(
+                    self.env, "ALERT_WEBHOOK_URL", None
+                )
+                if alerts_payload and (
+                    default_wh
+                    or any(
+                        isinstance(a, dict) and a.get("webhook_url")
+                        for a in alerts_payload
+                    )
+                ):
                     alert_fwd = await forward_alert_groups(
                         alerts_payload,
                         default_url=str(default_wh).strip() if default_wh else None,
@@ -339,7 +349,9 @@ class Default(WorkerEntrypoint):
                 job_exchange = default_exchange
                 for ev in evs:
                     if isinstance(ev, dict) and ev.get("exchange"):
-                        job_exchange = normalize_exchange(str(ev["exchange"]), default_exchange)
+                        job_exchange = normalize_exchange(
+                            str(ev["exchange"]), default_exchange
+                        )
                         break
                 try:
                     fwd = await forward_events(

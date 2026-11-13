@@ -181,7 +181,9 @@ async def ingest_ohlcv_to_r2(
             # Default to current year if no time
             year = now.year
         else:
-            year = datetime.datetime.fromtimestamp(t / 1000, tz=datetime.timezone.utc).year
+            year = datetime.datetime.fromtimestamp(
+                t / 1000, tz=datetime.timezone.utc
+            ).year
         by_year.setdefault(year, []).append(bar)
 
     total = 0

@@ -225,7 +225,9 @@ async def _fetch_json_get(
         from js import Headers  # type: ignore[import-not-found]
         from js import fetch  # type: ignore[import-not-found]
 
-        resp = await fetch(url, method="GET", headers=Headers.new(list(headers.items())))
+        resp = await fetch(
+            url, method="GET", headers=Headers.new(list(headers.items()))
+        )
         status = int(getattr(resp, "status", 0) or 0)
         try:
             retry_after: str | None = resp.headers.get("Retry-After")
@@ -261,7 +263,9 @@ async def _fetch_json_get(
             raw = b""
         status = int(e.code)
         try:
-            resp_headers = _retry_headers(e.headers.get("Retry-After") if e.headers else None)
+            resp_headers = _retry_headers(
+                e.headers.get("Retry-After") if e.headers else None
+            )
         except Exception:
             resp_headers = {}
     except Exception:
@@ -281,7 +285,9 @@ def _retry_headers(value: Any) -> dict[str, str]:
     return {"retry-after": text} if text else {}
 
 
-def _parse_retry_after(resp_headers: dict[str, Any] | None, body: dict[str, Any] | None) -> int | None:
+def _parse_retry_after(
+    resp_headers: dict[str, Any] | None, body: dict[str, Any] | None
+) -> int | None:
     """Extract ``Retry-After`` seconds from response headers or body.
 
     Mirrors ``pyne-agent-worker`` ``verify.ts`` (numeric ``Retry-After``
@@ -361,7 +367,11 @@ def _resolve_console_url(env: Any) -> str | None:
         return None
     if isinstance(env, str):
         return env.strip() or None
-    raw: Any = env.get("CONSOLE_URL") if isinstance(env, dict) else getattr(env, "CONSOLE_URL", None)
+    raw: Any = (
+        env.get("CONSOLE_URL")
+        if isinstance(env, dict)
+        else getattr(env, "CONSOLE_URL", None)
+    )
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return None
@@ -423,7 +433,9 @@ async def _verify_remote(console_url: str, raw_key: str, scope: str) -> VerifyRe
     return VerifyResult(outcome="invalid")
 
 
-async def verify_tenant(env: Any, raw_key: str, scope: str = TENANT_SCOPE) -> VerifyResult:
+async def verify_tenant(
+    env: Any, raw_key: str, scope: str = TENANT_SCOPE
+) -> VerifyResult:
     """Verify a tenant key against the console with in-isolate caching.
 
     Args:
@@ -455,7 +467,11 @@ async def verify_tenant(env: Any, raw_key: str, scope: str = TENANT_SCOPE) -> Ve
     else:
         result = await _verify_remote(console_url, raw_key, norm_scope)
 
-    ttl = POSITIVE_TTL_SECONDS if result.outcome in ("valid", "denied") else NEGATIVE_TTL_SECONDS
+    ttl = (
+        POSITIVE_TTL_SECONDS
+        if result.outcome in ("valid", "denied")
+        else NEGATIVE_TTL_SECONDS
+    )
     _cache_store(cache_key, result, now + ttl)
     return result
 
@@ -507,7 +523,9 @@ def usage_queue_depth() -> int:
     return len(_USAGE_QUEUE)
 
 
-async def flush_usage_queue(console_url: str | None, auth_token: str | None = None) -> int:
+async def flush_usage_queue(
+    console_url: str | None, auth_token: str | None = None
+) -> int:
     """POST up to :data:`USAGE_BATCH_MAX` queued events to the console.
 
     Args:
@@ -532,7 +550,15 @@ async def flush_usage_queue(console_url: str | None, auth_token: str | None = No
     try:
         status = await _post_json(url, headers, {"events": batch})
     except Exception as e:  # _post_json never raises — belt and braces
-        print(json.dumps({"type": "usage_flush_error", "error": str(e)[:200], "dropped": len(batch)}))
+        print(
+            json.dumps(
+                {
+                    "type": "usage_flush_error",
+                    "error": str(e)[:200],
+                    "dropped": len(batch),
+                }
+            )
+        )
         return 0
     if 200 <= status < 300:
         return len(batch)

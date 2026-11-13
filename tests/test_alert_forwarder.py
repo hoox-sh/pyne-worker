@@ -33,7 +33,9 @@ class TestBuildPayload:
         assert p["alert_source"] == "alert"
 
     def test_title_content(self) -> None:
-        p = build_alert_payload({"message": "m", "title": "T", "source": "alertcondition"})
+        p = build_alert_payload(
+            {"message": "m", "title": "T", "source": "alertcondition"}
+        )
         assert p["content"] == "**T**: m"
         assert p["alert_source"] == "alertcondition"
 
@@ -142,7 +144,9 @@ class TestDefaultTransportHardening:
 
         opener = _no_redirect_opener()
         handlers = [
-            h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+            h
+            for h in opener.handlers
+            if isinstance(h, urllib.request.HTTPRedirectHandler)
         ]
         assert handlers, "redirect handler missing from opener"
         # Returning None makes urllib raise HTTPError on a 30x instead of

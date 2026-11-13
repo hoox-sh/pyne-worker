@@ -154,7 +154,9 @@ def main() -> None:
             err_bucket[error[:100]] += 1
         sn = rel.split("/")[0]
         by_set[(sn, status)] += 1
-        rows.append({"file": rel, "set": sn, "status": status, "ms": ms, "error": error})
+        rows.append(
+            {"file": rel, "set": sn, "status": status, "ms": ms, "error": error}
+        )
         if i % 25 == 0 or status != "OK" and i <= 30 or i == len(fails):
             print(
                 f"  [{i}/{len(fails)}] OK={ok} PARSE={parse_fail} RUN={run_fail} "

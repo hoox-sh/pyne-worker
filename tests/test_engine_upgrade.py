@@ -101,7 +101,12 @@ class TestChartTimeframeHttp:
             "plot(timeframe.isdaily ? 1 : 0, 'daily')\n"
         )
         body, status = await _post_run(
-            {"script": script, "ohlcv": _bars(5), "timeframe": "15m", "mode": "interpret"}
+            {
+                "script": script,
+                "ohlcv": _bars(5),
+                "timeframe": "15m",
+                "mode": "interpret",
+            }
         )
         assert status == 200, body
         assert body["series"]["sec"][-1] == 900
@@ -110,7 +115,9 @@ class TestChartTimeframeHttp:
 
     async def test_default_timeframe_is_daily(self) -> None:
         script = "//@version=6\nindicator('tf')\nplot(timeframe.in_seconds(), 'sec')\n"
-        body, status = await _post_run({"script": script, "ohlcv": _bars(4), "mode": "interpret"})
+        body, status = await _post_run(
+            {"script": script, "ohlcv": _bars(4), "mode": "interpret"}
+        )
         assert status == 200, body
         assert body["series"]["sec"][-1] == 86400
 
@@ -153,11 +160,15 @@ class TestNextBarFill:
         out = Runtime(symbol="TEST").run(src, _bars(6), mode="interpret")
         assert "error" not in out, out.get("error")
         events = out.get("events") or []
-        entries = [e for e in events if isinstance(e, dict) and e.get("kind") == "entry"]
+        entries = [
+            e for e in events if isinstance(e, dict) and e.get("kind") == "entry"
+        ]
         fills = [
             e
             for e in events
-            if isinstance(e, dict) and e.get("kind") == "order" and e.get("comment") == "fill"
+            if isinstance(e, dict)
+            and e.get("kind") == "order"
+            and e.get("comment") == "fill"
         ]
         assert entries, events
         assert entries[0].get("bar_index") == 2

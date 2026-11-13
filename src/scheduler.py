@@ -63,7 +63,12 @@ async def run_scheduled_jobs(
         Summary dict with per-job results, feed status, and aggregate events.
     """
     if r2_bucket is None:
-        return {"error": "R2 bucket not configured", "jobs": [], "events": [], "feed": []}
+        return {
+            "error": "R2 bucket not configured",
+            "jobs": [],
+            "events": [],
+            "feed": [],
+        }
 
     jobs = await load_cron_jobs(r2_bucket)
 
@@ -122,7 +127,9 @@ async def run_scheduled_jobs(
             or "BTCUSDT"
         )
         timeframe = (
-            sanitize_timeframe(str(job.get("timeframe") or rec.get("timeframe") or timeframe))
+            sanitize_timeframe(
+                str(job.get("timeframe") or rec.get("timeframe") or timeframe)
+            )
             or "1m"
         )
         try:
@@ -131,7 +138,9 @@ async def run_scheduled_jobs(
             max_bars = 5000
         max_bars = max(50, min(max_bars, 100_000))
         forward = bool(job.get("forward_events", rec.get("forward_events", True)))
-        forward_alerts = bool(job.get("forward_alerts", rec.get("forward_alerts", True)))
+        forward_alerts = bool(
+            job.get("forward_alerts", rec.get("forward_alerts", True))
+        )
         webhook_url = job.get("webhook_url") or rec.get("webhook_url")
         if isinstance(webhook_url, str):
             webhook_url = validate_webhook_url(webhook_url)
@@ -186,7 +195,9 @@ async def run_scheduled_jobs(
             )
             continue
 
-        libraries = rec.get("libraries") if isinstance(rec.get("libraries"), list) else None
+        libraries = (
+            rec.get("libraries") if isinstance(rec.get("libraries"), list) else None
+        )
         inputs = rec.get("inputs") if isinstance(rec.get("inputs"), dict) else None
         runtime = Runtime(symbol=symbol, timeframe=to_pine_period(timeframe))
         result = runtime.run(

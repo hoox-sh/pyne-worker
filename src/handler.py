@@ -31,7 +31,6 @@ from typing import Any
 from cors import attach_cors
 from cors import cors_headers_for
 from cors import origin_allowed
-from middleware import LogHelper
 from middleware import RateLimiter
 from middleware import extract_bearer_token
 from middleware import is_tenant_key
@@ -98,7 +97,9 @@ def _json_response(
     return body, status, headers or {}
 
 
-def _parse_body(raw: str | None) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], int, dict[str, str]] | None]:
+def _parse_body(
+    raw: str | None,
+) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], int, dict[str, str]] | None]:
     if not raw:
         return None, _json_response({"error": "Missing request body"}, 400)
 
@@ -111,7 +112,9 @@ def _parse_body(raw: str | None) -> tuple[dict[str, Any] | None, tuple[dict[str,
         return None, _json_response({"error": "Invalid JSON"}, 400)
 
     if not isinstance(data, dict):
-        return None, _json_response({"error": "Request body must be a JSON object"}, 400)
+        return None, _json_response(
+            {"error": "Request body must be a JSON object"}, 400
+        )
 
     return data, None
 
@@ -182,7 +185,9 @@ def _parse_optional_int(
     if isinstance(value, bool) or not isinstance(value, int):
         return default, _json_response({"error": f"'{field}' must be an integer"}, 400)
     if min_value is not None and value < min_value:
-        return default, _json_response({"error": f"'{field}' must be >= {min_value}"}, 400)
+        return default, _json_response(
+            {"error": f"'{field}' must be >= {min_value}"}, 400
+        )
     return value, None
 
 
@@ -192,7 +197,9 @@ def _run_error_body(result: dict[str, Any]) -> dict[str, Any]:
     Keeps the worker ``error`` string for existing clients and adds
     ``status`` / ``message`` plus optional Runtime diagnostics.
     """
-    msg = sanitize_error_for_response(str(result.get("error") or "Script execution failed"))
+    msg = sanitize_error_for_response(
+        str(result.get("error") or "Script execution failed")
+    )
     body: dict[str, Any] = {
         "status": "error",
         "error": msg,
@@ -221,7 +228,9 @@ def _run_error_body(result: dict[str, Any]) -> dict[str, Any]:
 # Path helpers
 # ---------------------------------------------------------------------------
 
-_KNOWN_ROOTS = frozenset({"/health", "/run", "/ingest", "/scripts", "/cron", "/schedules", "/feed", "/ast"})
+_KNOWN_ROOTS = frozenset(
+    {"/health", "/run", "/ingest", "/scripts", "/cron", "/schedules", "/feed", "/ast"}
+)
 
 
 def _match_route(path: str) -> tuple[str, str | None]:
@@ -281,7 +290,9 @@ async def _record_tenant_usage(
             bar_count = max(0, int(bars or 0))
         except (TypeError, ValueError):
             bar_count = 0
-        queue_usage_event(verified.tid, TENANT_SCOPE, 1, bar_count, tenant_hash16 or "unknown")
+        queue_usage_event(
+            verified.tid, TENANT_SCOPE, 1, bar_count, tenant_hash16 or "unknown"
+        )
         # Service auth when configured, else the per-request tenant key hash
         # (hash-on-wire in both cases — never the raw key).
         await flush_usage_queue(console_url, usage_auth or tenant_key_hash)
@@ -330,8 +341,10 @@ async def handle_request(
         allowed_origin=allowed_origin,
         allow_guest_run=allow_guest_run,
     )
-    return payload, status, attach_cors(
-        headers, origin, path, extra_allowed=allowed_origin
+    return (
+        payload,
+        status,
+        attach_cors(headers, origin, path, extra_allowed=allowed_origin),
     )
 
 
@@ -409,7 +422,9 @@ async def _dispatch_request(
     bearer = extract_bearer_token(authorization)
     verified: VerifyResult | None = None
     verify_headers: dict[str, str] = {}
-    tenant_key_hash: str | None = None  # full sha256 hex — wire token only, never logged
+    tenant_key_hash: str | None = (
+        None  # full sha256 hex — wire token only, never logged
+    )
     tenant_hash16: str | None = None
     if is_tenant_key(bearer):
         tenant_key_hash = key_hash_full(bearer)
@@ -527,7 +542,9 @@ async def _dispatch_request(
         return resp_body, resp_status, resp_headers
 
     if route == "/run" and method == "POST":
-        resp_body, resp_status, resp_headers = await handle_run(body, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_run(
+            body, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         await _record_tenant_usage(
@@ -542,7 +559,9 @@ async def _dispatch_request(
         return resp_body, resp_status, resp_headers
 
     if route == "/ingest" and method == "POST":
-        resp_body, resp_status, resp_headers = await handle_ingest(body, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_ingest(
+            body, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         await _record_tenant_usage(
@@ -557,49 +576,65 @@ async def _dispatch_request(
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts" and method == "GET":
-        resp_body, resp_status, resp_headers = await handle_list_scripts(r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_list_scripts(
+            r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts" and method == "POST":
-        resp_body, resp_status, resp_headers = await handle_put_script(body, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_put_script(
+            body, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts/:id" and method == "GET" and param is not None:
-        resp_body, resp_status, resp_headers = await handle_get_script(param, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_get_script(
+            param, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/scripts/:id" and method == "DELETE" and param is not None:
-        resp_body, resp_status, resp_headers = await handle_delete_script(param, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_delete_script(
+            param, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/cron/jobs" and method == "GET":
-        resp_body, resp_status, resp_headers = await handle_get_cron_jobs(r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_get_cron_jobs(
+            r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/cron/jobs" and method == "PUT":
-        resp_body, resp_status, resp_headers = await handle_put_cron_jobs(body, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_put_cron_jobs(
+            body, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/cron/run" and method == "POST":
-        resp_body, resp_status, resp_headers = await handle_cron_run(body, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_cron_run(
+            body, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
 
     if route == "/feed/refresh" and method == "POST":
-        resp_body, resp_status, resp_headers = await handle_feed_refresh(body, r2_bucket=r2_bucket)
+        resp_body, resp_status, resp_headers = await handle_feed_refresh(
+            body, r2_bucket=r2_bucket
+        )
         resp_headers.update(rate_headers)
         resp_headers.update(verify_headers)
         return resp_body, resp_status, resp_headers
@@ -780,9 +815,15 @@ async def handle_run(
     script_id = data.get("script_id")
     deployed_id: str | None = None
 
-    if (not script or not isinstance(script, str)) and script_id and isinstance(script_id, str):
+    if (
+        (not script or not isinstance(script, str))
+        and script_id
+        and isinstance(script_id, str)
+    ):
         if r2_bucket is None:
-            return _json_response({"error": "R2 bucket not configured — cannot load script_id"}, 501)
+            return _json_response(
+                {"error": "R2 bucket not configured — cannot load script_id"}, 501
+            )
         try:
             from scripts_registry import get_script
 
@@ -922,13 +963,18 @@ async def handle_run(
         return _json_response({"error": str(e)}, 400)
     if libraries and mode == "compile":
         return _json_response(
-            {"error": "libraries require mode interpret or auto (compile has no import path)"},
+            {
+                "error": "libraries require mode interpret or auto (compile has no import path)"
+            },
             400,
         )
 
     webhook_raw = data.get("webhook_url")
     if webhook_raw is not None and webhook_raw != "":
-        if not isinstance(webhook_raw, str) or validate_webhook_url(webhook_raw) is None:
+        if (
+            not isinstance(webhook_raw, str)
+            or validate_webhook_url(webhook_raw) is None
+        ):
             return _json_response(
                 {
                     "error": "webhook_url is invalid or blocked (https public host required)",
@@ -955,16 +1001,24 @@ async def handle_run(
     from_bar = data.get("from_bar")
     to_bar = data.get("to_bar")
     for field, value in (("from_bar", from_bar), ("to_bar", to_bar)):
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int)
+        ):
             return _json_response({"error": f"'{field}' must be an integer"}, 400)
 
-    realtime_last_bar, rt_err = _parse_optional_bool(data, "realtime_last_bar", default=False)
+    realtime_last_bar, rt_err = _parse_optional_bool(
+        data, "realtime_last_bar", default=False
+    )
     if rt_err is not None:
         return rt_err
-    realtime_ticks, rt_err = _parse_optional_int(data, "realtime_ticks", default=1, min_value=1)
+    realtime_ticks, rt_err = _parse_optional_int(
+        data, "realtime_ticks", default=1, min_value=1
+    )
     if rt_err is not None:
         return rt_err
-    realtime_bars, rt_err = _parse_optional_int(data, "realtime_bars", default=0, min_value=0)
+    realtime_bars, rt_err = _parse_optional_int(
+        data, "realtime_bars", default=0, min_value=0
+    )
     if rt_err is not None:
         return rt_err
     realtime_from_bar, rt_err = _parse_optional_int(
@@ -1278,7 +1332,13 @@ async def handle_feed_refresh(
             info = await refresh_pair_to_r2(
                 r2_bucket, "BTCUSDT", "1m", limit=limit, closed_only=True
             )
-            return _json_response({"status": "ok", "feed": [info], "note": "no cron jobs; refreshed BTCUSDT/1m"})
+            return _json_response(
+                {
+                    "status": "ok",
+                    "feed": [info],
+                    "note": "no cron jobs; refreshed BTCUSDT/1m",
+                }
+            )
 
         feed = await refresh_pairs_for_jobs(r2_bucket, jobs, limit=limit)
         return _json_response({"status": "ok", "feed": feed})
@@ -1315,7 +1375,9 @@ async def handle_ingest(
     if data is None:
         return _json_response({"error": "Failed to parse request body"}, 400)
 
-    symbol = sanitize_symbol(data.get("symbol") if isinstance(data.get("symbol"), str) else None)
+    symbol = sanitize_symbol(
+        data.get("symbol") if isinstance(data.get("symbol"), str) else None
+    )
     if symbol is None:
         return _json_response({"error": "Missing or invalid 'symbol'"}, 400)
 

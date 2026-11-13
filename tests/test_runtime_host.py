@@ -80,7 +80,10 @@ class TestAutoInputs:
         r = rt.run(script, _bars(30), mode="auto", inputs={"Length": 14})
         assert "error" not in r
         assert r.get("auto_backend") == "interpret"
-        assert r.get("compile_fallback_reason") == "input.* overrides require interpret path"
+        assert (
+            r.get("compile_fallback_reason")
+            == "input.* overrides require interpret path"
+        )
         assert r.get("mode") == "interpret"
 
     def test_inputs_apply_on_interpret(self) -> None:
@@ -137,7 +140,9 @@ class TestAutoPrefilter:
 
 
 class TestCompileFailCache:
-    def test_auto_compile_fail_cache_skips_recompile(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_auto_compile_fail_cache_skips_recompile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Deterministic compile failures are remembered for subsequent auto runs."""
         try:
             from pynescript.compiler import engine as eng
@@ -202,9 +207,7 @@ plot(x.FOO)
             script,
             _bars(5),
             mode="interpret",
-            libraries=[
-                {"namespace": "ns", "name": "Lib", "version": 1, "source": lib}
-            ],
+            libraries=[{"namespace": "ns", "name": "Lib", "version": 1, "source": lib}],
         )
         assert "error" not in r, r.get("error")
         vals = (r.get("series") or {}).get("plot_0") or r.get("plots") or []

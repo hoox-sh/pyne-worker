@@ -25,7 +25,6 @@ pynescript/tests/test_parity.py; pyne-worker reuses the same Runtime.
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 from handler import handle_request
@@ -117,7 +116,10 @@ class TestRun:
     async def test_script_too_long(self) -> None:
         body, status = await _post(
             "/run",
-            {"script": "x" * 100_001, "data": [{"open": 1, "high": 2, "low": 0.5, "close": 1.5, "time": 1}]},
+            {
+                "script": "x" * 100_001,
+                "data": [{"open": 1, "high": 2, "low": 0.5, "close": 1.5, "time": 1}],
+            },
         )
         assert status == 413
 
